@@ -1368,25 +1368,9 @@ def choose_premove_candidate(
         ]
         if not own_lines:
             return None, predicted_reply, "premove-candidate-not-found"
-        opponent_accuracy = None
-        opponent_samples = 0
-        if opponent_match_history:
-            try:
-                opponent_accuracy, opponent_samples = strategy_module.opponent_recent_accuracy(
-                    opponent_match_history
-                )
-            except Exception:
-                pass
-        selected, _selected_info, _meta = strategy_module.choose_stockfish_move(
-            hypothetical,
-            own_lines,
-            previous_eval_white_cp=None,
-            opponent_accuracy=opponent_accuracy,
-            opponent_sample_count=opponent_samples,
-            opponent_pressure=False,
-            engine=engine,
-            bot_color=(bot_color == "white"),
-        )
+        # A premove is speculative, so use the strongest line without touching
+        # the strategy's persistent per-game selection state during this forecast.
+        selected = own_lines[0]["pv"][0]
         if selected not in hypothetical.legal_moves:
             return None, predicted_reply, "premove-candidate-not-legal-after-prediction"
         return selected, predicted_reply, "stockfish-prediction"
