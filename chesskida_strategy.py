@@ -265,14 +265,13 @@ def natural_bot_move_delay(
     previous_eval_white_cp=None,
     initial_time_seconds=None,
     remaining_time_seconds=None,
-    increment_seconds=0.0,
     is_opening_book_move=False
 ):
     """Return a small move delay plus clock-bounded optional pauses.
 
     Timing policy:
       * the first eight bot moves never receive a long pause
-      * the first eight available book moves and forcing/tactical moves are immediate
+      * a book move within the first eight bot turns, and forcing/tactical moves, is immediate
       * optional pauses are capped at 60% of the observed starting clock
       * a 10-15 second fallback budget is used only when clocks are unavailable
       * low-clock and late/endgame states allow only short pauses
