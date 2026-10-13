@@ -1357,16 +1357,290 @@ def _premove_score_for_bot(info, bot_color: str) -> int | None:
     return None
 
 
+def _single_premove_info(engine, board, limit, root_moves=None):
+    """Normalize python-chess analyse() output for a single-PV check."""
+    result = engine.analyse(
+        board,
+        limit,
+        multipv=1,
+        root_moves=root_moves,
+    )
+    return result[0] if isinstance(result, list) and result else (
+        None if isinstance(result, list) else result
+    )
+
+
+def _build_middle_game_premove_scenarios(board, bot_color: str):
+    """Find (a) moves legal after every opponent reply and (b) safe-shape recaptures."""
+    if chess is None or board is None:
+        return [], set(), []
+    bot_turn = chess.WHITE if bot_color == "white" else chess.BLACK
+    opponent_replies = list(board.legal_moves)
+    if not opponent_replies:
+        return [], set(), []
+
+    response_boards = []
+    universal_moves = None
+    capture_groups = {}
+
+    for reply in opponent_replies:
+        after_reply = board.copy(stack=True)
+        after_reply.push(reply)
+        response_boards.append((reply, after_reply))
+
+        # A universal premove must still be legal after every legal opponent move.
+        legal_uci = {
+            move.uci()
+            for move in after_reply.legal_moves
+            if move.promotion is None and not after_reply.is_castling(move)
+        }
+        universal_moves = (
+            legal_uci if universal_moves is None else universal_moves & legal_uci
+        )
+
+        # A conditional recapture only triggers if an opposing capture lands on
+        # a square currently occupied by one of our pieces.
+        if board.is_capture(reply):
+            target_piece = board.piece_at(reply.to_square)
+            if target_piece is not None and target_piece.color == bot_turn:
+                capture_groups.setdefault(reply.to_square, []).append((reply, after_reply))
+
+    recapture_options = []
+    piece_values = {
+        chess.PAWN: 100,
+        chess.KNIGHT: 320,
+        chess.BISHOP: 330,
+        chess.ROOK: 500,
+        chess.QUEEN: 900,
+        chess.KING: 20000,
+    }
+    for target_square, outcomes in capture_groups.items():
+        common_recaptures = None
+        first_position = outcomes[0][1]
+        for _reply, after_capture in outcomes:
+            possible = {
+                move.uci()
+                for move in after_capture.legal_moves
+                if (
+                    move.to_square == target_square
+                    and after_capture.is_capture(move)
+                    and move.promotion is None
+                    and not after_capture.is_castling(move)
+                )
+            }
+            if not possible:
+                common_recaptures = set()
+                break
+            common_recaptures = (
+                possible
+                if common_recaptures is None
+                else common_recaptures & possible
+            )
+            if not common_recaptures:
+                break
+
+        if common_recaptures:
+            target_piece = board.piece_at(target_square)
+            recapture_options.append({
+                "target_square": target_square,
+                "piece_value": piece_values.get(
+                    target_piece.piece_type if target_piece else chess.PAWN, 0
+                ),
+                "outcomes": outcomes,
+                "candidate_uci": common_recaptures,
+                "candidate_moves": [
+                    move for move in first_position.legal_moves
+                    if move.uci() in common_recaptures
+                ],
+            })
+
+    recapture_options.sort(
+        key=lambda group: (
+            -group["piece_value"],
+            -len(group["outcomes"]),
+            chess.square_name(group["target_square"]),
+        )
+    )
+    return response_boards, (universal_moves or set()), recapture_options
+
+
+def _candidate_safe_across_outcomes(
+    engine, outcomes, candidate, bot_color: str, search_time: float,
+    baseline_cache: dict[str, int | None],
+) -> tuple[bool, int | None, str]:
+    """Test a candidate against every relevant reply, failing closed on missing scores."""
+    worst_eval = 100000
+    limit = chess.engine.Limit(depth=8, time=search_time)
+    candidate_uci = candidate.uci()
+
+    for reply, after_reply in outcomes:
+        legal_move = next(
+            (move for move in after_reply.legal_moves if move.uci() == candidate_uci),
+            None,
+        )
+        if legal_move is None:
+            return False, None, "candidate-not-legal-after-every-reply"
+
+        reply_key = reply.uci()
+        if reply_key not in baseline_cache:
+            baseline_info = _single_premove_info(engine, after_reply, limit)
+            baseline_cache[reply_key] = _premove_score_for_bot(baseline_info, bot_color)
+        best_eval = baseline_cache[reply_key]
+        if best_eval is None:
+            return False, None, "baseline-evaluation-unavailable"
+
+        selected_info = _single_premove_info(
+            engine, after_reply, limit, root_moves=[legal_move]
+        )
+        selected_eval = _premove_score_for_bot(selected_info, bot_color)
+        if selected_eval is None:
+            return False, None, "candidate-evaluation-unavailable"
+        if selected_eval < PREMOVE_MIN_BOT_EVAL_CP:
+            return False, selected_eval, "candidate-can-leave-bot-losing"
+        if best_eval - selected_eval > PREMOVE_MAX_EVAL_DROP_CP:
+            return False, selected_eval, "candidate-reduces-evaluation-too-much"
+        worst_eval = min(worst_eval, selected_eval)
+
+    return True, (worst_eval if worst_eval != 100000 else None), "all-replies-safe"
+
+
+def choose_middle_game_premove(
+    engine, board, strategy_module, bot_color: str, args,
+) -> tuple[object | None, object | None, str]:
+    """Premove only for robust recaptures or one move safe after every legal reply."""
+    bot_turn = chess.WHITE if bot_color == "white" else chess.BLACK
+    if board.turn == bot_turn:
+        return None, None, "bot-turn-already-active"
+
+    # Build the legality shapes first. Most middlegame positions return here
+    # without extra Stockfish searches or any cursor/API action.
+    response_boards, universal_uci, recapture_options = (
+        _build_middle_game_premove_scenarios(board, bot_color)
+    )
+    if not response_boards:
+        return None, None, "no-opponent-replies"
+    if not universal_uci and not recapture_options:
+        return None, None, "no-universal-safe-move-or-recapture-pattern"
+
+    search_time = max(0.003, min(float(args.engine_time), 0.008))
+    current_lines = engine.analyse(
+        board,
+        chess.engine.Limit(depth=8, time=search_time),
+        multipv=min(3, len(response_boards)),
+    )
+    if not isinstance(current_lines, list):
+        current_lines = [current_lines]
+    current_lines = [
+        info for info in current_lines
+        if isinstance(info, dict) and info.get("pv")
+        and info["pv"][0] in board.legal_moves
+    ]
+    if not current_lines:
+        return None, None, "current-position-analysis-unavailable"
+    current_eval = _premove_score_for_bot(current_lines[0], bot_color)
+    if current_eval is None:
+        return None, None, "current-evaluation-unavailable"
+    if current_eval < PREMOVE_MIN_BOT_EVAL_CP:
+        return None, None, "bot-position-already-losing"
+
+    baseline_cache: dict[str, int | None] = {}
+
+    # 1) Midgame recapture: choose one destination currently occupied by our
+    # piece. The premove can only become legal when that piece is captured;
+    # check every legal capture to this square and reject unsafe recaptures.
+    for group in recapture_options:
+        outcomes = group["outcomes"]
+        common_uci = group["candidate_uci"]
+        first_capture_board = outcomes[0][1]
+        infos = engine.analyse(
+            first_capture_board,
+            chess.engine.Limit(depth=8, time=search_time),
+            multipv=min(5, max(1, len(common_uci))),
+        )
+        if not isinstance(infos, list):
+            infos = [infos]
+        ordered = []
+        seen = set()
+        for info in infos:
+            pv = info.get("pv") if isinstance(info, dict) else None
+            if pv and pv[0].uci() in common_uci and pv[0].uci() not in seen:
+                ordered.append(pv[0])
+                seen.add(pv[0].uci())
+        for move in group["candidate_moves"]:
+            if move.uci() in common_uci and move.uci() not in seen:
+                ordered.append(move)
+                seen.add(move.uci())
+
+        # Keep the latency bounded. If the strongest common recapture is unsafe,
+        # skip this square rather than trying a long list of speculative moves.
+        for candidate in ordered[:1]:
+            safe, worst_eval, reason = _candidate_safe_across_outcomes(
+                engine, outcomes, candidate, bot_color, search_time, baseline_cache
+            )
+            if safe and worst_eval is not None:
+                target_name = chess.square_name(group["target_square"])
+                return (
+                    candidate,
+                    outcomes[0][0],
+                    f"midgame-safe-recapture target={target_name} worst={worst_eval / 100:+.2f}",
+                )
+            # A failed safety proof means this target is not a suitable premove.
+            break
+
+    # 2) Universal-safe move: the exact same move must be legal after every
+    # possible opponent move, then pass engine checks in every resulting position.
+    predicted_reply = current_lines[0]["pv"][0]
+    predicted_board = next(
+        (position for reply, position in response_boards if reply == predicted_reply),
+        None,
+    )
+    if predicted_board is None or not universal_uci:
+        return None, None, "no-universal-safe-move-or-safe-recapture"
+
+    own_lines = engine.analyse(
+        predicted_board,
+        chess.engine.Limit(depth=8, time=search_time),
+        multipv=5,
+    )
+    if not isinstance(own_lines, list):
+        own_lines = [own_lines]
+    candidates = []
+    seen = set()
+    for info in own_lines:
+        pv = info.get("pv") if isinstance(info, dict) else None
+        if not pv:
+            continue
+        move = pv[0]
+        if (
+            move.uci() in universal_uci
+            and move.uci() not in seen
+            and move.promotion is None
+            and not predicted_board.is_castling(move)
+        ):
+            candidates.append(move)
+            seen.add(move.uci())
+
+    for candidate in candidates[:2]:
+        safe, worst_eval, _reason = _candidate_safe_across_outcomes(
+            engine, response_boards, candidate, bot_color, search_time, baseline_cache
+        )
+        if safe and worst_eval is not None:
+            return (
+                candidate,
+                predicted_reply,
+                f"midgame-universal-safe worst={worst_eval / 100:+.2f}",
+            )
+
+    return None, None, "no-midgame-premove-passed-all-reply-checks"
+
+
 def choose_premove_candidate(
     engine, board, strategy_module, bot_color: str, args, book=None,
     opponent_match_history: list[float] | None = None,
 ) -> tuple[object | None, object | None, str]:
-    """Select a safe premove only in the opening/endgame, without changing normal strategy state."""
+    """Choose an opening/endgame premove or a verified-safe middlegame candidate."""
     if chess is None or engine is None or strategy_module is None or board is None:
         return None, None, "premove-prerequisites-unavailable"
-    allowed, phase = premove_phase_allowed(board)
-    if not allowed:
-        return None, None, phase
     if board.is_game_over(claim_draw=True):
         return None, None, "game-over"
 
@@ -1374,9 +1648,14 @@ def choose_premove_candidate(
     if board.turn == bot_turn:
         return None, None, "bot-turn-already-active"
 
+    allowed, phase = premove_phase_allowed(board)
+    if not allowed:
+        return choose_middle_game_premove(engine, board, strategy_module, bot_color, args)
+
     search_time = max(0.005, min(float(args.engine_time), 0.025))
     try:
-        # Do not premove from a position Stockfish already considers losing.
+        # Preserve the previous opening/endgame policy, with its existing
+        # loss/evaluation-drop checks.
         opponent_lines = engine.analyse(
             board, chess.engine.Limit(depth=8, time=search_time), multipv=3
         )
@@ -2217,7 +2496,6 @@ def main() -> int:
                                 and not turn_conflict
                                 and api_my_turn is not True
                                 and fen != last_premove_attempt_fen
-                                and premove_phase_allowed(engine_board)[0]
                                 and not engine_board.is_game_over(claim_draw=True)
                             ):
                                 # A premove is speculative: analyze the likely opponent reply,
