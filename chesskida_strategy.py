@@ -16,7 +16,7 @@ import chess.engine
 ANALYSIS_TIME = 0.010
 ANALYSIS_DEPTH = 8
 BOT_EVERY_MOVE_DELAY_MIN = 0.035
-BOT_EVERY_MOVE_DELAY_MAX = 0.950
+BOT_EVERY_MOVE_DELAY_MAX = 2.100
 BOT_THINKING_ENABLED_DEFAULT = True
 BOT_THINKING_START_AFTER_MOVE = 8
 BOT_BOOK_INSTANT_MOVES = 8
@@ -323,28 +323,39 @@ def _sample_base_move_delay(
     forced=False,
     opening_book=False,
 ) -> float:
-    """Sample a short per-move delay with a skewed, non-uniform distribution."""
+    """Sample visibly broad timing bands without clustering around one tenth."""
     complexity = _timing_position_complexity(
         board, move, engine_result=engine_result, selection_meta=selection_meta
     )
     if forced or opening_book:
-        # Quick reactions still have a small, variable UI-settle interval.
-        base = random.triangular(0.025, 0.260, 0.075)
+        # Forcing replies stay quick; jitter prevents a fixed-looking interval.
+        base = random.choice((
+            random.uniform(0.018, 0.055),
+            random.uniform(0.045, 0.115),
+            random.uniform(0.080, 0.185),
+        ))
     else:
+        # Pick among separated bands first, then sample inside the band. This
+        # avoids the previous heavy clustering around roughly 0.5-0.7 seconds.
         roll = random.random()
-        if roll < 0.58:
-            base = random.triangular(0.045, 0.300, 0.115)
-        elif roll < 0.88:
-            base = random.triangular(0.120, 0.620, 0.285)
+        if roll < 0.18:
+            base = random.uniform(0.070, 0.240)
+        elif roll < 0.40:
+            base = random.uniform(0.190, 0.460)
+        elif roll < 0.61:
+            base = random.uniform(0.360, 0.760)
+        elif roll < 0.78:
+            base = random.uniform(0.620, 1.080)
+        elif roll < 0.92:
+            base = random.uniform(0.900, 1.520)
         else:
-            base = random.triangular(0.300, 0.900, 0.470)
-    complexity_factor = 0.82 + 0.72 * complexity
-    micro_jitter = random.uniform(0.0, 0.065)
+            base = random.uniform(1.250, 2.000)
+    complexity_factor = 0.88 + 0.42 * complexity
+    micro_jitter = random.uniform(0.0, 0.085)
     return min(
         BOT_EVERY_MOVE_DELAY_MAX,
         max(BOT_EVERY_MOVE_DELAY_MIN, base * complexity_factor + micro_jitter),
     )
-
 
 def _sample_thinking_pause(pause_max: float, complexity: float = 0.0) -> float:
     """Use a varied short/medium/long mixture instead of a repeated uniform 2-5s wait."""
@@ -380,7 +391,8 @@ def natural_bot_move_delay(
     initial_time_seconds=None,
     remaining_time_seconds=None,
     increment_seconds=0.0,
-    is_opening_book_move=False
+    is_opening_book_move=False,
+    opponent_time_seconds=None,
 ):
     """Return a small move delay plus clock-bounded optional pauses.
 
@@ -420,7 +432,47 @@ def natural_bot_move_delay(
 
     _bot_timing_move_count += 1
 
-    # Short per-move delay depends on board complexity and varies across several ranges.
+    own_clock = None
+    opponent_clock = None
+    try:
+        own_clock = (
+            max(0.0, float(remaining_time_seconds))
+            if remaining_time_seconds is not None else None
+        )
+    except (TypeError, ValueError):
+        pass
+    try:
+        opponent_clock = (
+            max(0.0, float(opponent_time_seconds))
+            if opponent_time_seconds is not None else None
+        )
+    except (TypeError, ValueError):
+        pass
+    clock_gap = (
+        own_clock - opponent_clock
+        if own_clock is not None and opponent_clock is not None
+        else None
+    )
+
+    # Under ten seconds, protect the clock: no discretionary pauses and only
+    # a tiny, randomized handoff interval. The caller separately caps search.
+    if own_clock is not None and own_clock <= 10.0:
+        quick_delay = random.choice((
+            random.uniform(0.010, 0.025),
+            random.uniform(0.018, 0.045),
+            random.uniform(0.030, 0.065),
+        ))
+        _last_bot_natural_delay = quick_delay
+        print(
+            f"[CLOCK MODE] low-clock fast path own={own_clock:.2f}s "
+            f"opponent={opponent_clock:.2f}s"
+            if opponent_clock is not None
+            else f"[CLOCK MODE] low-clock fast path own={own_clock:.2f}s opponent=unknown",
+            flush=True,
+        )
+        return quick_delay
+
+    # Short per-move delay depends on complexity, with broad independent bands.
     base_delay = _sample_base_move_delay(
         board,
         move,
@@ -429,7 +481,18 @@ def natural_bot_move_delay(
         opening_book=is_opening_book_move,
     )
     delay = base_delay
-    _last_bot_natural_delay = base_delay
+    # Protect a clock lead instead of spending time at the same rate regardless
+    # of the opponent. If clocks are close or we trail, keep moves snappy.
+    if clock_gap is not None:
+        if clock_gap < 0.0:
+            delay = min(delay, random.uniform(0.025, 0.120))
+        elif clock_gap < 3.0:
+            delay = min(delay, random.uniform(0.035, 0.180))
+        elif clock_gap < 8.0:
+            delay = min(delay, random.uniform(0.070, 0.300))
+        elif clock_gap < 15.0:
+            delay = min(delay, random.uniform(0.140, 0.550))
+    _last_bot_natural_delay = delay
 
     # Never let optional pauses consume the clock reserve needed to finish and
     # confirm a move. The remaining clock is an observation, not a fake timer.
@@ -452,7 +515,7 @@ def natural_bot_move_delay(
     if is_opening_book_move and _bot_timing_move_count <= BOT_BOOK_INSTANT_MOVES:
         # Opening-book moves remain fast, but no longer fire with a zero-second gap.
         _last_bot_natural_delay = base_delay
-        return max(0.020, float(base_delay))
+        return max(0.010, float(delay))
 
     # Forced/tactical replies should not consume an artificial pause budget.
     try:
@@ -470,6 +533,7 @@ def natural_bot_move_delay(
                 selection_meta=selection_meta,
                 forced=True,
             )
+            quick_delay = min(quick_delay, delay)
             _last_bot_natural_delay = quick_delay
             return quick_delay
     except Exception:
@@ -480,6 +544,9 @@ def natural_bot_move_delay(
         return max(0.0, float(delay))
 
     if not thinking_enabled:
+        return max(0.0, float(delay))
+
+    if clock_gap is not None and clock_gap < 15.0:
         return max(0.0, float(delay))
 
     # Late/endgame positions use occasional short pauses rather than the
@@ -507,6 +574,8 @@ def natural_bot_move_delay(
                 else:
                     reserve = max(0.25, min(1.0, remaining_clock * 0.10))
                 pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
+                if clock_gap is not None:
+                    pause_max = min(pause_max, max(0.0, clock_gap - 5.0))
             except (TypeError, ValueError):
                 pass
         if (
@@ -684,6 +753,8 @@ def natural_bot_move_delay(
             else:
                 reserve = max(0.25, min(2.0, remaining_clock * 0.08))
             pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
+            if clock_gap is not None:
+                pause_max = min(pause_max, max(0.0, clock_gap - 5.0))
         except (TypeError, ValueError):
             pass
 
