@@ -1115,7 +1115,7 @@ def perform_cursor_drag(
 
     try:
         # Use W3C pointer actions so each curve segment can receive its own
-        # duration. These durations add up to the randomized 100-300 ms budget.
+        # duration. The travel durations add up to the randomized 10-200 ms budget.
         if pre_delay_ms:
             time.sleep(pre_delay_ms / 1000.0)
 
@@ -1168,7 +1168,7 @@ def perform_cursor_drag(
                 "ok": True,
                 "uci": text,
                 "drag_ms": total_drag_ms,
-            "pre_delay_ms": pre_delay_ms,
+                "pre_delay_ms": pre_delay_ms,
                 "waypoints": waypoint_count,
             }
         time.sleep(0.025)
@@ -1177,7 +1177,7 @@ def perform_cursor_drag(
         "ok": False,
         "reason": "cursor-drag-not-confirmed",
         "drag_ms": total_drag_ms,
-            "pre_delay_ms": pre_delay_ms,
+        "pre_delay_ms": pre_delay_ms,
         "waypoints": waypoint_count,
     }
 
