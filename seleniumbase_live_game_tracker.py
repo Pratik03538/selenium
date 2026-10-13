@@ -764,12 +764,13 @@ def main() -> int:
     # time_control_seconds=60 and clock_increment_seconds=0.
     configured_time_control = load_optional_txt_setting("time_control_seconds")
     try:
-        initial_game_clock_seconds = (
+        configured_time_control_seconds = (
             max(0.0, float(configured_time_control))
             if configured_time_control else None
         )
     except ValueError:
-        initial_game_clock_seconds = None
+        configured_time_control_seconds = None
+    initial_game_clock_seconds = configured_time_control_seconds
     try:
         clock_increment_seconds = max(
             0.0, float(load_optional_txt_setting("clock_increment_seconds") or 0.0)
@@ -915,14 +916,15 @@ def main() -> int:
                         and is_start_position(fen)
                         and not is_start_position(previous_fen)
                     )
-                    if is_new_game_snapshot and not configured_time_control:
+                    if is_new_game_snapshot and configured_time_control_seconds is None:
                         initial_game_clock_seconds = None
+                        clock_source_reported = False
                     if initial_game_clock_seconds is None and observed_clocks:
                         initial_game_clock_seconds = max(observed_clocks)
                     if observed_clocks and not clock_source_reported:
                         source_note = (
                             "configured time-control value"
-                            if configured_time_control and initial_game_clock_seconds is not None
+                            if configured_time_control_seconds is not None
                             else "first observed clock reading (estimate)"
                         )
                         print(
