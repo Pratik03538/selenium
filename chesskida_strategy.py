@@ -268,19 +268,14 @@ def natural_bot_move_delay(
     increment_seconds=0.0,
     is_opening_book_move=False
 ):
-    """Return the retained base delay plus irregular human-like pauses.
+    """Return a small move delay plus clock-bounded optional pauses.
 
-    Cadence rules:
-      * first 10 bot moves: no long pause
-      * after a real pause: only 5-8 moves are guaranteed pause-free
-      * after that, every move is reevaluated from the current position, so
-        another pause can happen around 5-8 moves sometimes, or 10-12 moves
-        later in other situations; there is no fixed N-move schedule
-      * after move 50: normal pauses stop
-      * after move 50, only one final pause is allowed when Stockfish has a
-        mate-in-5..mate-in-1 opportunity; the exact mate distance is random
-        by position, and the special mate pause is used at most once
-      * regular pause time uses the existing 10-15 second game budget
+    Timing policy:
+      * the first eight bot moves never receive a long pause
+      * the first eight available book moves and forcing/tactical moves are immediate
+      * optional pauses are capped at 60% of the observed starting clock
+      * a 10-15 second fallback budget is used only when clocks are unavailable
+      * low-clock and late/endgame states allow only short pauses
     """
     global _last_bot_natural_delay
     global _bot_timing_move_count
@@ -289,7 +284,7 @@ def natural_bot_move_delay(
     global _thinking_move_cooldown_remaining
     global _mate_pause_used
 
-    if len(board.move_stack) <= 1:
+    if _thinking_budget_remaining is None or len(board.move_stack) <= 1:
         _bot_timing_move_count = 0
         if initial_time_seconds is not None and float(initial_time_seconds) > 0:
             initial_clock = float(initial_time_seconds)
