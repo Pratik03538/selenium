@@ -653,7 +653,7 @@ window.__liveGameApiReader = {
     if (wantedColor !== 'white' && wantedColor !== 'black') {
       return {ok: false, reason: 'player-color-unconfirmed'};
     }
-    const fenFields = currentFen.split(/\\s+/);
+    const fenFields = currentFen.split(/\s+/);
     const fenTurn = fenFields[1] === 'w' ? 'white' : (fenFields[1] === 'b' ? 'black' : '');
     if (fenTurn !== wantedColor) {
       return {ok: false, reason: 'not-configured-player-turn'};
