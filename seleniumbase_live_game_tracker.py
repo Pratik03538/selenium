@@ -462,9 +462,11 @@ function detectConfiguredPlayerColor(configuredName) {
   }
 
   const matches = [];
+  let exactNameFound = false;
   for (const el of queryAllDeep('*')) {
     const text = normalizePlayerText(el.innerText || el.textContent || '');
     if (text !== wanted) continue;
+    exactNameFound = true;
     const evidence = sideEvidenceFromNode(el);
     if (evidence && !matches.some(item => item.color === evidence.color)) {
       matches.push(evidence);
@@ -475,6 +477,9 @@ function detectConfiguredPlayerColor(configuredName) {
   }
   if (matches.length > 1) {
     return {color: null, source: 'player-name-matched-conflicting-elements', matched: true};
+  }
+  if (exactNameFound) {
+    return {color: null, source: 'player-name-found-side-unknown', matched: true};
   }
   return {color: null, source: 'player-name-not-found', matched: false};
 }
@@ -1019,6 +1024,7 @@ def main() -> int:
                 writer.writeheader()
             print("[MODE] Live state reader active (DOM observer + 200ms state fallback); Ctrl+C to stop.", flush=True)
             last_console_signature = None
+            last_name_debug_signature = None
             while True:
                 # Closing the chosen tab often yields current_url=None in ChromeDriver.
                 if chosen_handle not in driver.window_handles:
@@ -1222,6 +1228,36 @@ def main() -> int:
                             f"isMyTurn={event.get('isMyTurn')}",
                             flush=True,
                         )
+                        name_debug_signature = (
+                            event.get("playerNameColor"),
+                            event.get("playerNameColorSource"),
+                            event.get("playerNameMatched"),
+                        )
+                        if (
+                            load_optional_txt_setting("player_name").strip()
+                            and name_debug_signature != last_name_debug_signature
+                        ):
+                            last_name_debug_signature = name_debug_signature
+                            if event.get("playerNameColor") in {"white", "black"}:
+                                print(
+                                    f"[NAME DEBUG] Configured player name resolved to "
+                                    f"{event.get('playerNameColor')} via "
+                                    f"{event.get('playerNameColorSource')}.",
+                                    flush=True,
+                                )
+                            elif event.get("playerNameMatched"):
+                                print(
+                                    "[NAME DEBUG] Player name text was found, but its side is unknown. "
+                                    "Set white_player_selector and black_player_selector to the exact "
+                                    "containers that include each player's name.",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    "[NAME DEBUG] Exact player_name text was not found. "
+                                    "Check the spelling and visible username text in tracker_settings.txt.",
+                                    flush=True,
+                                )
                         if fen:
                             print("       ", fen, flush=True)
                         if last_move:
