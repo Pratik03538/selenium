@@ -514,7 +514,7 @@ def natural_bot_move_delay(
     # first eight book selections. The site must still confirm the move.
     if is_opening_book_move and _bot_timing_move_count <= BOT_BOOK_INSTANT_MOVES:
         # Opening-book moves remain fast, but no longer fire with a zero-second gap.
-        _last_bot_natural_delay = base_delay
+        _last_bot_natural_delay = delay
         return max(0.010, float(delay))
 
     # Forced/tactical replies should not consume an artificial pause budget.
