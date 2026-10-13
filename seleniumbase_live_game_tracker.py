@@ -1101,21 +1101,21 @@ def perform_cursor_drag(
 
         actions = ActionChains(driver)
         pointer = actions.w3c_actions.pointer_action
-        pointer.move_to(
-            board_element,
+        pointer.source.create_pointer_move(
+            origin=board_element,
+            duration=rng.randint(40, 90),
             x=source_offset[0],
             y=source_offset[1],
-            duration=rng.randint(40, 90),
         )
         pointer.pause(hover_ms / 1000.0)
         pointer.pointer_down()
 
         for (px, py), segment_ms in zip(path_points, segment_durations):
-            pointer.move_to(
-                board_element,
+            pointer.source.create_pointer_move(
+                origin=board_element,
+                duration=segment_ms,
                 x=round(px - width / 2.0),
                 y=round(py - height / 2.0),
-                duration=segment_ms,
             )
 
         pointer.pointer_up()
