@@ -287,6 +287,30 @@ function queryAllDeep(selector) {
   }
   return out;
 }
+function queryAllWithinDeep(root, selector) {
+  if (!root || !selector) return [];
+  const roots = [root];
+  if (root.shadowRoot) roots.push(root.shadowRoot);
+  const out = [], seen = new Set();
+  for (let i = 0; i < roots.length; i++) {
+    const current = roots[i];
+    try {
+      if (current.matches && current.matches(selector) && !seen.has(current)) {
+        seen.add(current);
+        out.push(current);
+      }
+    } catch (_) {}
+    try {
+      for (const el of current.querySelectorAll(selector)) {
+        if (!seen.has(el)) { seen.add(el); out.push(el); }
+      }
+      for (const el of current.querySelectorAll('*')) {
+        if (el.shadowRoot) roots.push(el.shadowRoot);
+      }
+    } catch (_) {}
+  }
+  return out;
+}
 function callMaybe(obj, name) {
   try { return obj && typeof obj[name] === 'function' ? obj[name]() : null; }
   catch (_) { return null; }
@@ -369,10 +393,9 @@ function detectBottomSide(board) {
     }
   }
 
-  // IMPORTANT: coordinate labels are more direct evidence than a generic
-  // `flipped` CSS class, which some board implementations reuse for styling.
-  // This follows the supplied userscript's coordinate-based approach.
-  for (const coordinates of queryAllDeep('.coordinates')) {
+  // Coordinate labels must belong to this exact board. A page may contain a
+  // hidden/previous board; global label lookup can report the wrong orientation.
+  for (const coordinates of queryAllWithinDeep(board, '.coordinates')) {
     const children = Array.from(coordinates.children || []);
     const labels = children.map(el => String(el.innerText || el.textContent || '').trim());
     if (labels.length && labels[0] === '1') {
@@ -615,7 +638,7 @@ window.__liveGameApiReader = {
   status: () => ({lastError: state.lastError, pending: state.queue.length}),
   drain: () => state.queue.splice(0, state.queue.length),
   current: () => state.snapshot(),
-  dragTarget: (uci, expectedFen) => {
+  dragTarget: (uci, expectedFen, expectedColor) => {
     const board = getBoard();
     const game = board && board.game;
     if (!board || !game || typeof game.getFEN !== 'function' ||
@@ -626,6 +649,15 @@ window.__liveGameApiReader = {
     if (!currentFen || currentFen !== String(expectedFen || '').trim()) {
       return {ok: false, reason: 'position-changed-before-drag'};
     }
+    const wantedColor = String(expectedColor || '').trim().toLowerCase();
+    if (wantedColor !== 'white' && wantedColor !== 'black') {
+      return {ok: false, reason: 'player-color-unconfirmed'};
+    }
+    const fenFields = currentFen.split(/\\s+/);
+    const fenTurn = fenFields[1] === 'w' ? 'white' : (fenFields[1] === 'b' ? 'black' : '');
+    if (fenTurn !== wantedColor) {
+      return {ok: false, reason: 'not-configured-player-turn'};
+    }
     const text = String(uci || '').toLowerCase();
     if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(text)) {
       return {ok: false, reason: 'invalid-uci'};
@@ -633,6 +665,30 @@ window.__liveGameApiReader = {
     const raw = callMaybe(game, 'getLegalMoves');
     if (!Array.isArray(raw)) return {ok: false, reason: 'legal-moves-unavailable'};
     const from = text.slice(0, 2), to = text.slice(2, 4), promo = text.slice(4, 5);
+    // Independently verify the source piece color from the authoritative FEN.
+    const fenRanks = String(fenFields[0] || '').split('/');
+    const sourceFile = from.charCodeAt(0) - 97;
+    const sourceRank = Number(from[1]);
+    let sourcePiece = '';
+    if (fenRanks.length === 8 && sourceFile >= 0 && sourceFile < 8 && sourceRank >= 1 && sourceRank <= 8) {
+      const row = fenRanks[8 - sourceRank];
+      let file = 0;
+      for (const token of row) {
+        if (/^[1-8]$/.test(token)) {
+          file += Number(token);
+        } else {
+          if (file === sourceFile) { sourcePiece = token; break; }
+          file += 1;
+        }
+      }
+    }
+    if (!sourcePiece || !/^[prnbqkPRNBQK]$/.test(sourcePiece)) {
+      return {ok: false, reason: 'source-square-empty-in-fen'};
+    }
+    const sourceColor = sourcePiece === sourcePiece.toUpperCase() ? 'white' : 'black';
+    if (sourceColor !== wantedColor) {
+      return {ok: false, reason: 'source-piece-is-not-configured-player'};
+    }
     const candidates = raw.filter(m => m &&
       String(m.from || '').toLowerCase() === from &&
       String(m.to || '').toLowerCase() === to);
@@ -663,7 +719,10 @@ window.__liveGameApiReader = {
       boardElement: board,
       width: rect.width,
       height: rect.height,
-      bottomSide: orientation.side
+      bottomSide: orientation.side,
+      fenTurn,
+      sourceColor,
+      sourcePiece
     };
   },
   playUci: (uci, expectedFen) => {
@@ -877,7 +936,9 @@ def calculate_engine_search_limit(
     return max(0.005, min(base, clock_cap))
 
 
-def perform_cursor_drag(driver, uci: str, expected_fen: str) -> dict[str, object]:
+def perform_cursor_drag(
+    driver, uci: str, expected_fen: str, expected_color: str | None
+) -> dict[str, object]:
     """Perform a real Selenium pointer drag on the configured, non-blocked test board.
 
     This is intended for UI testing of an owned site. Square centers receive small,
@@ -889,7 +950,7 @@ def perform_cursor_drag(driver, uci: str, expected_fen: str) -> dict[str, object
             "return window.__liveGameApiReader ? "
             "window.__liveGameApiReader.dragTarget(arguments[0], arguments[1]) : "
             "{ok:false, reason:'reader-not-installed'};",
-            uci, expected_fen,
+            uci, expected_fen, expected_color,
         )
     except WebDriverException:
         return {"ok": False, "reason": "drag-target-unavailable"}
@@ -1701,7 +1762,9 @@ def main() -> int:
                                         time.sleep(natural_delay)
 
                                     if args.move_input == "cursor":
-                                        submit = perform_cursor_drag(driver, chosen_move.uci(), fen)
+                                        submit = perform_cursor_drag(
+                                            driver, chosen_move.uci(), fen, active_bot_color
+                                        )
                                     else:
                                         submit = driver.execute_script(
                                             "return window.__liveGameApiReader ? window.__liveGameApiReader.playUci(arguments[0], arguments[1]) : {ok:false, reason:'reader-not-installed'};",
