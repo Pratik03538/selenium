@@ -1646,7 +1646,8 @@ def choose_stockfish_move(
     opponent_accuracy=None,
     opponent_sample_count=0,
     opponent_pressure=False,
-    engine=None
+    engine=None,
+    bot_color=None
 ):
     # Reset the historical fuzzy state at a fresh match/new game.
     # This is retained from the fast-main-match-controls branch so a previous
@@ -1686,6 +1687,20 @@ def choose_stockfish_move(
                 "current_cp": 0,
                 "selected_cp": 0,
                 "reason": "no MultiPV candidates"
+            }
+        )
+
+    # Candidate scores are converted to the side-to-move perspective below.
+    # For this bot integration, the side-to-move must also be the verified bot side.
+    if bot_color is not None and board.turn != bot_color:
+        return (
+            None,
+            None,
+            {
+                "rank": 0,
+                "current_cp": 0,
+                "selected_cp": 0,
+                "reason": "BOT COLOR GUARD | position is not the bot's turn"
             }
         )
 
