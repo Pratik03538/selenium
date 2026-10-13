@@ -475,6 +475,34 @@ function sideEvidenceFromNode(start) {
   }
   return null;
 }
+function sideEvidenceFromPlayerPanelClock(start) {
+  // Determine side from the clock inside the nearest container for this exact
+  // username. Ignore outer wrappers that contain both players' clocks.
+  let node = start;
+  for (
+    let depth = 0;
+    node && depth <= 9;
+    depth++,
+    node = node.parentElement || node.getRootNode?.().host
+  ) {
+    let clocks = [];
+    try {
+      clocks = Array.from(node.querySelectorAll?.('.clock-component') || []);
+    } catch (_) {}
+    if (clocks.length !== 1) continue;
+
+    const clock = clocks[0];
+    const isWhite = !!clock.classList?.contains('clock-white');
+    const isBlack = !!clock.classList?.contains('clock-black');
+    if (isWhite !== isBlack) {
+      return {
+        color: isWhite ? 'white' : 'black',
+        source: 'matched-player-panel-clock-class'
+      };
+    }
+  }
+  return null;
+}
 function detectConfiguredPlayerColor(configuredName) {
   const wanted = normalizePlayerText(configuredName);
   if (!wanted) return {color: null, source: 'player-name-not-configured', matched: false};
@@ -500,7 +528,7 @@ function detectConfiguredPlayerColor(configuredName) {
     if (text !== wanted) continue;
     exactNameFound = true;
     if (!nameContext) nameContext = describePlayerNameContext(el);
-    const evidence = sideEvidenceFromNode(el);
+    const evidence = sideEvidenceFromPlayerPanelClock(el) || sideEvidenceFromNode(el);
     if (evidence && !matches.some(item => item.color === evidence.color)) {
       matches.push(evidence);
     }
