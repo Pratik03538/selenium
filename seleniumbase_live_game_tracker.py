@@ -400,7 +400,7 @@ function normalizeColorToken(value) {
   return null;
 }
 function normalizePlayerText(value) {
-  return String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
+  return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
 }
 function selectorNameSide(name, selector, color) {
   if (!name || !selector) return false;
@@ -433,8 +433,8 @@ function sideEvidenceFromNode(start) {
       String(node.getAttribute?.('aria-label') || ''),
       String(node.getAttribute?.('title') || '')
     ].join(' ').toLowerCase();
-    const whiteHint = /(^|[\\s_-])white([\\s_-]|$)|white-player|player-white/.test(clues);
-    const blackHint = /(^|[\\s_-])black([\\s_-]|$)|black-player|player-black/.test(clues);
+    const whiteHint = /(^|[\s_-])white([\s_-]|$)|white-player|player-white/.test(clues);
+    const blackHint = /(^|[\s_-])black([\s_-]|$)|black-player|player-black/.test(clues);
     if (whiteHint !== blackHint) {
       return {color: whiteHint ? 'white' : 'black', source: 'player-name-ancestor-label'};
     }
@@ -1105,7 +1105,7 @@ def main() -> int:
                                     previous_eval_white_cp = None
                                     opponent_pressure = False
                                     last_auto_attempt_fen = ""
-                                    active_bot_color = configured_bot_color or api_bot_color
+                                    active_bot_color = configured_bot_color or player_name_color or api_bot_color
                                 elif strategy_transition is not None:
                                     strategy_move = chess.Move.from_uci(strategy_transition["uci"])
                                     if strategy_move in strategy_board.legal_moves:
