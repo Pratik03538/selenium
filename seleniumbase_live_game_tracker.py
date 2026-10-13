@@ -1450,6 +1450,10 @@ PREMOVE_OPENING_FULLMOVE_MAX = 5
 PREMOVE_ENDGAME_MAX_PIECES = 10
 PREMOVE_MIN_BOT_EVAL_CP = -25
 PREMOVE_MAX_EVAL_DROP_CP = 40
+# Middlegame recaptures: accept a reasonably broad reply set, not every legal blunder.
+# Rank is zero-indexed, so 4 means the top five replies; 175cp is a permissive gap.
+PREMOVE_LIKELY_REPLY_MAX_RANK = 4
+PREMOVE_LIKELY_REPLY_MAX_CP_GAP = 175
 
 
 def premove_phase_allowed(board) -> tuple[bool, str]:
@@ -1654,7 +1658,7 @@ def choose_middle_game_premove(
     current_lines = engine.analyse(
         board,
         chess.engine.Limit(depth=8, time=search_time),
-        multipv=min(3, len(response_boards)),
+        multipv=min(PREMOVE_LIKELY_REPLY_MAX_RANK + 1, len(response_boards)),
     )
     if not isinstance(current_lines, list):
         current_lines = [current_lines]
@@ -1671,12 +1675,51 @@ def choose_middle_game_premove(
     if current_eval < PREMOVE_MIN_BOT_EVAL_CP:
         return None, None, "bot-position-already-losing"
 
+    # Estimate whether the opponent capture is plausible. This is deliberately
+    # permissive: top-five replies within 1.75 pawns remain eligible. It only
+    # filters speculative recaptures; universal-safe premoves are still checked
+    # below. A candidate recapture must still pass the all-outcomes safety test.
+    reply_scores = []
+    for reply_rank, info in enumerate(current_lines[: PREMOVE_LIKELY_REPLY_MAX_RANK + 1]):
+        pv = info.get("pv") if isinstance(info, dict) else None
+        score_obj = info.get("score") if isinstance(info, dict) else None
+        if not pv or score_obj is None:
+            continue
+        try:
+            opponent_score = score_obj.pov(board.turn).score(mate_score=100000)
+        except (AttributeError, TypeError, ValueError):
+            opponent_score = None
+        if opponent_score is None:
+            continue
+        reply_scores.append((reply_rank, pv[0].uci(), int(opponent_score)))
+
+    plausible_reply_uci = set()
+    if reply_scores:
+        best_opponent_score = max(score for _rank, _uci, score in reply_scores)
+        plausible_reply_uci = {
+            uci
+            for rank, uci, score in reply_scores
+            if (
+                rank <= PREMOVE_LIKELY_REPLY_MAX_RANK
+                and best_opponent_score - score <= PREMOVE_LIKELY_REPLY_MAX_CP_GAP
+            )
+        }
+    elif current_lines and current_lines[0].get("pv"):
+        # Preserve the most likely predicted reply if MultiPV scores are partial.
+        plausible_reply_uci.add(current_lines[0]["pv"][0].uci())
+
+    likely_recapture_options = [
+        group
+        for group in recapture_options
+        if any(reply.uci() in plausible_reply_uci for reply, _after in group["outcomes"])
+    ]
+
     baseline_cache: dict[str, int | None] = {}
 
     # 1) Midgame recapture: choose one destination currently occupied by our
     # piece. The premove can only become legal when that piece is captured;
     # check every legal capture to this square and reject unsafe recaptures.
-    for group in recapture_options:
+    for group in likely_recapture_options:
         outcomes = group["outcomes"]
         common_uci = group["candidate_uci"]
         first_capture_board = outcomes[0][1]
