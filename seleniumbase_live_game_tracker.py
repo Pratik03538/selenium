@@ -171,8 +171,8 @@ def host_for(url: str | None) -> str:
         return ""
 
 
-def is_public_competitive_host(host: str) -> bool:
-    """Keep this live reader restricted to private/authorized test sites."""
+def is_stockfish_autoplay_blocked_host(host: str) -> bool:
+    """Prevent automatic Stockfish moves on public competitive chess platforms."""
     host = (host or "").lower().rstrip(".").removeprefix("www.")
     blocked_roots = (
         "chess.com", "lichess.org", "chess24.com", "chessclub.com",
@@ -181,7 +181,7 @@ def is_public_competitive_host(host: str) -> bool:
 
 
 def target_matches(url: str | None, allowed_host: str) -> bool:
-    """Internal allowlist check. Values are never included in user-facing output."""
+    """Allow HTTP(S) tabs on the configured host for live read-only tracking."""
     if not isinstance(url, str) or not url.strip():
         return False
     try:
@@ -190,8 +190,6 @@ def target_matches(url: str | None, allowed_host: str) -> bool:
         return False
     host = host_for(url)
     if parsed.scheme not in {"http", "https"} or not host:
-        return False
-    if is_public_competitive_host(host):
         return False
     return host == allowed_host or host.endswith("." + allowed_host)
 
@@ -697,7 +695,7 @@ def main() -> int:
         if args.auto_play:
             if chess is None:
                 raise RuntimeError("Autoplay requires python-chess. Install with: python -m pip install python-chess")
-            if is_public_competitive_host(allowed_host):
+            if is_stockfish_autoplay_blocked_host(allowed_host):
                 raise RuntimeError("Autoplay is disabled for public competitive chess platforms.")
             if not installed.get("boardFound") or not installed.get("gameApiFound"):
                 raise RuntimeError("Autoplay needs the site's exposed board game API.")
