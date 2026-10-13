@@ -15,28 +15,28 @@ import chess.engine
 # Constants used by the extracted strategy/timing functions.
 ANALYSIS_TIME = 0.010
 ANALYSIS_DEPTH = 8
-BOT_EVERY_MOVE_DELAY_MIN = 0.000
-BOT_EVERY_MOVE_DELAY_MAX = 0.010
+BOT_EVERY_MOVE_DELAY_MIN = 0.035
+BOT_EVERY_MOVE_DELAY_MAX = 0.750
 BOT_THINKING_ENABLED_DEFAULT = True
 BOT_THINKING_START_AFTER_MOVE = 8
 BOT_BOOK_INSTANT_MOVES = 8
-BOT_ENDGAME_PAUSE_MIN = 0.15
-BOT_ENDGAME_PAUSE_MAX = 0.75
-BOT_ENDGAME_PAUSE_CHANCE = 0.15
-BOT_PAUSE_MOVE_COOLDOWN_MIN = 5
+BOT_ENDGAME_PAUSE_MIN = 0.25
+BOT_ENDGAME_PAUSE_MAX = 2.400
+BOT_ENDGAME_PAUSE_CHANCE = 0.23
+BOT_PAUSE_MOVE_COOLDOWN_MIN = 2
 BOT_PAUSE_MOVE_COOLDOWN_MAX = 12
-BOT_PAUSE_ELIGIBILITY_SCALE = 0.55
+BOT_PAUSE_ELIGIBILITY_SCALE = 0.62
 BOT_POST_50_MOVE = 50
 BOT_MATE_PAUSE_MIN_MATE = 1
 BOT_MATE_PAUSE_MAX_MATE = 5
-BOT_THINK_PAUSE_MIN = 2.0
-BOT_THINK_PAUSE_MAX = 5.0
-BOT_MATE_PAUSE_MIN = 2.0
-BOT_MATE_PAUSE_MAX = 5.0
-BOT_THINK_BUDGET_MIN = 10.0
-BOT_THINK_BUDGET_MAX = 15.0
-BOT_THINK_ELIGIBILITY_MIN = 0.18
-BOT_THINK_ELIGIBILITY_MAX = 0.65
+BOT_THINK_PAUSE_MIN = 0.450
+BOT_THINK_PAUSE_MAX = 8.500
+BOT_MATE_PAUSE_MIN = 1.5
+BOT_MATE_PAUSE_MAX = 6.5
+BOT_THINK_BUDGET_MIN = 14.0
+BOT_THINK_BUDGET_MAX = 26.0
+BOT_THINK_ELIGIBILITY_MIN = 0.10
+BOT_THINK_ELIGIBILITY_MAX = 0.72
 BOT_THINK_REASONABLE_CP = 60
 BOT_THINK_UNCERTAINTY_CP = 75
 BOT_THINK_SHARP_EVAL_CP = 80
@@ -255,6 +255,117 @@ def classify_move_quality(
 
     return "BLUNDER"
 
+def _timing_position_complexity(
+    board,
+    move,
+    engine_result=None,
+    selection_meta=None,
+) -> float:
+    """Estimate decision complexity from the actual position and candidate spread."""
+    complexity = 0.0
+    try:
+        legal_count = board.legal_moves.count()
+        complexity += min(0.28, max(0, legal_count - 12) * 0.009)
+    except Exception:
+        pass
+    try:
+        if board.is_check():
+            complexity += 0.16
+        if board.gives_check(move):
+            complexity += 0.12
+        if board.is_capture(move):
+            complexity += 0.08
+        if move.promotion is not None:
+            complexity += 0.18
+        if len(board.piece_map()) <= 12:
+            complexity += 0.10
+    except Exception:
+        pass
+
+    scores = []
+    if isinstance(engine_result, list):
+        for info in engine_result[:TRAINING_MULTI_PV]:
+            try:
+                score_obj = info.get("score")
+                if score_obj is None:
+                    continue
+                cp = score_to_cp(score_obj.pov(board.turn))
+                if cp is not None:
+                    scores.append(int(cp))
+            except Exception:
+                continue
+    if len(scores) >= 2:
+        gap = abs(scores[0] - scores[1])
+        if gap <= BOT_THINK_UNCERTAINTY_CP:
+            complexity += 0.18
+        if sum(abs(score - scores[0]) <= BOT_THINK_REASONABLE_CP for score in scores) >= 3:
+            complexity += 0.12
+
+    if isinstance(selection_meta, dict):
+        try:
+            rank = int(selection_meta.get("rank", 0))
+            if rank >= 2:
+                complexity += min(0.10, rank * 0.018)
+        except (TypeError, ValueError):
+            pass
+        reason = str(selection_meta.get("reason", "")).lower()
+        if any(token in reason for token in ("controlled shuffle", "advantage maintain", "mate")):
+            complexity += 0.06
+
+    return min(1.0, max(0.0, complexity))
+
+
+def _sample_base_move_delay(
+    board,
+    move,
+    engine_result=None,
+    selection_meta=None,
+    forced=False,
+    opening_book=False,
+) -> float:
+    """Sample a short per-move delay with a skewed, non-uniform distribution."""
+    complexity = _timing_position_complexity(
+        board, move, engine_result=engine_result, selection_meta=selection_meta
+    )
+    if forced or opening_book:
+        # Quick reactions still have a small, variable UI-settle interval.
+        base = random.triangular(0.025, 0.260, 0.075)
+    else:
+        roll = random.random()
+        if roll < 0.58:
+            base = random.triangular(0.045, 0.300, 0.115)
+        elif roll < 0.88:
+            base = random.triangular(0.120, 0.620, 0.285)
+        else:
+            base = random.triangular(0.300, 0.900, 0.470)
+    complexity_factor = 0.82 + 0.72 * complexity
+    micro_jitter = random.uniform(0.0, 0.065)
+    return min(0.950, max(0.020, base * complexity_factor + micro_jitter))
+
+
+def _sample_thinking_pause(pause_max: float, complexity: float = 0.0) -> float:
+    """Use a varied short/medium/long mixture instead of a repeated uniform 2-5s wait."""
+    high = max(0.0, float(pause_max))
+    if high <= 0.0:
+        return 0.0
+    complexity = min(1.0, max(0.0, float(complexity)))
+    roll = random.random()
+    if roll < 0.54:
+        low = min(0.45, high)
+        high = min(high, 1.7 + 1.4 * complexity)
+        mode = min(high, 0.75 + 1.0 * complexity)
+    elif roll < 0.88:
+        low = min(1.0, high)
+        high = min(high, 4.2 + 2.0 * complexity)
+        mode = min(high, 1.8 + 1.7 * complexity)
+    else:
+        low = min(2.4, high)
+        mode = min(high, 4.6 + 2.0 * complexity)
+    if high <= low:
+        return max(0.0, high)
+    return random.triangular(low, high, min(high, max(low, mode)))
+
+
 def natural_bot_move_delay(
     board,
     move,
@@ -271,11 +382,11 @@ def natural_bot_move_delay(
     """Return a small move delay plus clock-bounded optional pauses.
 
     Timing policy:
-      * the first eight bot moves never receive a long pause
-      * a book move within the first eight bot turns, and forcing/tactical moves, is immediate
-      * optional pauses are capped at 60% of the observed starting clock
-      * a 10-15 second fallback budget is used only when clocks are unavailable
-      * low-clock and late/endgame states allow only short pauses
+      * routine move delays vary with position complexity
+      * book/tactical moves stay relatively quick but are not always zero-delay
+      * thinking pauses use a skewed short/medium/long distribution
+      * optional pauses remain clock-bounded and consume a finite game budget
+      * the first eight moves avoid multi-second pauses
     """
     global _last_bot_natural_delay
     global _bot_timing_move_count
@@ -294,10 +405,11 @@ def natural_bot_move_delay(
                 max(0.0, initial_clock - min(3.0, max(0.5, initial_clock * 0.08)))
             )
         else:
-            # Fallback when the configured test site does not expose a readable clock.
-            _thinking_budget_total = random.uniform(
+            # The site clock is not exposed; use a variable total pause budget.
+            _thinking_budget_total = random.triangular(
                 BOT_THINK_BUDGET_MIN,
-                BOT_THINK_BUDGET_MAX
+                BOT_THINK_BUDGET_MAX,
+                18.0
             )
         _thinking_budget_remaining = _thinking_budget_total
         _thinking_move_cooldown_remaining = 0
@@ -305,10 +417,13 @@ def natural_bot_move_delay(
 
     _bot_timing_move_count += 1
 
-    # Keep a very small default delay for ordinary moves.
-    base_delay = random.uniform(
-        BOT_EVERY_MOVE_DELAY_MIN,
-        BOT_EVERY_MOVE_DELAY_MAX
+    # Short per-move delay depends on board complexity and varies across several ranges.
+    base_delay = _sample_base_move_delay(
+        board,
+        move,
+        engine_result=engine_result,
+        selection_meta=selection_meta,
+        opening_book=is_opening_book_move,
     )
     delay = base_delay
     _last_bot_natural_delay = base_delay
@@ -332,8 +447,9 @@ def natural_bot_move_delay(
     # Opening-book moves are already known; do not wait unnecessarily on the
     # first eight book selections. The site must still confirm the move.
     if is_opening_book_move and _bot_timing_move_count <= BOT_BOOK_INSTANT_MOVES:
-        _last_bot_natural_delay = 0.0
-        return 0.0
+        # Opening-book moves remain fast, but no longer fire with a zero-second gap.
+        _last_bot_natural_delay = base_delay
+        return max(0.020, float(base_delay))
 
     # Forced/tactical replies should not consume an artificial pause budget.
     try:
@@ -344,8 +460,15 @@ def natural_bot_move_delay(
             or move.promotion is not None
             or board.gives_check(move)
         ):
-            _last_bot_natural_delay = 0.0
-            return 0.0
+            quick_delay = _sample_base_move_delay(
+                board,
+                move,
+                engine_result=engine_result,
+                selection_meta=selection_meta,
+                forced=True,
+            )
+            _last_bot_natural_delay = quick_delay
+            return quick_delay
     except Exception:
         pass
 
@@ -388,7 +511,10 @@ def natural_bot_move_delay(
             or random.random() >= BOT_ENDGAME_PAUSE_CHANCE
         ):
             return max(0.0, float(delay))
-        pause_duration = random.uniform(BOT_ENDGAME_PAUSE_MIN, pause_max)
+        endgame_complexity = _timing_position_complexity(
+            board, move, engine_result=engine_result, selection_meta=selection_meta
+        )
+        pause_duration = _sample_thinking_pause(pause_max, endgame_complexity)
         _thinking_budget_remaining = max(
             0.0, float(_thinking_budget_remaining) - pause_duration
         )
@@ -561,10 +687,8 @@ def natural_bot_move_delay(
     if pause_max < BOT_THINK_PAUSE_MIN:
         return max(0.0, float(delay))
 
-    pause_duration = random.uniform(
-        BOT_THINK_PAUSE_MIN,
-        pause_max
-    )
+    pause_complexity = min(1.0, max(0.0, signal_score / 1.55))
+    pause_duration = _sample_thinking_pause(pause_max, pause_complexity)
 
     _thinking_budget_remaining = max(
         0.0,
@@ -574,10 +698,12 @@ def natural_bot_move_delay(
     # Only the randomized refractory minimum is set here. The next
     # pause is NOT scheduled for a specific move; after this block, the
     # current position must pass a fresh situation-based eligibility test.
-    _thinking_move_cooldown_remaining = random.randint(
-        BOT_PAUSE_MOVE_COOLDOWN_MIN,
-        BOT_PAUSE_MOVE_COOLDOWN_MAX
-    )
+    if pause_duration >= 5.0:
+        _thinking_move_cooldown_remaining = random.randint(7, 14)
+    elif pause_duration >= 2.4:
+        _thinking_move_cooldown_remaining = random.randint(4, 10)
+    else:
+        _thinking_move_cooldown_remaining = random.randint(1, 7)
 
     delay += pause_duration
 
