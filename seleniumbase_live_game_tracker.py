@@ -399,6 +399,15 @@ function normalizeColorToken(value) {
   if (['black', 'b', 'dark', 'black-side', 'black_side'].includes(token)) return 'black';
   return null;
 }
+function normalizeTurnColor(value) {
+  const named = normalizeColorToken(value);
+  if (named) return named;
+  // Observed game API maps turn=1 to FEN 'w' and turn=2 to FEN 'b'.
+  const token = String(value == null ? '' : value).trim().toLowerCase();
+  if (token === '1') return 'white';
+  if (token === '2') return 'black';
+  return null;
+}
 function normalizePlayerText(value) {
   return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().toLocaleLowerCase().replace(/^@/, '');
 }
@@ -496,7 +505,7 @@ function snapshot() {
   const legalMoves = getLegalMoves(game);
   const turn = callMaybe(game, 'getTurn');
   const playingAs = callMaybe(game, 'getPlayingAs');
-  const turnColor = normalizeColorToken(turn);
+  const turnColor = normalizeTurnColor(turn);
   const playingAsColor = normalizeColorToken(playingAs);
   const playerNameSide = detectConfiguredPlayerColor(cfg.playerName);
   // Raw values can differ by API representation (for example "w" vs "white").
