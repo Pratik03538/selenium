@@ -60,9 +60,9 @@ HUMAN_WINNING_GUARD_MAX_DROP_CP = 45
 # Keep the baseline weighted picker, but allow a few more safe ranks
 # to remain eligible in winning positions. CP and hanging-piece guards below
 # still decide whether a lower-ranked move is actually acceptable.
-HUMAN_WINNING_GUARD_RANK_CAP = 7
+HUMAN_WINNING_GUARD_RANK_CAP = 5
 HUMAN_STRONG_WINNING_CP = 300
-HUMAN_STRONG_WINNING_RANK_CAP = 5
+HUMAN_STRONG_WINNING_RANK_CAP = 3
 HUMAN_WINNING_NON_BEST_CHANCE = 0.45
 HUMAN_STRONG_WINNING_NON_BEST_CHANCE = 0.25
 FREE_CAPTURE_MIN_VALUE = 3
