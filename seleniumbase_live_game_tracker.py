@@ -1320,8 +1320,8 @@ def perform_api_premove(
 
 PREMOVE_OPENING_FULLMOVE_MAX = 5
 PREMOVE_ENDGAME_MAX_PIECES = 10
-PREMOVE_MIN_BOT_EVAL_CP = -100
-PREMOVE_MAX_EVAL_DROP_CP = 75
+PREMOVE_MIN_BOT_EVAL_CP = -25
+PREMOVE_MAX_EVAL_DROP_CP = 40
 
 
 def premove_phase_allowed(board) -> tuple[bool, str]:
