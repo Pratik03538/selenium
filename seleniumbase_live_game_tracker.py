@@ -419,6 +419,28 @@ function selectorNameSide(name, selector, color) {
   }
   return false;
 }
+function describePlayerNameContext(start) {
+  const path = [];
+  let node = start;
+  for (let depth = 0; node && depth <= 6; depth++, node = node.parentElement || node.getRootNode?.().host) {
+    const tag = String(node.tagName || 'node').toLowerCase();
+    const id = String(node.id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60);
+    const classes = String(node.className?.baseVal || node.className || '')
+      .split(/\\s+/).filter(Boolean)
+      .map(value => value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 45))
+      .filter(Boolean).slice(0, 6);
+    const attrs = [];
+    for (const name of ['data-player-color', 'data-color', 'data-side', 'color', 'aria-label', 'title']) {
+      const value = node.getAttribute?.(name);
+      if (value && ['data-player-color', 'data-color', 'data-side', 'color'].includes(name)) {
+        attrs.push(name + '=' + String(value).slice(0, 20));
+      }
+    }
+    path.push(tag + (id ? '#' + id : '') + (classes.length ? '.' + classes.join('.') : '') +
+      (attrs.length ? '[' + attrs.join(',') + ']' : ''));
+  }
+  return path.join(' <- ');
+}
 function sideEvidenceFromNode(start) {
   let node = start;
   for (let depth = 0; node && depth <= 7; depth++, node = node.parentElement || node.getRootNode?.().host) {
@@ -472,25 +494,27 @@ function detectConfiguredPlayerColor(configuredName) {
 
   const matches = [];
   let exactNameFound = false;
+  let nameContext = '';
   for (const el of queryAllDeep('*')) {
     const text = normalizePlayerText(el.innerText || el.textContent || '');
     if (text !== wanted) continue;
     exactNameFound = true;
+    if (!nameContext) nameContext = describePlayerNameContext(el);
     const evidence = sideEvidenceFromNode(el);
     if (evidence && !matches.some(item => item.color === evidence.color)) {
       matches.push(evidence);
     }
   }
   if (matches.length === 1) {
-    return {color: matches[0].color, source: matches[0].source, matched: true};
+    return {color: matches[0].color, source: matches[0].source, matched: true, debugPath: nameContext};
   }
   if (matches.length > 1) {
-    return {color: null, source: 'player-name-matched-conflicting-elements', matched: true};
+    return {color: null, source: 'player-name-matched-conflicting-elements', matched: true, debugPath: nameContext};
   }
   if (exactNameFound) {
-    return {color: null, source: 'player-name-found-side-unknown', matched: true};
+    return {color: null, source: 'player-name-found-side-unknown', matched: true, debugPath: nameContext};
   }
-  return {color: null, source: 'player-name-not-found', matched: false};
+  return {color: null, source: 'player-name-not-found', matched: false, debugPath: ''};
 }
 function snapshot() {
   const board = getBoard();
@@ -525,6 +549,7 @@ function snapshot() {
     playerNameColor: playerNameSide.color,
     playerNameColorSource: playerNameSide.source,
     playerNameMatched: playerNameSide.matched,
+    playerNameDebugPath: playerNameSide.debugPath || '',
     isMyTurn,
     bottomSide: orientation.side,
     bottomSideSource: orientation.source,
@@ -1216,6 +1241,7 @@ def main() -> int:
                         "playerNameColor": event.get("playerNameColor"),
                         "playerNameColorSource": event.get("playerNameColorSource"),
                         "playerNameMatched": event.get("playerNameMatched"),
+                        "playerNameDebugPath": event.get("playerNameDebugPath"),
                         "isMyTurn": event.get("isMyTurn"),
                         "bottomSide": event.get("bottomSide", "unknown"),
                         "historyLen": len(history_copy),
@@ -1261,6 +1287,11 @@ def main() -> int:
                                     "containers that include each player's name.",
                                     flush=True,
                                 )
+                                if event.get("playerNameDebugPath"):
+                                    print(
+                                        "[NAME DOM] " + str(event.get("playerNameDebugPath")),
+                                        flush=True,
+                                    )
                             else:
                                 print(
                                     "[NAME DEBUG] Exact player_name text was not found. "
