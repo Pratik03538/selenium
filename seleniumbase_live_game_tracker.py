@@ -663,6 +663,16 @@ def main() -> int:
         print("[CONNECT ERROR] Selenium could not attach to Chrome. Update Selenium and check ChromeDriver compatibility.", file=sys.stderr, flush=True)
         return 2
     print("[CONNECT] Selenium attached.", flush=True)
+    # Bound each WebDriver command so a stalled tab does not appear to freeze forever.
+    try:
+        executor = driver.command_executor
+        if hasattr(executor, "set_timeout"):
+            executor.set_timeout(15)
+            print("[CONNECT] Selenium command timeout set to 15 seconds.", flush=True)
+        else:
+            print("[NOTE] This Selenium version does not expose a command timeout setter.", flush=True)
+    except Exception:
+        print("[NOTE] Could not set a Selenium command timeout; per-tab diagnostics remain enabled.", flush=True)
 
     cfg = {
         "boardSelector": args.board_selector,
@@ -681,16 +691,20 @@ def main() -> int:
     engine = None
     last_auto_attempt_fen = ""
     try:
+        print("[TABS] Requesting browser tab handles...", flush=True)
         handles = driver.window_handles
         candidates: list[tuple[int, str]] = []
-        print("[TABS] Browser tabs (site details hidden):", flush=True)
+        print(f"[TABS] Browser returned {len(handles)} tab handle(s). Site details are hidden.", flush=True)
         for i, handle in enumerate(handles):
+            print(f"[TABS] Inspecting tab {i} ({i + 1}/{len(handles)}): switching focus...", flush=True)
             try:
                 driver.switch_to.window(handle)
+                print(f"[TABS] Tab {i}: switched; reading current page address...", flush=True)
                 url = driver.current_url
-            except WebDriverException:
-                print(f"  {i}: unavailable", flush=True)
+            except WebDriverException as exc:
+                print(f"[TABS] Tab {i}: WebDriver command failed ({type(exc).__name__}).", flush=True)
                 continue
+            print(f"[TABS] Tab {i}: address read; checking configured domain...", flush=True)
             matched = target_matches(url, allowed_host)
             print(f"  {i}: {'matches saved settings' if matched else 'not a matching tab'}", flush=True)
             if matched:
