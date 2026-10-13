@@ -1104,6 +1104,11 @@ def main() -> int:
                                     engine_result = []
                                     selected_info = None
                                     selection_meta = None
+                                    remaining_clock_seconds = (
+                                        white_clock_seconds
+                                        if engine_board.turn == chess.WHITE
+                                        else black_clock_seconds
+                                    )
                                     book_choice = book.choose(engine_board) if book is not None else None
 
                                     if book_choice is not None:
@@ -1119,11 +1124,6 @@ def main() -> int:
                                             "book_weight": float(book_choice.get("weight", 0.0)),
                                         }
                                     else:
-                                        remaining_clock_seconds = (
-                                            white_clock_seconds
-                                            if engine_board.turn == chess.WHITE
-                                            else black_clock_seconds
-                                        )
                                         limit_seconds = calculate_engine_search_limit(
                                             base_seconds=args.engine_time,
                                             remaining_seconds=remaining_clock_seconds,
@@ -1182,6 +1182,13 @@ def main() -> int:
                                         selection_meta=selection_meta,
                                         thinking_enabled=strategy_module.BOT_THINKING_ENABLED_DEFAULT,
                                         previous_eval_white_cp=previous_eval_white_cp,
+                                        initial_time_seconds=initial_game_clock_seconds,
+                                        remaining_time_seconds=remaining_clock_seconds,
+                                        increment_seconds=clock_increment_seconds,
+                                        is_opening_book_move=(
+                                            isinstance(selection_meta, dict)
+                                            and selection_meta.get("source") == "GM_BOOK"
+                                        ),
                                     )
                                     if natural_delay > 0:
                                         print(f"[BOT TIMING] delay={natural_delay:.3f}s.", flush=True)
