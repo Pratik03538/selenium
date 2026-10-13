@@ -311,6 +311,35 @@ function queryAllWithinDeep(root, selector) {
   }
   return out;
 }
+function deepElementFromPoint(x, y) {
+  let node = document.elementFromPoint(x, y);
+  const seen = new Set();
+  while (node && node.shadowRoot && !seen.has(node)) {
+    seen.add(node);
+    let inner = null;
+    try { inner = node.shadowRoot.elementFromPoint(x, y); } catch (_) {}
+    if (!inner || inner === node) break;
+    node = inner;
+  }
+  return node;
+}
+function pieceColorFromNode(start, board) {
+  let node = start;
+  for (let depth = 0; node && depth < 12; depth++) {
+    const classes = String(node.className?.baseVal || node.className || '');
+    const tokens = classes.split(/\s+/).filter(Boolean);
+    if (tokens.some(token => /^w[prnbqk]$/.test(token))) return 'white';
+    if (tokens.some(token => /^b[prnbqk]$/.test(token))) return 'black';
+    for (const attr of ['data-color', 'data-piece-color', 'piece-color']) {
+      const token = String(node.getAttribute?.(attr) || '').trim().toLowerCase();
+      if (['white', 'w'].includes(token)) return 'white';
+      if (['black', 'b'].includes(token)) return 'black';
+    }
+    if (node === board) break;
+    node = node.parentElement || node.getRootNode?.().host || null;
+  }
+  return '';
+}
 function callMaybe(obj, name) {
   try { return obj && typeof obj[name] === 'function' ? obj[name]() : null; }
   catch (_) { return null; }
@@ -381,7 +410,6 @@ function getApiMethods(game) {
 function detectBottomSide(board) {
   if (!board) return {side: 'unknown', source: 'board-not-found'};
 
-  // Prefer explicit semantic orientation attributes when present.
   const orientationAttrs = [
     board.getAttribute('data-orientation'),
     board.getAttribute('data-board-orientation'),
@@ -393,28 +421,47 @@ function detectBottomSide(board) {
     }
   }
 
-  // Coordinate labels must belong to this exact board. A page may contain a
-  // hidden/previous board; global label lookup can report the wrong orientation.
+  // Find rank labels by their actual on-screen vertical position, not DOM order.
   for (const coordinates of queryAllWithinDeep(board, '.coordinates')) {
-    const children = Array.from(coordinates.children || []);
-    const labels = children.map(el => String(el.innerText || el.textContent || '').trim());
-    if (labels.length && labels[0] === '1') {
-      return {side: 'white', source: 'coordinate-label'};
+    let yRank1 = null, yRank8 = null;
+    for (const child of Array.from(coordinates.children || [])) {
+      const label = String(child.innerText || child.textContent || '').trim();
+      if (label !== '1' && label !== '8') continue;
+      const r = child.getBoundingClientRect?.();
+      if (!r || !r.width || !r.height) continue;
+      const y = r.top + r.height / 2;
+      if (label === '1') yRank1 = y;
+      if (label === '8') yRank8 = y;
     }
-    if (labels.length && labels[0] === '8') {
-      return {side: 'black', source: 'coordinate-label'};
+    if (yRank1 !== null && yRank8 !== null && Math.abs(yRank1 - yRank8) > 20) {
+      return {
+        side: yRank1 > yRank8 ? 'white' : 'black',
+        source: 'rank-label-screen-position'
+      };
     }
   }
 
-  // Use class-based clues only when coordinate labels are absent.
-  const classText = String(board.className?.baseVal || board.className || '').toLowerCase();
-  if (/(^|\s)(flipped|orientation-black|black-bottom)(\s|$)/.test(classText)) {
+  // Inspect board descendants: the orientation class may not be on the host.
+  const orientationNodes = queryAllWithinDeep(
+    board, '.flipped, .orientation-black, .black-bottom, .orientation-white, .white-bottom'
+  );
+  for (const node of orientationNodes) {
+    const tokens = String(node.className?.baseVal || node.className || '').toLowerCase().split(/\s+/);
+    if (tokens.some(token => ['flipped', 'orientation-black', 'black-bottom'].includes(token))) {
+      return {side: 'black', source: 'board-descendant-class'};
+    }
+    if (tokens.some(token => ['orientation-white', 'white-bottom'].includes(token))) {
+      return {side: 'white', source: 'board-descendant-class'};
+    }
+  }
+
+  const hostTokens = String(board.className?.baseVal || board.className || '').toLowerCase().split(/\s+/);
+  if (hostTokens.some(token => ['flipped', 'orientation-black', 'black-bottom'].includes(token))) {
     return {side: 'black', source: 'board-class-fallback'};
   }
-  if (/(^|\s)(orientation-white|white-bottom)(\s|$)/.test(classText)) {
+  if (hostTokens.some(token => ['orientation-white', 'white-bottom'].includes(token))) {
     return {side: 'white', source: 'board-class-fallback'};
   }
-
   return {side: 'unknown', source: 'orientation-not-exposed'};
 }
 function normalizeColorToken(value) {
@@ -713,6 +760,27 @@ window.__liveGameApiReader = {
     }
     if (!['white', 'black'].includes(orientation.side)) {
       return {ok: false, reason: 'board-orientation-unknown'};
+    }
+
+    // Verify the visually rendered source square before issuing a mouse drag.
+    // A wrong orientation must not send the cursor onto an opponent's piece.
+    const boardFile = orientation.side === 'white' ? sourceFile : 7 - sourceFile;
+    const boardRow = orientation.side === 'white' ? 8 - sourceRank : sourceRank - 1;
+    const sourceX = rect.left + (boardFile + 0.5) * rect.width / 8;
+    const sourceY = rect.top + (boardRow + 0.5) * rect.height / 8;
+    const renderedSource = deepElementFromPoint(sourceX, sourceY);
+    const renderedColor = pieceColorFromNode(renderedSource, board);
+    if (!renderedColor) {
+      return {ok: false, reason: 'ui-source-piece-color-unreadable', bottomSide: orientation.side};
+    }
+    if (renderedColor !== sourceColor) {
+      return {
+        ok: false,
+        reason: 'ui-source-piece-color-mismatch',
+        expectedColor: sourceColor,
+        detectedColor: renderedColor,
+        bottomSide: orientation.side
+      };
     }
     return {
       ok: true,
