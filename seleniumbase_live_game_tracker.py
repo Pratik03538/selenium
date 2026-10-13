@@ -404,8 +404,10 @@ function getLegalMoves(game) {
 }
 function getApiMethods(game) {
   if (!game) return [];
-  return ['getFEN', 'getTurn', 'getPlayingAs', 'getLegalMoves']
-    .filter(name => typeof game[name] === 'function');
+  return [
+    'getFEN', 'getTurn', 'getPlayingAs', 'getLegalMoves',
+    'queuePremoveUci', 'setPremoveUci', 'queuePremove', 'setPremove', 'premove'
+  ].filter(name => typeof game[name] === 'function');
 }
 function detectBottomSide(board) {
   if (!board) return {side: 'unknown', source: 'board-not-found'};
@@ -685,7 +687,7 @@ window.__liveGameApiReader = {
   status: () => ({lastError: state.lastError, pending: state.queue.length}),
   drain: () => state.queue.splice(0, state.queue.length),
   current: () => state.snapshot(),
-  dragTarget: (uci, expectedFen, expectedColor) => {
+  dragTarget: (uci, expectedFen, expectedColor, allowPremove = false) => {
     const board = getBoard();
     const game = board && board.game;
     if (!board || !game || typeof game.getFEN !== 'function') {
@@ -701,8 +703,12 @@ window.__liveGameApiReader = {
     }
     const fenFields = currentFen.split(/\s+/);
     const fenTurn = fenFields[1] === 'w' ? 'white' : (fenFields[1] === 'b' ? 'black' : '');
-    if (fenTurn !== wantedColor) {
+    const isPremove = fenTurn !== wantedColor;
+    if (isPremove && !allowPremove) {
       return {ok: false, reason: 'not-configured-player-turn'};
+    }
+    if (!isPremove && allowPremove) {
+      return {ok: false, reason: 'premove-no-longer-needed'};
     }
     const text = String(uci || '').toLowerCase();
     if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(text)) {
@@ -770,8 +776,116 @@ window.__liveGameApiReader = {
       bottomSide: orientation.side,
       fenTurn,
       sourceColor,
-      sourcePiece
+      sourcePiece,
+      premoveOnly: isPremove
     };
+  },
+  premoveStatus: () => {
+    const board = getBoard();
+    const game = board && board.game;
+    const sources = [game, board].filter(Boolean);
+    const looksPending = value => {
+      if (value === true) return true;
+      if (typeof value === 'string') return value.trim().length > 0;
+      if (value && typeof value === 'object') {
+        return Boolean(value.uci || value.from && value.to || value.source && value.target);
+      }
+      return false;
+    };
+    for (const source of sources) {
+      for (const name of ['getPremove', 'getPendingPremove', 'getQueuedPremove']) {
+        try {
+          if (typeof source[name] === 'function') {
+            const value = source[name]();
+            if (looksPending(value)) return {pending: true, source: name};
+          }
+        } catch (_) {}
+      }
+      for (const name of ['pendingPremove', 'queuedPremove', 'premove']) {
+        try {
+          if (looksPending(source[name])) return {pending: true, source: name};
+        } catch (_) {}
+      }
+    }
+    if (board) {
+      for (const selector of ['[data-premove]', '.premove', '[class*="premove"]', '[class*="pre-move"]']) {
+        for (const el of queryAllWithinDeep(board, selector)) {
+          try {
+            const rect = el.getBoundingClientRect();
+            const tokens = String(el.className?.baseVal || el.className || '');
+            if (rect.width > 0 && rect.height > 0 && /premove|pre-move/i.test(tokens + ' ' + el.getAttribute('data-premove'))) {
+              return {pending: true, source: 'visible-board-marker'};
+            }
+          } catch (_) {}
+        }
+      }
+    }
+    return {pending: false, source: 'not-exposed'};
+  },
+  queuePremove: (uci, expectedFen, expectedColor) => {
+    const board = getBoard();
+    const game = board && board.game;
+    if (!board || !game || typeof game.getFEN !== 'function') {
+      return {ok: false, reason: 'board-game-api-unavailable'};
+    }
+    const currentFen = String(callMaybe(game, 'getFEN') || '').trim();
+    if (!currentFen || currentFen !== String(expectedFen || '').trim()) {
+      return {ok: false, reason: 'position-changed-before-premove'};
+    }
+    const wantedColor = String(expectedColor || '').trim().toLowerCase();
+    if (!['white', 'black'].includes(wantedColor)) {
+      return {ok: false, reason: 'player-color-unconfirmed'};
+    }
+    const turnField = currentFen.split(/\s+/)[1];
+    const fenTurn = turnField === 'w' ? 'white' : (turnField === 'b' ? 'black' : '');
+    if (fenTurn === wantedColor) {
+      return {ok: false, reason: 'premove-no-longer-needed'};
+    }
+    const text = String(uci || '').toLowerCase();
+    if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(text)) {
+      return {ok: false, reason: 'invalid-uci'};
+    }
+    const from = text.slice(0, 2), to = text.slice(2, 4), promotion = text.slice(4, 5);
+    const ranks = String(currentFen.split(/\s+/)[0] || '').split('/');
+    const fileWanted = from.charCodeAt(0) - 97, rankWanted = Number(from[1]);
+    let piece = '', file = 0;
+    const row = ranks[8 - rankWanted];
+    if (row && fileWanted >= 0 && fileWanted < 8 && rankWanted >= 1 && rankWanted <= 8) {
+      for (const token of row) {
+        if (/^[1-8]$/.test(token)) file += Number(token);
+        else {
+          if (file === fileWanted) { piece = token; break; }
+          file += 1;
+        }
+      }
+    }
+    if (!piece || !/^[prnbqkPRNBQK]$/.test(piece)) return {ok:false, reason:'source-square-empty-in-fen'};
+    const sourceColor = piece === piece.toUpperCase() ? 'white' : 'black';
+    if (sourceColor !== wantedColor) return {ok:false, reason:'source-piece-is-not-configured-player'};
+    const request = {uci: text, from, to, promotion: promotion || null};
+    const targets = [game, board];
+    for (const target of targets) {
+      for (const name of ['queuePremoveUci', 'setPremoveUci']) {
+        try {
+          if (typeof target[name] === 'function') {
+            const result = target[name](text);
+            if (result === false) return {ok:false, reason:'premove-api-rejected'};
+            return {ok:true, source:name, confirmed:true};
+          }
+        } catch (_) {}
+      }
+      for (const name of ['queuePremove', 'setPremove', 'premove']) {
+        try {
+          if (typeof target[name] !== 'function') continue;
+          let result;
+          try { result = target[name](request); }
+          catch (_) { result = target[name](text); }
+          if (result === false) return {ok:false, reason:'premove-api-rejected'};
+          return {ok:true, source:name, confirmed:true};
+        } catch (_) {}
+      }
+    }
+    return {ok:false, reason:'premove-api-unavailable'};
   },
   playUci: (uci, expectedFen) => {
     // Use only the configured site's exposed legal-move/game API.
@@ -985,21 +1099,22 @@ def calculate_engine_search_limit(
 
 
 def perform_cursor_drag(
-    driver, uci: str, expected_fen: str, expected_color: str | None
+    driver, uci: str, expected_fen: str, expected_color: str | None,
+    allow_premove: bool = False,
 ) -> dict[str, object]:
     """Drag a legal move on the configured local/test board.
 
     Each move chooses new points inside the source and destination squares.
-    Pointer travel follows a gentle randomized quadratic curve and its total
-    configured source-to-destination duration is 10-200 ms, with a
-    separate randomized 0-100 ms delay before pointer movement.
+    Pointer travel follows a short quadratic curve with an 8-90 ms travel
+    budget and a separate 0-25 ms pre-delay. Premove gestures are best-effort:
+    they are only considered queued when the site exposes an explicit signal.
     """
     try:
         target = driver.execute_script(
             "return window.__liveGameApiReader ? "
-            "window.__liveGameApiReader.dragTarget(arguments[0], arguments[1], arguments[2]) : "
+            "window.__liveGameApiReader.dragTarget(arguments[0], arguments[1], arguments[2], arguments[3]) : "
             "{ok:false, reason:'reader-not-installed'};",
-            uci, expected_fen, expected_color,
+            uci, expected_fen, expected_color, allow_premove,
         )
     except WebDriverException:
         return {"ok": False, "reason": "drag-target-unavailable"}
@@ -1057,9 +1172,9 @@ def perform_cursor_drag(
     control_x = min(max(2.0, control_x), width - 2.0)
     control_y = min(max(2.0, control_y), height - 2.0)
 
-    waypoint_count = rng.randint(3, 5)
-    total_drag_ms = rng.randint(10, 200)
-    pre_delay_ms = rng.randint(0, 100)
+    waypoint_count = rng.randint(2, 3)
+    total_drag_ms = rng.randint(8, 90)
+    pre_delay_ms = rng.randint(0, 25)
     base_duration, extra_ms = divmod(total_drag_ms, waypoint_count)
     segment_durations = [base_duration] * waypoint_count
     if extra_ms:
@@ -1091,11 +1206,11 @@ def perform_cursor_drag(
         path_points.append((px, py))
 
     source_offset = (round(sx - width / 2.0), round(sy - height / 2.0))
-    hover_ms = rng.randint(20, 75)
+    hover_ms = rng.randint(8, 25)
 
     try:
         # Use W3C pointer actions so each curve segment can receive its own
-        # duration. The travel durations add up to the randomized 10-200 ms budget.
+        # duration. Travel is 8-90 ms, plus short source positioning and hover.
         if pre_delay_ms:
             time.sleep(pre_delay_ms / 1000.0)
 
@@ -1103,7 +1218,7 @@ def perform_cursor_drag(
         pointer = actions.w3c_actions.pointer_action
         pointer.source.create_pointer_move(
             origin=board_element,
-            duration=rng.randint(40, 90),
+            duration=rng.randint(15, 35),
             x=source_offset[0],
             y=source_offset[1],
         )
@@ -1136,7 +1251,7 @@ def perform_cursor_drag(
         }
 
     # Confirm the UI accepted this drag before reporting success.
-    deadline = time.monotonic() + 1.25
+    deadline = time.monotonic() + (0.45 if allow_premove else 0.90)
     while time.monotonic() < deadline:
         try:
             current_fen = driver.execute_script(
@@ -1152,9 +1267,32 @@ def perform_cursor_drag(
                 "drag_ms": total_drag_ms,
                 "pre_delay_ms": pre_delay_ms,
                 "waypoints": waypoint_count,
+                "premove_applied": bool(allow_premove),
             }
-        time.sleep(0.025)
+        if allow_premove:
+            try:
+                status = driver.execute_script(
+                    "return window.__liveGameApiReader ? "
+                    "window.__liveGameApiReader.premoveStatus() : {pending:false,source:'reader-not-installed'};"
+                )
+                if isinstance(status, dict) and status.get("pending"):
+                    return {
+                        "ok": True, "uci": text, "premove_attempted": True,
+                        "premove_confirmed": True, "premove_source": status.get("source", ""),
+                        "drag_ms": total_drag_ms, "pre_delay_ms": pre_delay_ms,
+                        "waypoints": waypoint_count,
+                    }
+            except WebDriverException:
+                pass
+        time.sleep(0.015)
 
+    if allow_premove:
+        return {
+            "ok": True, "uci": text, "premove_attempted": True,
+            "premove_confirmed": False, "premove_source": "not-exposed",
+            "drag_ms": total_drag_ms, "pre_delay_ms": pre_delay_ms,
+            "waypoints": waypoint_count,
+        }
     return {
         "ok": False,
         "reason": "cursor-drag-not-confirmed",
@@ -1162,6 +1300,98 @@ def perform_cursor_drag(
         "pre_delay_ms": pre_delay_ms,
         "waypoints": waypoint_count,
     }
+
+
+def perform_api_premove(
+    driver, uci: str, expected_fen: str, expected_color: str | None
+) -> dict[str, object]:
+    """Queue a premove only through an explicitly exposed site premove API."""
+    try:
+        result = driver.execute_script(
+            "return window.__liveGameApiReader ? "
+            "window.__liveGameApiReader.queuePremove(arguments[0], arguments[1], arguments[2]) : "
+            "{ok:false, reason:'reader-not-installed'};",
+            uci, expected_fen, expected_color,
+        )
+    except WebDriverException:
+        return {"ok": False, "reason": "premove-api-unavailable"}
+    return result if isinstance(result, dict) else {"ok": False, "reason": "invalid-premove-response"}
+
+
+def choose_premove_candidate(
+    engine, board, strategy_module, bot_color: str, args, book=None,
+    opponent_match_history: list[float] | None = None,
+) -> tuple[object | None, object | None, str]:
+    """Predict one likely opponent reply, then choose a move legal after that reply."""
+    if chess is None or engine is None or strategy_module is None or board is None:
+        return None, None, "premove-prerequisites-unavailable"
+    if board.is_game_over(claim_draw=True):
+        return None, None, "game-over"
+    search_time = max(0.005, min(float(args.engine_time), 0.025))
+    try:
+        opponent_lines = engine.analyse(
+            board, chess.engine.Limit(depth=8, time=search_time), multipv=3
+        )
+        if not isinstance(opponent_lines, list):
+            opponent_lines = [opponent_lines]
+        opponent_line = next(
+            (info for info in opponent_lines
+             if isinstance(info, dict) and info.get("pv")
+             and info["pv"][0] in board.legal_moves),
+            None,
+        )
+        if opponent_line is None:
+            return None, None, "opponent-reply-not-found"
+        predicted_reply = opponent_line["pv"][0]
+        hypothetical = board.copy(stack=True)
+        hypothetical.push(predicted_reply)
+        expected_turn = chess.WHITE if bot_color == "white" else chess.BLACK
+        if hypothetical.turn != expected_turn:
+            return None, predicted_reply, "hypothetical-turn-mismatch"
+
+        book_choice = book.choose(hypothetical) if book is not None else None
+        if book_choice is not None:
+            selected = book_choice.get("move")
+            if selected in hypothetical.legal_moves:
+                return selected, predicted_reply, "opening-book"
+        own_lines = engine.analyse(
+            hypothetical,
+            chess.engine.Limit(depth=10, time=search_time),
+            multipv=min(5, max(1, int(getattr(strategy_module, "TRAINING_MULTI_PV", 5)))),
+        )
+        if not isinstance(own_lines, list):
+            own_lines = [own_lines]
+        own_lines = [
+            info for info in own_lines
+            if isinstance(info, dict) and info.get("pv")
+            and info["pv"][0] in hypothetical.legal_moves
+        ]
+        if not own_lines:
+            return None, predicted_reply, "premove-candidate-not-found"
+        opponent_accuracy = None
+        opponent_samples = 0
+        if opponent_match_history:
+            try:
+                opponent_accuracy, opponent_samples = strategy_module.opponent_recent_accuracy(
+                    opponent_match_history
+                )
+            except Exception:
+                pass
+        selected, _selected_info, _meta = strategy_module.choose_stockfish_move(
+            hypothetical,
+            own_lines,
+            previous_eval_white_cp=None,
+            opponent_accuracy=opponent_accuracy,
+            opponent_sample_count=opponent_samples,
+            opponent_pressure=False,
+            engine=engine,
+            bot_color=(bot_color == "white"),
+        )
+        if selected not in hypothetical.legal_moves:
+            return None, predicted_reply, "premove-candidate-not-legal-after-prediction"
+        return selected, predicted_reply, "stockfish-prediction"
+    except (chess.engine.EngineError, ValueError, RuntimeError, TypeError):
+        return None, None, "premove-analysis-failed"
 
 
 def parse_args() -> argparse.Namespace:
@@ -1198,6 +1428,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stockfish-path", default="", help="Stockfish executable path; can also be set as stockfish_path=... in TXT settings.")
     parser.add_argument("--engine-time", type=float, default=0.040, help="Stockfish search time per move, seconds (ChessKida baseline default: 0.040).")
     parser.add_argument("--move-input", choices=("api", "cursor"), default=None, help="Move submission method; can also be set with move_input=api|cursor in tracker_settings.txt.")
+    premove_group = parser.add_mutually_exclusive_group()
+    premove_group.add_argument("--premove", dest="premove_enabled", action="store_true", help="Try best-effort premoves on the configured authorized site.")
+    premove_group.add_argument("--no-premove", dest="premove_enabled", action="store_false", help="Disable premove attempts.")
+    parser.set_defaults(premove_enabled=None)
     return parser.parse_args()
 
 
@@ -1219,6 +1453,10 @@ def main() -> int:
     if args.move_input not in {"api", "cursor"}:
         print("[CONFIG ERROR] move_input must be api or cursor.", file=sys.stderr, flush=True)
         return 2
+    if args.premove_enabled is None:
+        raw_premove = load_optional_txt_setting("premove_enabled").strip().lower()
+        args.premove_enabled = raw_premove in {"1", "true", "yes", "on", "enabled"} if raw_premove else True
+    print(f"[CONFIG] Premove attempts: {'enabled' if args.premove_enabled else 'disabled'}.", flush=True)
     if args.allowed_domain.strip():
         allowed_host = normalize_host(args.allowed_domain)
         settings_source = "command-line settings"
@@ -1305,6 +1543,7 @@ def main() -> int:
     book = None
     strategy_module = None
     last_auto_attempt_fen = ""
+    last_premove_attempt_fen = ""
     strategy_board = None
     strategy_board_fen = ""
     active_bot_color = configured_bot_color
@@ -1538,6 +1777,7 @@ def main() -> int:
                                     previous_eval_white_cp = None
                                     opponent_pressure = False
                                     last_auto_attempt_fen = ""
+                                    last_premove_attempt_fen = ""
                                     active_bot_color = configured_bot_color or player_name_color or api_bot_color
                                 elif strategy_transition is not None:
                                     strategy_move = chess.Move.from_uci(strategy_transition["uci"])
@@ -1915,6 +2155,78 @@ def main() -> int:
                                         print(f"[AUTO] Move was not submitted ({reason}){detail}.", flush=True)
                                 except (chess.engine.EngineError, ValueError, WebDriverException, RuntimeError):
                                     print("[AUTO] Strategy calculation/submission failed; waiting for the next position.", flush=True)
+                            elif (
+                                args.premove_enabled
+                                and active_bot_color in {"white", "black"}
+                                and not side_matches_bot
+                                and not color_conflict
+                                and not turn_conflict
+                                and api_my_turn is not True
+                                and fen != last_premove_attempt_fen
+                                and not engine_board.is_game_over(claim_draw=True)
+                            ):
+                                # A premove is speculative: analyze the likely opponent reply,
+                                # then queue a move legal after that predicted reply. If the
+                                # site cannot queue/confirm it, ordinary-turn logic still runs.
+                                last_premove_attempt_fen = fen
+                                try:
+                                    premove_move, predicted_reply, premove_source = choose_premove_candidate(
+                                        engine,
+                                        engine_board,
+                                        strategy_module,
+                                        active_bot_color,
+                                        args,
+                                        book=book,
+                                        opponent_match_history=opponent_match_history,
+                                    )
+                                    if premove_move is None:
+                                        print(
+                                            f"[PREMOVE] Skipped ({premove_source}); normal turn handling remains enabled.",
+                                            flush=True,
+                                        )
+                                    elif len(premove_move.uci()) == 5 and args.move_input == "cursor":
+                                        print(
+                                            "[PREMOVE] Skipped promotion candidate; this board needs a site-specific promotion handler.",
+                                            flush=True,
+                                        )
+                                    else:
+                                        predicted_san = engine_board.san(predicted_reply) if predicted_reply else "unknown"
+                                        chosen_premove_uci = premove_move.uci()
+                                        if args.move_input == "cursor":
+                                            premove_submit = perform_cursor_drag(
+                                                driver,
+                                                chosen_premove_uci,
+                                                fen,
+                                                active_bot_color,
+                                                allow_premove=True,
+                                            )
+                                        else:
+                                            premove_submit = perform_api_premove(
+                                                driver,
+                                                chosen_premove_uci,
+                                                fen,
+                                                active_bot_color,
+                                            )
+                                        if isinstance(premove_submit, dict) and premove_submit.get("ok"):
+                                            if premove_submit.get("premove_confirmed"):
+                                                confirmation = f"confirmed via {premove_submit.get('premove_source', 'site status')}"
+                                            elif premove_submit.get("confirmed"):
+                                                confirmation = f"accepted by {premove_submit.get('source', 'site premove API')}"
+                                            else:
+                                                confirmation = "gesture sent; site queue status is not exposed, normal-turn fallback remains enabled"
+                                            print(
+                                                f"[PREMOVE] {engine_board.san(premove_move) if premove_move in engine_board.legal_moves else premove_move.uci()} "
+                                                f"queued-attempt after predicted reply {predicted_san} | {confirmation}.",
+                                                flush=True,
+                                            )
+                                        else:
+                                            reason = premove_submit.get("reason", "premove-submit-failed") if isinstance(premove_submit, dict) else "premove-submit-failed"
+                                            print(
+                                                f"[PREMOVE] Not queued ({reason}); normal turn handling remains enabled.",
+                                                flush=True,
+                                            )
+                                except (chess.engine.EngineError, ValueError, WebDriverException, RuntimeError, TypeError):
+                                    print("[PREMOVE] Candidate calculation/submission failed; normal turn handling remains enabled.", flush=True)
                 time.sleep(max(0.05, args.queue_read_interval))
 
     except KeyboardInterrupt:
