@@ -32,6 +32,11 @@ except ImportError as exc:
     ) from exc
 
 try:
+    from seleniumbase import Driver as SeleniumBaseDriver
+except ImportError:
+    SeleniumBaseDriver = None  # Optional unless --browser-mode uc is selected.
+
+try:
     import chess
     import chess.engine
 except ImportError:
@@ -241,6 +246,125 @@ def check_target(url: str | None, allowed_host: str) -> None:
         raise RuntimeError("The selected browser tab is no longer available.")
     if not target_matches(url, allowed_host):
         raise RuntimeError("The selected browser tab no longer matches the saved site settings.")
+
+
+JS_DETECT_VERIFICATION = r"""
+const body = String(document.body?.innerText || '').slice(0, 12000).toLowerCase();
+const title = String(document.title || '').toLowerCase();
+const challengeText = /verify (that )?you are human|confirm (that )?you are not a robot|complete (the )?(security check|captcha)|security verification required|checking your browser|checking if the site connection is secure|human verification|required to verify|captcha required|please verify you are human|press and hold to confirm/.test(body + " " + title);
+function isVisible(el) {
+  if (!el) return false;
+  const r = el.getBoundingClientRect();
+  const style = getComputedStyle(el);
+  return r.width > 0 && r.height > 0 && style.display !== 'none' &&
+    style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+}
+const widgetSelectors = [
+  '.g-recaptcha', '.h-captcha', '.cf-turnstile', '[data-sitekey]',
+  '#challenge-form', '#cf-challenge-running', 'input[name*="captcha" i]',
+  'iframe[src*="recaptcha" i]', 'iframe[src*="hcaptcha" i]',
+  'iframe[src*="challenges.cloudflare.com" i]', 'iframe[title*="captcha" i]'
+];
+let captchaWidget = false;
+for (const selector of widgetSelectors) {
+  try {
+    if (Array.from(document.querySelectorAll(selector)).some(isVisible)) {
+      captchaWidget = true;
+      break;
+    }
+  } catch (_) {}
+}
+return {challengeText, captchaWidget, detected: challengeText || captchaWidget};
+""";
+
+
+def wait_for_manual_verification(driver, allowed_host: str, cfg=None) -> bool:
+    """Pause on an apparent challenge for manual completion; never solve it automatically."""
+    state = driver.execute_script(JS_DETECT_VERIFICATION)
+    if not isinstance(state, dict) or not state.get("detected"):
+        return False
+
+    print(
+        "[CAPTCHA] Verification/challenge detected. Automation is paused; "
+        "complete it manually in the Chrome window.",
+        flush=True,
+    )
+    while True:
+        try:
+            input("[CAPTCHA] After you finish verification, press Enter to resume: ")
+        except EOFError as exc:
+            raise RuntimeError(
+                "Manual verification is pending, but the console cannot accept input."
+            ) from exc
+
+        check_target(driver.current_url, allowed_host)
+        state = driver.execute_script(JS_DETECT_VERIFICATION)
+        if not isinstance(state, dict):
+            raise RuntimeError("Could not confirm the verification page state.")
+        # A visible CAPTCHA widget may remain on screen after being solved.
+        # If explicit challenge text is still present, ask for another check.
+        if state.get("challengeText"):
+            print(
+                "[CAPTCHA] Challenge text is still present. Finish the verification "
+                "or wait for the page to complete, then press Enter again.",
+                flush=True,
+            )
+            continue
+        break
+
+    if cfg is not None:
+        reader_ready = driver.execute_script(
+            "return Boolean(window.__liveGameApiReader && "
+            "typeof window.__liveGameApiReader.current === 'function');"
+        )
+        if not reader_ready:
+            installed = driver.execute_script(JS_INSTALL_OBSERVER, cfg)
+            print(
+                f"[CAPTCHA] Page observer refreshed | board={bool(installed.get('boardFound'))} "
+                f"| game API={bool(installed.get('gameApiFound'))}.",
+                flush=True,
+            )
+    print("[CAPTCHA] Manual verification step complete; re-checking game state.", flush=True)
+    return True
+
+
+def configured_uc_start_url(allowed_host: str) -> str:
+    """Resolve a UC-mode entry URL while constraining it to the configured host."""
+    raw_url = (
+        load_optional_txt_setting("site_url").strip()
+        or load_optional_txt_setting("url").strip()
+    )
+    if not raw_url:
+        scheme = "https"
+        if allowed_host == "localhost" or allowed_host.endswith((".localhost", ".local", ".test")):
+            scheme = "http"
+        else:
+            try:
+                address = ipaddress.ip_address(allowed_host)
+                if address.is_private or address.is_loopback:
+                    scheme = "http"
+            except ValueError:
+                pass
+        raw_url = f"{scheme}://{allowed_host}"
+    elif "://" not in raw_url:
+        try_host = normalize_host(raw_url)
+        scheme = "https"
+        if try_host == "localhost" or (try_host and try_host.endswith((".localhost", ".local", ".test"))):
+            scheme = "http"
+        else:
+            try:
+                address = ipaddress.ip_address(try_host)
+                if address.is_private or address.is_loopback:
+                    scheme = "http"
+            except (ValueError, TypeError):
+                pass
+        raw_url = f"{scheme}://{raw_url}"
+
+    if not target_matches(raw_url, allowed_host):
+        raise RuntimeError(
+            "UC mode entry URL does not match the configured authorized site."
+        )
+    return raw_url
 
 
 JS_INSTALL_OBSERVER = r"""
@@ -1733,6 +1857,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--debugger-address", default="127.0.0.1:9223")
     parser.add_argument(
+        "--browser-mode", choices=("attach", "uc"), default=None,
+        help="Browser startup mode: attach to existing Chrome, or launch SeleniumBase UC Mode for the configured site.",
+    )
+    parser.add_argument(
         "--allowed-domain", default="",
         help="Optional override; otherwise load it from a neighbouring TXT settings file.",
     )
@@ -1777,6 +1905,13 @@ def main() -> int:
         print("Place blocked_platforms.txt beside this script and retry.", file=sys.stderr, flush=True)
         return 2
     print(f"[CONFIG] Blocked platform list loaded ({len(blocked_platforms)} entries).", flush=True)
+
+    if args.browser_mode is None:
+        args.browser_mode = load_optional_txt_setting("browser_mode").strip().lower() or "attach"
+    if args.browser_mode not in {"attach", "uc"}:
+        print("[CONFIG ERROR] browser_mode must be attach or uc.", file=sys.stderr, flush=True)
+        return 2
+    print(f"[CONFIG] Browser mode: {args.browser_mode}.", flush=True)
 
     if args.auto_play is None:
         auto_setting = load_optional_txt_setting("auto_play").strip().lower()
@@ -1824,28 +1959,79 @@ def main() -> int:
         print("[CONFIG] Player-name side detection enabled; configured name is hidden.", flush=True)
     print(f"[CONFIG] Settings loaded from the {settings_source}.", flush=True)
 
-    # Don't echo the local debugger address or any page URL.
-    print("[CONNECT] Checking the local Chrome DevTools endpoint...", flush=True)
-    debugger_url = f"http://{args.debugger_address}/json/version"
-    try:
-        with urlopen(debugger_url, timeout=3) as response:
-            debugger_info = json.loads(response.read().decode("utf-8", errors="replace"))
-    except Exception:
-        print("[CONNECT ERROR] Chrome DevTools is not responding on the configured local port.", file=sys.stderr, flush=True)
-        print("Launch the separate debugging Chrome window, open your test page, then retry.", file=sys.stderr, flush=True)
-        return 2
-    browser_version = str(debugger_info.get("Browser", "Chrome"))
-    print(f"[CONNECT] DevTools is online ({browser_version}).", flush=True)
+    # Attach mode is unchanged; UC mode launches a dedicated SeleniumBase-managed browser.
+    driver = None
+    if args.browser_mode == "uc":
+        if SeleniumBaseDriver is None:
+            print(
+                "[CONFIG ERROR] SeleniumBase is missing. Install dependencies with: "
+                "python -m pip install -r requirements.txt",
+                file=sys.stderr, flush=True,
+            )
+            return 2
+        try:
+            start_url = configured_uc_start_url(allowed_host)
+        except RuntimeError as exc:
+            print(f"[CONFIG ERROR] {exc}", file=sys.stderr, flush=True)
+            return 2
+        print("[CONNECT] Launching SeleniumBase UC Mode for the configured authorized site...", flush=True)
+        try:
+            driver = SeleniumBaseDriver(uc=True)
+            if hasattr(driver, "uc_open_with_reconnect"):
+                driver.uc_open_with_reconnect(start_url, reconnect_time=2)
+            else:
+                driver.get(start_url)
+        except Exception:
+            try:
+                if driver is not None:
+                    driver.quit()
+            except Exception:
+                pass
+            print(
+                "[CONNECT ERROR] SeleniumBase UC Mode could not launch the browser. "
+                "Update Chrome and install the project requirements.",
+                file=sys.stderr, flush=True,
+            )
+            return 2
+        print("[CONNECT] SeleniumBase UC browser launched.", flush=True)
+        print(
+            "[UC] Navigate to your authorized test-game page and sign in if needed. "
+            "If verification appears, complete it manually in the browser.",
+            flush=True,
+        )
+        try:
+            input("[UC] Press Enter when the correct test page is ready: ")
+            wait_for_manual_verification(driver, allowed_host)
+        except (RuntimeError, WebDriverException):
+            try:
+                driver.quit()
+            except Exception:
+                pass
+            print("[UC] Site verification/setup did not complete; stopping safely.", file=sys.stderr, flush=True)
+            return 2
+    else:
+        # Don't echo the local debugger address or any page URL.
+        print("[CONNECT] Checking the local Chrome DevTools endpoint...", flush=True)
+        debugger_url = f"http://{args.debugger_address}/json/version"
+        try:
+            with urlopen(debugger_url, timeout=3) as response:
+                debugger_info = json.loads(response.read().decode("utf-8", errors="replace"))
+        except Exception:
+            print("[CONNECT ERROR] Chrome DevTools is not responding on the configured local port.", file=sys.stderr, flush=True)
+            print("Launch the separate debugging Chrome window, open your test page, then retry.", file=sys.stderr, flush=True)
+            return 2
+        browser_version = str(debugger_info.get("Browser", "Chrome"))
+        print(f"[CONNECT] DevTools is online ({browser_version}).", flush=True)
 
-    options = webdriver.ChromeOptions()
-    options.debugger_address = args.debugger_address
-    print("[CONNECT] Attaching Selenium to the existing Chrome session...", flush=True)
-    try:
-        driver = webdriver.Chrome(options=options)
-    except WebDriverException:
-        print("[CONNECT ERROR] Selenium could not attach to Chrome. Update Selenium and check ChromeDriver compatibility.", file=sys.stderr, flush=True)
-        return 2
-    print("[CONNECT] Selenium attached.", flush=True)
+        options = webdriver.ChromeOptions()
+        options.debugger_address = args.debugger_address
+        print("[CONNECT] Attaching Selenium to the existing Chrome session...", flush=True)
+        try:
+            driver = webdriver.Chrome(options=options)
+        except WebDriverException:
+            print("[CONNECT ERROR] Selenium could not attach to Chrome. Update Selenium and check ChromeDriver compatibility.", file=sys.stderr, flush=True)
+            return 2
+        print("[CONNECT] Selenium attached.", flush=True)
 
     cfg = {
         "boardSelector": args.board_selector,
@@ -2441,6 +2627,7 @@ def main() -> int:
                                         print(f"[BOT TIMING] delay={natural_delay:.3f}s.", flush=True)
                                         time.sleep(natural_delay)
 
+                                    wait_for_manual_verification(driver, allowed_host, cfg)
                                     if args.move_input == "cursor":
                                         submit = perform_cursor_drag(
                                             driver, chosen_move.uci(), fen, active_bot_color
@@ -2525,6 +2712,7 @@ def main() -> int:
                                     else:
                                         predicted_san = engine_board.san(predicted_reply) if predicted_reply else "unknown"
                                         chosen_premove_uci = premove_move.uci()
+                                        wait_for_manual_verification(driver, allowed_host, cfg)
                                         if args.move_input == "cursor":
                                             premove_submit = perform_cursor_drag(
                                                 driver,
@@ -2584,6 +2772,11 @@ def main() -> int:
                 driver.execute_script("window.__liveGameApiReader?.stop?.()")
         except Exception:
             pass
+        if args.browser_mode == "uc" and driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                pass
     return 0
 
 
