@@ -1188,6 +1188,10 @@ def calculate_engine_search_limit(
         return base
 
     remaining = max(0.0, float(remaining_seconds))
+    # At <=10s, cap engine work hard so calculation doesn't consume the
+    # time needed to submit and confirm a move.
+    if remaining <= 10.0:
+        return max(0.001, min(base, 0.010, remaining * 0.05))
     initial = max(1.0, float(initial_seconds or remaining or 1.0))
     increment = max(0.0, min(float(increment_seconds or 0.0), 60.0))
 
@@ -2536,6 +2540,11 @@ def main() -> int:
                                         if engine_board.turn == chess.WHITE
                                         else black_clock_seconds
                                     )
+                                    opponent_clock_seconds = (
+                                        black_clock_seconds
+                                        if engine_board.turn == chess.WHITE
+                                        else white_clock_seconds
+                                    )
                                     book_choice = book.choose(engine_board) if book is not None else None
 
                                     if book_choice is not None:
@@ -2617,6 +2626,7 @@ def main() -> int:
                                         previous_eval_white_cp=previous_eval_white_cp,
                                         initial_time_seconds=initial_game_clock_seconds,
                                         remaining_time_seconds=remaining_clock_seconds,
+                                        opponent_time_seconds=opponent_clock_seconds,
                                         increment_seconds=clock_increment_seconds,
                                         is_opening_book_move=(
                                             isinstance(selection_meta, dict)
@@ -2624,7 +2634,23 @@ def main() -> int:
                                         ),
                                     )
                                     if natural_delay > 0:
-                                        print(f"[BOT TIMING] delay={natural_delay:.3f}s.", flush=True)
+                                        clock_gap_text = (
+                                            f" | clock_gap={remaining_clock_seconds - opponent_clock_seconds:+.2f}s"
+                                            if remaining_clock_seconds is not None and opponent_clock_seconds is not None
+                                            else ""
+                                        )
+                                        mode_text = (
+                                            "LOW_CLOCK"
+                                            if remaining_clock_seconds is not None and remaining_clock_seconds <= 10.0
+                                            else "CLOCK_AWARE"
+                                        )
+                                        print(
+                                            f"[BOT TIMING] delay={natural_delay:.3f}s | mode={mode_text}"
+                                            f" | own={remaining_clock_seconds if remaining_clock_seconds is not None else 'unknown'}"
+                                            f" | opponent={opponent_clock_seconds if opponent_clock_seconds is not None else 'unknown'}"
+                                            f"{clock_gap_text}.",
+                                            flush=True,
+                                        )
                                         time.sleep(natural_delay)
 
                                     wait_for_manual_verification(driver, allowed_host, cfg)
@@ -2689,6 +2715,16 @@ def main() -> int:
                                 # then queue a move legal after that predicted reply. If the
                                 # site cannot queue/confirm it, ordinary-turn logic still runs.
                                 last_premove_attempt_fen = fen
+                                bot_clock_for_premove = (
+                                    white_clock_seconds if active_bot_color == "white"
+                                    else black_clock_seconds
+                                )
+                                if bot_clock_for_premove is not None and bot_clock_for_premove <= 10.0:
+                                    print(
+                                        f"[PREMOVE] Low-clock priority active ({bot_clock_for_premove:.2f}s); "
+                                        "checking a legal/safety-guarded premove for this position.",
+                                        flush=True,
+                                    )
                                 try:
                                     premove_move, predicted_reply, premove_source = choose_premove_candidate(
                                         engine,
