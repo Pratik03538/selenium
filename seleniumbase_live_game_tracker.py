@@ -1422,12 +1422,9 @@ def choose_premove_candidate(
         if best_after_reply_eval < PREMOVE_MIN_BOT_EVAL_CP:
             return None, predicted_reply, "predicted-reply-leaves-bot-losing"
 
-        # Opening-book choices are retained when available, but they must pass
-        # the same engine safety check as every other premove candidate.
-        book_choice = book.choose(hypothetical) if book is not None else None
-        selected = book_choice.get("move") if book_choice is not None else own_lines[0]["pv"][0]
-        if selected not in hypothetical.legal_moves:
-            selected = own_lines[0]["pv"][0]
+        # Do not call the opening book here: premove forecasting must not
+        # consume/change the normal turn's existing randomized book choice.
+        selected = own_lines[0]["pv"][0]
 
         after_selected = hypothetical.copy(stack=True)
         after_selected.push(selected)
