@@ -433,10 +433,13 @@ function sideEvidenceFromNode(start) {
       String(node.getAttribute?.('aria-label') || ''),
       String(node.getAttribute?.('title') || '')
     ].join(' ').toLowerCase();
-    const whiteHint = /(^|[\s_-])white([\s_-]|$)|white-player|player-white/.test(clues);
-    const blackHint = /(^|[\s_-])black([\s_-]|$)|black-player|player-black/.test(clues);
+    // Only trust explicit player-container labels. A generic ancestor class like
+    // ".white" can describe a piece, theme, or stale layout and caused the
+    // username matcher to label Black games as White.
+    const whiteHint = /white[-_ ]player|player[-_ ]white|whiteplayer|playerwhite|white[-_ ]player[-_ ](container|name|info)/.test(clues);
+    const blackHint = /black[-_ ]player|player[-_ ]black|blackplayer|playerblack|black[-_ ]player[-_ ](container|name|info)/.test(clues);
     if (whiteHint !== blackHint) {
-      return {color: whiteHint ? 'white' : 'black', source: 'player-name-ancestor-label'};
+      return {color: whiteHint ? 'white' : 'black', source: 'explicit-player-ancestor-label'};
     }
   }
   return null;
