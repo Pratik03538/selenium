@@ -688,8 +688,7 @@ window.__liveGameApiReader = {
   dragTarget: (uci, expectedFen, expectedColor) => {
     const board = getBoard();
     const game = board && board.game;
-    if (!board || !game || typeof game.getFEN !== 'function' ||
-        typeof game.getLegalMoves !== 'function') {
+    if (!board || !game || typeof game.getFEN !== 'function') {
       return {ok: false, reason: 'board-game-api-unavailable'};
     }
     const currentFen = String(callMaybe(game, 'getFEN') || '').trim();
@@ -709,8 +708,6 @@ window.__liveGameApiReader = {
     if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(text)) {
       return {ok: false, reason: 'invalid-uci'};
     }
-    const raw = callMaybe(game, 'getLegalMoves');
-    if (!Array.isArray(raw)) return {ok: false, reason: 'legal-moves-unavailable'};
     const from = text.slice(0, 2), to = text.slice(2, 4), promo = text.slice(4, 5);
     // Independently verify the source piece color from the authoritative FEN.
     const fenRanks = String(fenFields[0] || '').split('/');
@@ -735,23 +732,6 @@ window.__liveGameApiReader = {
     const sourceColor = sourcePiece === sourcePiece.toUpperCase() ? 'white' : 'black';
     if (sourceColor !== wantedColor) {
       return {ok: false, reason: 'source-piece-is-not-configured-player'};
-    }
-    const candidates = raw.filter(m => m &&
-      String(m.from || '').toLowerCase() === from &&
-      String(m.to || '').toLowerCase() === to);
-    if (!candidates.length) return {ok: false, reason: 'legal-move-not-found'};
-    if (promo) {
-      const promotionCode = value => {
-        const v = String(value == null ? '' : value).toLowerCase();
-        if (['q', 'queen'].includes(v)) return 'q';
-        if (['r', 'rook'].includes(v)) return 'r';
-        if (['b', 'bishop'].includes(v)) return 'b';
-        if (['n', 'knight'].includes(v)) return 'n';
-        return '';
-      };
-      if (!candidates.some(m => promotionCode(m.promotion) === promo)) {
-        return {ok: false, reason: 'promotion-choice-not-exposed'};
-      }
     }
     const rect = board.getBoundingClientRect();
     const orientation = detectBottomSide(board);
@@ -1140,7 +1120,7 @@ def perform_cursor_drag(
 
         pointer.pointer_up()
         actions.perform()
-    except (WebDriverException, ValueError, TypeError, AttributeError):
+    except (WebDriverException, ValueError, TypeError, AttributeError) as exc:
         # Never leave the mouse button pressed if a pointer action fails.
         try:
             ActionChains(driver).release().perform()
@@ -1149,6 +1129,8 @@ def perform_cursor_drag(
         return {
             "ok": False,
             "reason": "cursor-action-failed",
+            "error_type": type(exc).__name__,
+            "error": str(exc)[:240],
             "drag_ms": total_drag_ms,
             "pre_delay_ms": pre_delay_ms,
         }
@@ -1922,7 +1904,15 @@ def main() -> int:
                                             next_human_best_uci = None
                                     else:
                                         reason = submit.get("reason", "move-submit-failed") if isinstance(submit, dict) else "move-submit-failed"
-                                        print(f"[AUTO] Move was not submitted ({reason}).", flush=True)
+                                        detail = ""
+                                        if args.move_input == "cursor" and isinstance(submit, dict) and submit.get("error"):
+                                            detail = f" | {submit.get('error_type', 'Error')}: {str(submit.get('error'))[:240]}"
+                                        elif args.move_input == "cursor" and isinstance(submit, dict) and submit.get("drag_ms") is not None:
+                                            detail = (
+                                                f" | travel={int(submit.get('drag_ms', 0))} ms"
+                                                f" | pre-delay={int(submit.get('pre_delay_ms', 0))} ms"
+                                            )
+                                        print(f"[AUTO] Move was not submitted ({reason}){detail}.", flush=True)
                                 except (chess.engine.EngineError, ValueError, WebDriverException, RuntimeError):
                                     print("[AUTO] Strategy calculation/submission failed; waiting for the next position.", flush=True)
                 time.sleep(max(0.05, args.queue_read_interval))
