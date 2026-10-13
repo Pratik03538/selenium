@@ -1858,7 +1858,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debugger-address", default="127.0.0.1:9223")
     parser.add_argument(
         "--browser-mode", choices=("attach", "uc"), default=None,
-        help="Browser startup mode: attach to existing Chrome, or launch SeleniumBase UC Mode for the configured site.",
+        help="Browser startup mode: UC Mode by default; use attach to reuse an existing debugging Chrome session.",
     )
     parser.add_argument(
         "--allowed-domain", default="",
@@ -1907,7 +1907,7 @@ def main() -> int:
     print(f"[CONFIG] Blocked platform list loaded ({len(blocked_platforms)} entries).", flush=True)
 
     if args.browser_mode is None:
-        args.browser_mode = load_optional_txt_setting("browser_mode").strip().lower() or "attach"
+        args.browser_mode = load_optional_txt_setting("browser_mode").strip().lower() or "uc"
     if args.browser_mode not in {"attach", "uc"}:
         print("[CONFIG ERROR] browser_mode must be attach or uc.", file=sys.stderr, flush=True)
         return 2
