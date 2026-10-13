@@ -2,9 +2,9 @@
 
 Attaches to an existing Chrome debugging session, reads the exposed game API,
 reconstructs moves from FEN changes, and writes a local CSV. Optional Stockfish
-autoplay is available only on the exact configured authorized site; known public
-competitive chess hosts are always rejected. URLs, hostnames and page titles are
-never printed or stored in the CSV.
+autoplay is available on the exact configured site unless its hostname is listed
+in blocked_platforms.txt. Blocked hosts are configured in that text file rather
+than hard-coded in the Python source. URLs and page titles are never stored in the CSV.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import ipaddress
 import sys
 import time
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import urlopen
@@ -34,6 +35,7 @@ except ImportError:
     chess = None  # FEN/DOM capture works; reconstruction/autoplay need python-chess.
 
 BASE_DIR = Path(__file__).resolve().parent
+BLOCKED_PLATFORMS_FILE = BASE_DIR / "blocked_platforms.txt"
 # Use a new private log so a prior CSV with raw URLs is not appended to.
 DEFAULT_CSV = BASE_DIR / "live_dom_events_private_v2.csv"
 CSV_FIELDS = [
@@ -171,17 +173,41 @@ def host_for(url: str | None) -> str:
         return ""
 
 
-def is_stockfish_autoplay_blocked_host(host: str) -> bool:
-    """Prevent automatic Stockfish moves on public competitive chess platforms."""
-    host = (host or "").lower().rstrip(".").removeprefix("www.")
-    blocked_roots = (
-        "chess.com", "lichess.org", "chess24.com", "chessclub.com",
+@lru_cache(maxsize=1)
+def load_blocked_platforms() -> frozenset[str]:
+    """Read blocked hostnames from the neighbouring blocked_platforms.txt file."""
+    if not BLOCKED_PLATFORMS_FILE.is_file():
+        return frozenset()
+
+    blocked: set[str] = set()
+    try:
+        lines = BLOCKED_PLATFORMS_FILE.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as exc:
+        raise RuntimeError("Could not read blocked_platforms.txt.") from exc
+
+    for raw_line in lines:
+        value = raw_line.strip()
+        if not value or value.startswith("#"):
+            continue
+        host = normalize_host(value)
+        if host:
+            blocked.add(host)
+    return frozenset(blocked)
+
+
+def is_blocked_platform(host: str) -> bool:
+    """Return True only for hosts listed in blocked_platforms.txt (including subdomains)."""
+    normalized = normalize_host(host)
+    if not normalized:
+        return False
+    return any(
+        normalized == blocked or normalized.endswith("." + blocked)
+        for blocked in load_blocked_platforms()
     )
-    return any(host == root or host.endswith("." + root) for root in blocked_roots)
 
 
 def target_matches(url: str | None, allowed_host: str) -> bool:
-    """Allow HTTP(S) tabs on the configured host for live read-only tracking."""
+    """Match the configured host, excluding hosts listed in blocked_platforms.txt."""
     if not isinstance(url, str) or not url.strip():
         return False
     try:
@@ -190,6 +216,8 @@ def target_matches(url: str | None, allowed_host: str) -> bool:
         return False
     host = host_for(url)
     if parsed.scheme not in {"http", "https"} or not host:
+        return False
+    if is_blocked_platform(host):
         return False
     return host == allowed_host or host.endswith("." + allowed_host)
 
@@ -596,12 +624,22 @@ def main() -> int:
     else:
         allowed_host, source_name = load_allowed_host_from_txt()
         settings_source = f"{source_name} TXT file" if source_name else "TXT settings"
+    if not BLOCKED_PLATFORMS_FILE.is_file():
+        print("[CONFIG ERROR] blocked_platforms.txt is missing.", file=sys.stderr)
+        print("Restore the file beside this script before starting the tracker.", file=sys.stderr)
+        return 2
+    try:
+        blocked_platforms = load_blocked_platforms()
+    except RuntimeError:
+        print("[CONFIG ERROR] Could not read blocked_platforms.txt.", file=sys.stderr)
+        return 2
     if not allowed_host:
         print("[CONFIG ERROR] Site settings could not be loaded from TXT.", file=sys.stderr)
         print("Add site_domain=your-hostname to tracker_settings.txt.", file=sys.stderr)
         print("The configured hostname is intentionally hidden in terminal output.", file=sys.stderr)
         return 2
     print(f"[CONFIG] Settings loaded from the {settings_source}.", flush=True)
+    print(f"[CONFIG] Blocked platform list loaded ({len(blocked_platforms)} hostnames).", flush=True)
 
     # Don't echo the local debugger address or any page URL.
     print("[CONNECT] Checking the local Chrome DevTools endpoint...", flush=True)
@@ -695,8 +733,8 @@ def main() -> int:
         if args.auto_play:
             if chess is None:
                 raise RuntimeError("Autoplay requires python-chess. Install with: python -m pip install python-chess")
-            if is_stockfish_autoplay_blocked_host(allowed_host):
-                raise RuntimeError("Autoplay is disabled for public competitive chess platforms.")
+            if is_blocked_platform(allowed_host):
+                raise RuntimeError("Autoplay is disabled for platforms listed in blocked_platforms.txt.")
             if not installed.get("boardFound") or not installed.get("gameApiFound"):
                 raise RuntimeError("Autoplay needs the site's exposed board game API.")
             configured_engine_path = args.stockfish_path.strip() or load_optional_txt_setting("stockfish_path") or "stockfish.exe"
