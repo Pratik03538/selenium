@@ -318,7 +318,10 @@ def natural_bot_move_delay(
     if remaining_time_seconds is not None and _thinking_budget_remaining is not None:
         try:
             remaining_clock = max(0.0, float(remaining_time_seconds))
-            clock_reserve = max(0.25, min(2.0, remaining_clock * 0.08))
+            if initial_time_seconds is not None and float(initial_time_seconds) > 0:
+                clock_reserve = max(1.0, float(initial_time_seconds) * 0.40)
+            else:
+                clock_reserve = max(0.25, min(2.0, remaining_clock * 0.08))
             safe_pause_budget = max(0.0, remaining_clock - clock_reserve)
             _thinking_budget_remaining = min(
                 float(_thinking_budget_remaining), safe_pause_budget
@@ -373,7 +376,10 @@ def natural_bot_move_delay(
         if remaining_time_seconds is not None:
             try:
                 remaining_clock = max(0.0, float(remaining_time_seconds))
-                reserve = max(0.25, min(1.0, remaining_clock * 0.10))
+                if initial_time_seconds is not None and float(initial_time_seconds) > 0:
+                    reserve = max(1.0, float(initial_time_seconds) * 0.40)
+                else:
+                    reserve = max(0.25, min(1.0, remaining_clock * 0.10))
                 pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
             except (TypeError, ValueError):
                 pass
@@ -544,7 +550,10 @@ def natural_bot_move_delay(
     if remaining_time_seconds is not None:
         try:
             remaining_clock = max(0.0, float(remaining_time_seconds))
-            reserve = max(0.25, min(2.0, remaining_clock * 0.08))
+            if initial_time_seconds is not None and float(initial_time_seconds) > 0:
+                reserve = max(1.0, float(initial_time_seconds) * 0.40)
+            else:
+                reserve = max(0.25, min(2.0, remaining_clock * 0.08))
             pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
         except (TypeError, ValueError):
             pass
