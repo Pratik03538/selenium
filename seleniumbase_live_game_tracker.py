@@ -734,6 +734,13 @@ def main() -> int:
         print("Add site_domain=your-hostname to tracker_settings.txt.", file=sys.stderr)
         print("The configured hostname is intentionally hidden in terminal output.", file=sys.stderr)
         return 2
+    configured_bot_color_raw = load_optional_txt_setting("bot_color")
+    configured_bot_color = normalize_chess_color(configured_bot_color_raw)
+    if args.auto_play and configured_bot_color_raw and configured_bot_color is None:
+        print("[CONFIG ERROR] bot_color must be exactly white or black.", file=sys.stderr, flush=True)
+        return 2
+    if args.auto_play and configured_bot_color:
+        print(f"[CONFIG] Explicit bot color loaded: {configured_bot_color}.", flush=True)
     print(f"[CONFIG] Settings loaded from the {settings_source}.", flush=True)
 
     # Don't echo the local debugger address or any page URL.
@@ -779,7 +786,8 @@ def main() -> int:
     last_auto_attempt_fen = ""
     strategy_board = None
     strategy_board_fen = ""
-    active_bot_color = None
+    active_bot_color = configured_bot_color
+    last_side_warning_fen = ""
     previous_eval_white_cp = None
     next_human_best_uci = None
     opponent_match_history: list[float] = []
@@ -930,6 +938,13 @@ def main() -> int:
                 for event in events or []:
                     fen = str(event.get("fen") or "").strip()
                     dom_moves = event.get("moves") or []
+                    api_bot_color = normalize_chess_color(
+                        event.get("playingAsColor") or event.get("playingAs")
+                    )
+                    if configured_bot_color:
+                        active_bot_color = configured_bot_color
+                    elif active_bot_color is None and api_bot_color:
+                        active_bot_color = api_bot_color
                     white_clock_seconds = parse_clock_seconds(event.get("whiteClock"))
                     black_clock_seconds = parse_clock_seconds(event.get("blackClock"))
                     observed_clocks = [
@@ -995,7 +1010,7 @@ def main() -> int:
                                     previous_eval_white_cp = None
                                     opponent_pressure = False
                                     last_auto_attempt_fen = ""
-                                    active_bot_color = None
+                                    active_bot_color = configured_bot_color or api_bot_color
                                 elif strategy_transition is not None:
                                     strategy_move = chess.Move.from_uci(strategy_transition["uci"])
                                     if strategy_move in strategy_board.legal_moves:
@@ -1018,7 +1033,7 @@ def main() -> int:
 
                                 # Compare the opponent's move to the best reply predicted
                                 # from our last move, as the original ChessKida controller does.
-                                bot_side_for_score = active_bot_color or str(event.get("bottomSide") or "").lower()
+                                bot_side_for_score = active_bot_color or api_bot_color
                                 if (
                                     strategy_transition is not None
                                     and bot_side_for_score in {"white", "black"}
@@ -1070,7 +1085,9 @@ def main() -> int:
                     print_signature = json.dumps({
                         "fen": fen,
                         "turn": event.get("turn"),
+                        "turnColor": event.get("turnColor"),
                         "playingAs": event.get("playingAs"),
+                        "playingAsColor": event.get("playingAsColor"),
                         "isMyTurn": event.get("isMyTurn"),
                         "bottomSide": event.get("bottomSide", "unknown"),
                         "historyLen": len(history_copy),
@@ -1081,10 +1098,12 @@ def main() -> int:
                     if print_signature != last_console_signature:
                         last_console_signature = print_signature
                         print(
-                            f"[LIVE] turn={event.get('turn')} | ply={len(history_copy)} | "
+                            f"[LIVE] turn={event.get('turn')} (normalized={event.get('turnColor')}) | "
+                            f"player={event.get('playingAsColor') or 'unknown'} | "
+                            f"botSide={active_bot_color or 'unconfirmed'} | ply={len(history_copy)} | "
                             f"FEN={'OK' if fen else 'missing'} | "
                             f"API={'OK' if event.get('gameApiFound') else 'missing'} | "
-                            f"bottomSide={event.get('bottomSide', 'unknown')} | "
+                            f"bottomSide={event.get('bottomSide', 'unknown')} (orientation only) | "
                             f"isMyTurn={event.get('isMyTurn')}",
                             flush=True,
                         )
