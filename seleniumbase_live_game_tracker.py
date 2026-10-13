@@ -400,7 +400,7 @@ function normalizeColorToken(value) {
   return null;
 }
 function normalizePlayerText(value) {
-  return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+  return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim().toLocaleLowerCase().replace(/^@/, '');
 }
 function selectorNameSide(name, selector, color) {
   if (!name || !selector) return false;
@@ -412,7 +412,7 @@ function selectorNameSide(name, selector, color) {
 }
 function sideEvidenceFromNode(start) {
   let node = start;
-  for (let depth = 0; node && depth <= 7; depth++, node = node.parentElement) {
+  for (let depth = 0; node && depth <= 7; depth++, node = node.parentElement || node.getRootNode?.().host) {
     for (const attr of ['data-player-color', 'data-color', 'data-side', 'color']) {
       const side = normalizeColorToken(node.getAttribute?.(attr));
       if (side) return {color: side, source: 'player-name-ancestor-attribute'};
