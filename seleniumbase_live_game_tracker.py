@@ -2540,11 +2540,6 @@ def main() -> int:
                                         if engine_board.turn == chess.WHITE
                                         else black_clock_seconds
                                     )
-                                    opponent_clock_seconds = (
-                                        black_clock_seconds
-                                        if engine_board.turn == chess.WHITE
-                                        else white_clock_seconds
-                                    )
                                     book_choice = book.choose(engine_board) if book is not None else None
 
                                     if book_choice is not None:
@@ -2626,7 +2621,6 @@ def main() -> int:
                                         previous_eval_white_cp=previous_eval_white_cp,
                                         initial_time_seconds=initial_game_clock_seconds,
                                         remaining_time_seconds=remaining_clock_seconds,
-                                        opponent_time_seconds=opponent_clock_seconds,
                                         increment_seconds=clock_increment_seconds,
                                         is_opening_book_move=(
                                             isinstance(selection_meta, dict)
@@ -2634,21 +2628,14 @@ def main() -> int:
                                         ),
                                     )
                                     if natural_delay > 0:
-                                        clock_gap_text = (
-                                            f" | clock_gap={remaining_clock_seconds - opponent_clock_seconds:+.2f}s"
-                                            if remaining_clock_seconds is not None and opponent_clock_seconds is not None
-                                            else ""
-                                        )
                                         mode_text = (
                                             "LOW_CLOCK"
                                             if remaining_clock_seconds is not None and remaining_clock_seconds <= 10.0
-                                            else "CLOCK_AWARE"
+                                            else "OWN_CLOCK"
                                         )
                                         print(
                                             f"[BOT TIMING] delay={natural_delay:.3f}s | mode={mode_text}"
-                                            f" | own={remaining_clock_seconds if remaining_clock_seconds is not None else 'unknown'}"
-                                            f" | opponent={opponent_clock_seconds if opponent_clock_seconds is not None else 'unknown'}"
-                                            f"{clock_gap_text}.",
+                                            f" | own_clock={remaining_clock_seconds if remaining_clock_seconds is not None else 'unknown'}s.",
                                             flush=True,
                                         )
                                         time.sleep(natural_delay)
