@@ -18,7 +18,11 @@ ANALYSIS_DEPTH = 8
 BOT_EVERY_MOVE_DELAY_MIN = 0.000
 BOT_EVERY_MOVE_DELAY_MAX = 0.010
 BOT_THINKING_ENABLED_DEFAULT = True
-BOT_THINKING_START_AFTER_MOVE = 10
+BOT_THINKING_START_AFTER_MOVE = 8
+BOT_BOOK_INSTANT_MOVES = 8
+BOT_ENDGAME_PAUSE_MIN = 0.15
+BOT_ENDGAME_PAUSE_MAX = 0.75
+BOT_ENDGAME_PAUSE_CHANCE = 0.15
 BOT_PAUSE_MOVE_COOLDOWN_MIN = 5
 BOT_PAUSE_MOVE_COOLDOWN_MAX = 12
 BOT_PAUSE_ELIGIBILITY_SCALE = 0.55
@@ -258,7 +262,11 @@ def natural_bot_move_delay(
     selection_meta=None,
     moves_since_buffer=0,
     thinking_enabled=BOT_THINKING_ENABLED_DEFAULT,
-    previous_eval_white_cp=None
+    previous_eval_white_cp=None,
+    initial_time_seconds=None,
+    remaining_time_seconds=None,
+    increment_seconds=0.0,
+    is_opening_book_move=False
 ):
     """Return the retained base delay plus irregular human-like pauses.
 
@@ -283,17 +291,26 @@ def natural_bot_move_delay(
 
     if len(board.move_stack) <= 1:
         _bot_timing_move_count = 0
-        _thinking_budget_total = random.uniform(
-            BOT_THINK_BUDGET_MIN,
-            BOT_THINK_BUDGET_MAX
-        )
+        if initial_time_seconds is not None and float(initial_time_seconds) > 0:
+            initial_clock = float(initial_time_seconds)
+            # Allocate at most 60% of the starting clock to optional pauses.
+            _thinking_budget_total = min(
+                initial_clock * 0.60,
+                max(0.0, initial_clock - min(3.0, max(0.5, initial_clock * 0.08)))
+            )
+        else:
+            # Fallback when the configured test site does not expose a readable clock.
+            _thinking_budget_total = random.uniform(
+                BOT_THINK_BUDGET_MIN,
+                BOT_THINK_BUDGET_MAX
+            )
         _thinking_budget_remaining = _thinking_budget_total
         _thinking_move_cooldown_remaining = 0
         _mate_pause_used = False
 
     _bot_timing_move_count += 1
 
-    # Existing tiny base delay remains unchanged.
+    # Keep a very small default delay for ordinary moves.
     base_delay = random.uniform(
         BOT_EVERY_MOVE_DELAY_MIN,
         BOT_EVERY_MOVE_DELAY_MAX
@@ -301,73 +318,87 @@ def natural_bot_move_delay(
     delay = base_delay
     _last_bot_natural_delay = base_delay
 
-    # First 10 bot moves: absolutely no long pause.
+    # Never let optional pauses consume the clock reserve needed to finish and
+    # confirm a move. The remaining clock is an observation, not a fake timer.
+    if remaining_time_seconds is not None and _thinking_budget_remaining is not None:
+        try:
+            remaining_clock = max(0.0, float(remaining_time_seconds))
+            clock_reserve = max(0.25, min(2.0, remaining_clock * 0.08))
+            safe_pause_budget = max(0.0, remaining_clock - clock_reserve)
+            _thinking_budget_remaining = min(
+                float(_thinking_budget_remaining), safe_pause_budget
+            )
+        except (TypeError, ValueError):
+            pass
+
+    # Opening-book moves are already known; do not wait unnecessarily on the
+    # first eight book selections. The site must still confirm the move.
+    if is_opening_book_move and _bot_timing_move_count <= BOT_BOOK_INSTANT_MOVES:
+        _last_bot_natural_delay = 0.0
+        return 0.0
+
+    # Forced/tactical replies should not consume an artificial pause budget.
+    try:
+        if (
+            board.is_check()
+            or board.is_capture(move)
+            or board.is_castling(move)
+            or move.promotion is not None
+            or board.gives_check(move)
+        ):
+            _last_bot_natural_delay = 0.0
+            return 0.0
+    except Exception:
+        pass
+
+    # First eight bot moves: no long pause.
     if _bot_timing_move_count <= BOT_THINKING_START_AFTER_MOVE:
         return max(0.0, float(delay))
 
     if not thinking_enabled:
         return max(0.0, float(delay))
 
-    # ============================================================
-    # AFTER MOVE 50:
-    # No normal thinking pauses anymore. The only allowed long pause
-    # is one mate-in-5..mate-in-1 moment for the entire game.
-    # ============================================================
-    if _bot_timing_move_count > BOT_POST_50_MOVE:
-        if _mate_pause_used:
-            return max(0.0, float(delay))
-
-        mate_distance = None
-
-        if isinstance(engine_result, list):
-            for info in engine_result:
-                try:
-                    score_obj = info.get("score")
-                    if score_obj is None:
-                        continue
-
-                    mate_score = score_obj.pov(board.turn).mate()
-
-                    if mate_score is None:
-                        continue
-
-                    mate_distance_abs = abs(int(mate_score))
-
-                    if (
-                        mate_distance_abs
-                        <= BOT_MATE_PAUSE_MAX_MATE
-                        and mate_distance_abs
-                        >= BOT_MATE_PAUSE_MIN_MATE
-                    ):
-                        mate_distance = mate_distance_abs
-                        break
-                except Exception:
-                    continue
-
-        if mate_distance is None:
-            return max(0.0, float(delay))
-
-        pause_duration = random.uniform(
-            BOT_MATE_PAUSE_MIN,
-            BOT_MATE_PAUSE_MAX
+    # Late/endgame positions use occasional short pauses rather than the
+    # regular multi-second pause. Piece count complements move-count detection.
+    try:
+        endgame_mode = (
+            _bot_timing_move_count > BOT_POST_50_MOVE
+            or len(board.piece_map()) <= 10
         )
+    except Exception:
+        endgame_mode = _bot_timing_move_count > BOT_POST_50_MOVE
 
-        _mate_pause_used = True
-
-        # This is the single final mate pause. Keep it separate from the
-        # ordinary pause budget because move-50+ is explicitly mate-only.
-        delay += pause_duration
-
+    if endgame_mode:
+        if _thinking_budget_remaining is None or _thinking_budget_remaining <= 0.05:
+            return max(0.0, float(delay))
+        pause_max = min(
+            BOT_ENDGAME_PAUSE_MAX,
+            float(_thinking_budget_remaining)
+        )
+        if remaining_time_seconds is not None:
+            try:
+                remaining_clock = max(0.0, float(remaining_time_seconds))
+                reserve = max(0.25, min(1.0, remaining_clock * 0.10))
+                pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
+            except (TypeError, ValueError):
+                pass
+        if (
+            pause_max < BOT_ENDGAME_PAUSE_MIN
+            or random.random() >= BOT_ENDGAME_PAUSE_CHANCE
+        ):
+            return max(0.0, float(delay))
+        pause_duration = random.uniform(BOT_ENDGAME_PAUSE_MIN, pause_max)
+        _thinking_budget_remaining = max(
+            0.0, float(_thinking_budget_remaining) - pause_duration
+        )
+        _last_bot_natural_delay = delay + pause_duration
         print(
-            "[BOT PAUSE] "
-            f"duration={pause_duration:.3f}s "
-            f"reason=MATE M{mate_distance} "
-            f"move={_bot_timing_move_count} "
-            "final_mate_pause=yes",
+            f"[BOT PAUSE] duration={pause_duration:.3f}s "
+            f"reason=ENDGAME_SHORT remaining_budget={_thinking_budget_remaining:.3f}s "
+            f"moves={_bot_timing_move_count}",
             flush=True
         )
-
-        return max(0.0, float(delay))
+        return max(0.0, float(delay + pause_duration))
 
     if (
         _thinking_budget_remaining is None
@@ -515,6 +546,13 @@ def natural_bot_move_delay(
         BOT_THINK_PAUSE_MAX,
         float(_thinking_budget_remaining)
     )
+    if remaining_time_seconds is not None:
+        try:
+            remaining_clock = max(0.0, float(remaining_time_seconds))
+            reserve = max(0.25, min(2.0, remaining_clock * 0.08))
+            pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
+        except (TypeError, ValueError):
+            pass
 
     if pause_max < BOT_THINK_PAUSE_MIN:
         return max(0.0, float(delay))
