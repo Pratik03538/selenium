@@ -938,8 +938,9 @@ def main() -> int:
                 for event in events or []:
                     fen = str(event.get("fen") or "").strip()
                     dom_moves = event.get("moves") or []
-                    api_bot_color = normalize_chess_color(
-                        event.get("playingAsColor") or event.get("playingAs")
+                    api_bot_color = (
+                        normalize_chess_color(event.get("playingAsColor"))
+                        or normalize_chess_color(event.get("playingAs"))
                     )
                     if configured_bot_color:
                         active_bot_color = configured_bot_color
@@ -1124,8 +1125,9 @@ def main() -> int:
                     # explicit bot_color setting. Board orientation is presentation only.
                     if args.auto_play and engine is not None and strategy_module is not None and fen and strategy_board is not None:
                         api_my_turn = event.get("isMyTurn")
-                        api_bot_color = normalize_chess_color(
-                            event.get("playingAsColor") or event.get("playingAs")
+                        api_bot_color = (
+                            normalize_chess_color(event.get("playingAsColor"))
+                            or normalize_chess_color(event.get("playingAs"))
                         )
                         if configured_bot_color:
                             active_bot_color = configured_bot_color
