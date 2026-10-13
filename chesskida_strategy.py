@@ -57,9 +57,12 @@ HUMAN_ADVANTAGE_GROWTH_PREFERENCE_MIN_CP = 10
 HUMAN_ADVANTAGE_GROWTH_PREFERENCE_MAX_CP = 35
 HUMAN_WINNING_GUARD_START_CP = 60
 HUMAN_WINNING_GUARD_MAX_DROP_CP = 45
-HUMAN_WINNING_GUARD_RANK_CAP = 5
+# Keep the baseline weighted picker, but allow a few more safe ranks
+# to remain eligible in winning positions. CP and hanging-piece guards below
+# still decide whether a lower-ranked move is actually acceptable.
+HUMAN_WINNING_GUARD_RANK_CAP = 7
 HUMAN_STRONG_WINNING_CP = 300
-HUMAN_STRONG_WINNING_RANK_CAP = 3
+HUMAN_STRONG_WINNING_RANK_CAP = 5
 HUMAN_WINNING_NON_BEST_CHANCE = 0.45
 HUMAN_STRONG_WINNING_NON_BEST_CHANCE = 0.25
 FREE_CAPTURE_MIN_VALUE = 3
@@ -2869,7 +2872,7 @@ def choose_stockfish_move(
                     f"TARGET="
                     f"{profile['target_accuracy']:.1f}% "
                     f"RANKCAP=#"
-                    f"{adaptive_max_rank + 1}"
+                    f"{effective_rank_cap + 1}"
                 )
             }
         )
