@@ -1011,7 +1011,8 @@ def perform_cursor_drag(
 
     Each move chooses new points inside the source and destination squares.
     Pointer travel follows a gentle randomized quadratic curve and its total
-    configured source-to-destination duration is 100-300 ms.
+    configured source-to-destination duration is 10-200 ms, with a
+    separate randomized 0-100 ms delay before pointer movement.
     """
     try:
         target = driver.execute_script(
@@ -1077,7 +1078,8 @@ def perform_cursor_drag(
     control_y = min(max(2.0, control_y), height - 2.0)
 
     waypoint_count = rng.randint(3, 5)
-    total_drag_ms = rng.randint(100, 300)
+    total_drag_ms = rng.randint(10, 200)
+    pre_delay_ms = rng.randint(0, 100)
     base_duration, extra_ms = divmod(total_drag_ms, waypoint_count)
     segment_durations = [base_duration] * waypoint_count
     if extra_ms:
@@ -1114,6 +1116,9 @@ def perform_cursor_drag(
     try:
         # Use W3C pointer actions so each curve segment can receive its own
         # duration. These durations add up to the randomized 100-300 ms budget.
+        if pre_delay_ms:
+            time.sleep(pre_delay_ms / 1000.0)
+
         actions = ActionChains(driver)
         pointer = actions.w3c_actions.pointer_action
         pointer.move_to(
@@ -1145,6 +1150,7 @@ def perform_cursor_drag(
             "ok": False,
             "reason": "cursor-action-failed",
             "drag_ms": total_drag_ms,
+            "pre_delay_ms": pre_delay_ms,
         }
 
     # Confirm the UI accepted this drag before reporting success.
@@ -1162,6 +1168,7 @@ def perform_cursor_drag(
                 "ok": True,
                 "uci": text,
                 "drag_ms": total_drag_ms,
+            "pre_delay_ms": pre_delay_ms,
                 "waypoints": waypoint_count,
             }
         time.sleep(0.025)
@@ -1170,6 +1177,7 @@ def perform_cursor_drag(
         "ok": False,
         "reason": "cursor-drag-not-confirmed",
         "drag_ms": total_drag_ms,
+            "pre_delay_ms": pre_delay_ms,
         "waypoints": waypoint_count,
     }
 
@@ -1889,7 +1897,7 @@ def main() -> int:
                                         )
                                     if isinstance(submit, dict) and submit.get("ok"):
                                         if args.move_input == "cursor":
-                                            print(f"[CURSOR] Drag accepted (variable path/timing; approx. {int(submit.get('drag_ms', 0))} ms).", flush=True)
+                                            print(f"[CURSOR] Drag accepted | travel={int(submit.get('drag_ms', 0))} ms | pre-delay={int(submit.get('pre_delay_ms', 0))} ms | waypoints={int(submit.get('waypoints', 0))}.", flush=True)
                                         print(f"[AUTO] Submitted selected move: {chosen_san} ({chosen_move.uci()}).", flush=True)
 
                                         after_board = engine_board.copy(stack=True)
