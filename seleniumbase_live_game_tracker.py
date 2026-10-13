@@ -1042,11 +1042,7 @@ def main() -> int:
             if is_public_competitive_host(allowed_host):
                 raise RuntimeError("Autoplay is disabled for public competitive chess platforms.")
             if not installed.get("boardFound") or not installed.get("gameApiFound"):
-                print(
-                    "[WAITING FOR MATCH] Board/game API not available yet; "
-                    "will keep monitoring this tab.",
-                    flush=True,
-                )
+                raise RuntimeError("Autoplay needs the site's exposed board game API.")
             try:
                 import chesskida_strategy as strategy_module
                 from gm_book import GMBook
@@ -1091,15 +1087,6 @@ def main() -> int:
             print("[MODE] Live state reader active (DOM observer + 200ms state fallback); Ctrl+C to stop.", flush=True)
             last_console_signature = None
             last_name_debug_signature = None
-            waiting_for_match = (
-                not bool(installed.get("boardFound"))
-                or (args.auto_play and not bool(installed.get("gameApiFound")))
-            )
-            if waiting_for_match and not args.auto_play:
-                print(
-                    "[WAITING FOR MATCH] Board not found yet; will keep monitoring this tab.",
-                    flush=True,
-                )
             while True:
                 # Closing the chosen tab often yields current_url=None in ChromeDriver.
                 if chosen_handle not in driver.window_handles:
@@ -1125,24 +1112,6 @@ def main() -> int:
                     break
 
                 for event in events or []:
-                    board_ready = bool(event.get("boardFound"))
-                    game_api_ready = bool(event.get("gameApiFound"))
-                    if not board_ready or (args.auto_play and not game_api_ready):
-                        if not waiting_for_match:
-                            print(
-                                "[WAITING FOR MATCH] Board/game API is unavailable; waiting for it to appear.",
-                                flush=True,
-                            )
-                        waiting_for_match = True
-                        continue
-
-                    if waiting_for_match:
-                        print(
-                            "[MATCH FOUND] Board/game API detected; resuming live state reader.",
-                            flush=True,
-                        )
-                        waiting_for_match = False
-
                     fen = str(event.get("fen") or "").strip()
                     dom_moves = event.get("moves") or []
                     api_bot_color = (
