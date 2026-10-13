@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import ipaddress
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -576,6 +577,78 @@ def is_start_position(fen: str) -> bool:
         return False
 
 
+
+_CLOCK_MMSS_RE = re.compile(r"^(\d+):([0-5]?\d)(?:\.(\d+))?$")
+_CLOCK_HHMMSS_RE = re.compile(r"^(\d+):([0-5]?\d):([0-5]?\d)(?:\.(\d+))?$")
+
+
+def parse_clock_seconds(raw_value: object) -> float | None:
+    """Parse a visible chess clock such as 1:00, 00:59.4, or 59.4 seconds."""
+    text = re.sub(r"\s+", "", str(raw_value or "")).replace(",", ".")
+    if not text:
+        return None
+    match = _CLOCK_HHMMSS_RE.fullmatch(text)
+    if match:
+        hours, minutes, seconds, fraction = match.groups()
+        decimal = float(f"0.{fraction}") if fraction else 0.0
+        return max(0.0, int(hours) * 3600 + int(minutes) * 60 + int(seconds) + decimal)
+    match = _CLOCK_MMSS_RE.fullmatch(text)
+    if match:
+        minutes, seconds, fraction = match.groups()
+        decimal = float(f"0.{fraction}") if fraction else 0.0
+        return max(0.0, int(minutes) * 60 + int(seconds) + decimal)
+    if re.fullmatch(r"\d+(?:\.\d+)?", text):
+        return max(0.0, float(text))
+    return None
+
+
+def calculate_engine_search_limit(
+    base_seconds: float,
+    remaining_seconds: float | None,
+    initial_seconds: float | None,
+    increment_seconds: float,
+    board,
+) -> float:
+    """Cap engine calculation time using the observed clock; never exceed the configured cap."""
+    base = max(0.005, min(float(base_seconds), 5.0))
+    if remaining_seconds is None:
+        return base
+
+    remaining = max(0.0, float(remaining_seconds))
+    initial = max(1.0, float(initial_seconds or remaining or 1.0))
+    increment = max(0.0, min(float(increment_seconds or 0.0), 60.0))
+
+    # Retain a clock reserve for submitting the move and state confirmation.
+    reserve = min(3.0, max(0.25, remaining * 0.08))
+    usable = max(0.0, remaining - reserve)
+    if usable <= 0.01:
+        return max(0.005, min(base, max(0.005, remaining * 0.20)))
+
+    # Estimate the remaining decision count from the observed base clock.
+    if initial <= 60:
+        expected_moves = 35.0
+    elif initial <= 180:
+        expected_moves = 40.0
+    else:
+        expected_moves = 45.0
+    fraction = min(1.0, max(0.08, remaining / initial))
+    expected_moves = max(8.0, expected_moves * (fraction ** 0.5))
+    per_move_clock = usable / expected_moves + increment
+
+    # Spend a small fraction of the available move budget on calculation.
+    # The position can raise this only within the caller's configured cap.
+    factor = 1.0
+    try:
+        if board.is_check() or board.legal_moves.count() >= 28:
+            factor = 1.20
+        elif len(board.piece_map()) <= 10:
+            factor = 0.80
+    except Exception:
+        pass
+    clock_cap = max(0.005, per_move_clock * 0.20 * factor)
+    return max(0.005, min(base, clock_cap))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Attach to Chrome and read live chess DOM/API state; output hides site identifiers."
@@ -686,6 +759,24 @@ def main() -> int:
     next_human_best_uci = None
     opponent_match_history: list[float] = []
     opponent_pressure = False
+    # If the site exposes the clock from game start, estimate the base time
+    # from its first valid reading. Optional TXT keys can make this explicit:
+    # time_control_seconds=60 and clock_increment_seconds=0.
+    configured_time_control = load_optional_txt_setting("time_control_seconds")
+    try:
+        initial_game_clock_seconds = (
+            max(0.0, float(configured_time_control))
+            if configured_time_control else None
+        )
+    except ValueError:
+        initial_game_clock_seconds = None
+    try:
+        clock_increment_seconds = max(
+            0.0, float(load_optional_txt_setting("clock_increment_seconds") or 0.0)
+        )
+    except ValueError:
+        clock_increment_seconds = 0.0
+    clock_source_reported = False
     try:
         handles = driver.window_handles
         candidates: list[tuple[int, str]] = []
@@ -813,6 +904,33 @@ def main() -> int:
                 for event in events or []:
                     fen = str(event.get("fen") or "").strip()
                     dom_moves = event.get("moves") or []
+                    white_clock_seconds = parse_clock_seconds(event.get("whiteClock"))
+                    black_clock_seconds = parse_clock_seconds(event.get("blackClock"))
+                    observed_clocks = [
+                        value for value in (white_clock_seconds, black_clock_seconds)
+                        if value is not None
+                    ]
+                    is_new_game_snapshot = bool(
+                        fen and previous_fen and fen != previous_fen
+                        and is_start_position(fen)
+                        and not is_start_position(previous_fen)
+                    )
+                    if is_new_game_snapshot and not configured_time_control:
+                        initial_game_clock_seconds = None
+                    if initial_game_clock_seconds is None and observed_clocks:
+                        initial_game_clock_seconds = max(observed_clocks)
+                    if observed_clocks and not clock_source_reported:
+                        source_note = (
+                            "configured time-control value"
+                            if configured_time_control and initial_game_clock_seconds is not None
+                            else "first observed clock reading (estimate)"
+                        )
+                        print(
+                            f"[CLOCK] Base time={initial_game_clock_seconds:.2f}s via {source_note}; "
+                            f"increment={clock_increment_seconds:.2f}s.",
+                            flush=True,
+                        )
+                        clock_source_reported = True
                     last_move: dict[str, str] | None = None
                     note = "DOM/API state change; identifiers omitted"
 
@@ -1001,7 +1119,30 @@ def main() -> int:
                                             "book_weight": float(book_choice.get("weight", 0.0)),
                                         }
                                     else:
-                                        limit_seconds = max(0.005, min(float(args.engine_time), 5.0))
+                                        remaining_clock_seconds = (
+                                            white_clock_seconds
+                                            if engine_board.turn == chess.WHITE
+                                            else black_clock_seconds
+                                        )
+                                        limit_seconds = calculate_engine_search_limit(
+                                            base_seconds=args.engine_time,
+                                            remaining_seconds=remaining_clock_seconds,
+                                            initial_seconds=initial_game_clock_seconds,
+                                            increment_seconds=clock_increment_seconds,
+                                            board=engine_board,
+                                        )
+                                        if remaining_clock_seconds is None:
+                                            print(
+                                                f"[ENGINE CLOCK] Remaining clock unavailable; "
+                                                f"using configured cap={limit_seconds:.3f}s.",
+                                                flush=True,
+                                            )
+                                        else:
+                                            print(
+                                                f"[ENGINE CLOCK] remaining={remaining_clock_seconds:.2f}s | "
+                                                f"search_limit={limit_seconds:.3f}s.",
+                                                flush=True,
+                                            )
                                         engine_result = engine.analyse(
                                             engine_board,
                                             chess.engine.Limit(depth=12, time=limit_seconds),
