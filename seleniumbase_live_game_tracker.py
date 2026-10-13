@@ -1348,10 +1348,15 @@ def main() -> int:
                             or normalize_chess_color(event.get("playingAs"))
                         )
                         player_name_color = normalize_chess_color(event.get("playerNameColor"))
-                        if configured_bot_color:
+                        # When player_name is configured, the matched username's
+                        # panel color is per-game truth. Refresh it on each snapshot
+                        # so the previous game's color cannot stick across a game reset.
+                        if configured_player_name:
+                            active_bot_color = player_name_color
+                        elif configured_bot_color:
                             active_bot_color = configured_bot_color
-                        elif active_bot_color is None and (player_name_color or api_bot_color):
-                            active_bot_color = player_name_color or api_bot_color
+                        elif active_bot_color is None and api_bot_color:
+                            active_bot_color = api_bot_color
 
                         color_conflict = bool(
                             active_bot_color
