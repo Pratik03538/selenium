@@ -1120,29 +1120,73 @@ def main() -> int:
                         if event.get("result"):
                             print("        Result detected.", flush=True)
 
-                    # Autoplay operates only when explicitly enabled, the configured
-                    # host has already passed the allowlist and public-platform block,
-                    # and the detected bottom-side color is to move. Never click by
-                    # coordinates; submit through the site's exposed legal-move API.
+                    # Autoplay side detection must use the player-color API or an
+                    # explicit bot_color setting. Board orientation is presentation only.
                     if args.auto_play and engine is not None and strategy_module is not None and fen and strategy_board is not None:
-                        bottom = str(event.get("bottomSide") or "unknown").lower()
                         api_my_turn = event.get("isMyTurn")
+                        api_bot_color = normalize_chess_color(
+                            event.get("playingAsColor") or event.get("playingAs")
+                        )
+                        if configured_bot_color:
+                            active_bot_color = configured_bot_color
+                        elif active_bot_color is None and api_bot_color:
+                            active_bot_color = api_bot_color
 
-                        if bottom in {"white", "black"}:
-                            active_bot_color = bottom
+                        color_conflict = bool(
+                            api_bot_color
+                            and active_bot_color
+                            and api_bot_color != active_bot_color
+                        )
 
                         if fen != last_auto_attempt_fen:
                             engine_board = strategy_board.copy(stack=True)
-                            if api_my_turn is True:
-                                our_turn = True
-                            elif api_my_turn is False:
+                            side_to_move = (
+                                "white" if engine_board.turn == chess.WHITE else "black"
+                            )
+                            api_turn_color = normalize_chess_color(event.get("turnColor"))
+                            turn_conflict = bool(
+                                api_turn_color and api_turn_color != side_to_move
+                            )
+                            side_matches_bot = bool(
+                                active_bot_color and side_to_move == active_bot_color
+                            )
+
+                            # Never treat bottomSide as the bot color. Unknown or
+                            # contradictory color data must stop move submission.
+                            our_turn = (
+                                side_matches_bot
+                                and not color_conflict
+                                and not turn_conflict
+                                and api_my_turn is not False
+                            )
+                            if api_my_turn is True and not side_matches_bot:
+                                turn_conflict = True
                                 our_turn = False
-                            else:
-                                our_turn = (
-                                    bottom in {"white", "black"}
-                                    and ((engine_board.turn == chess.WHITE and bottom == "white")
-                                         or (engine_board.turn == chess.BLACK and bottom == "black"))
-                                )
+
+                            if (
+                                (active_bot_color is None or color_conflict or turn_conflict)
+                                and fen != last_side_warning_fen
+                            ):
+                                last_side_warning_fen = fen
+                                if active_bot_color is None:
+                                    print(
+                                        "[AUTO SAFETY] Bot color is unconfirmed. "
+                                        "Set bot_color=white or bot_color=black in tracker_settings.txt, "
+                                        "or expose a recognized getPlayingAs() value. No move submitted.",
+                                        flush=True,
+                                    )
+                                elif color_conflict:
+                                    print(
+                                        "[AUTO SAFETY] Configured/API player color conflicts. "
+                                        "Move generation paused; check bot_color in TXT settings.",
+                                        flush=True,
+                                    )
+                                else:
+                                    print(
+                                        "[AUTO SAFETY] API turn conflicts with FEN side-to-move. "
+                                        "Move generation paused for this position.",
+                                        flush=True,
+                                    )
 
                             if our_turn and not engine_board.is_game_over(claim_draw=True):
                                 last_auto_attempt_fen = fen
@@ -1201,6 +1245,11 @@ def main() -> int:
                                         opponent_accuracy, opponent_sample_count = strategy_module.opponent_recent_accuracy(
                                             opponent_match_history
                                         )
+                                        print(
+                                            f"[ENGINE POV] analysis_side={active_bot_color} | "
+                                            f"fen_side_to_move={side_to_move}.",
+                                            flush=True,
+                                        )
                                         chosen_move, selected_info, selection_meta = strategy_module.choose_stockfish_move(
                                             engine_board,
                                             engine_result,
@@ -1209,6 +1258,7 @@ def main() -> int:
                                             opponent_sample_count=opponent_sample_count,
                                             opponent_pressure=opponent_pressure,
                                             engine=engine,
+                                            bot_color=(active_bot_color == "white"),
                                         )
                                         opponent_pressure = False
 
