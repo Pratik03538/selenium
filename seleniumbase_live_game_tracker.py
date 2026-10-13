@@ -13,6 +13,7 @@ import csv
 import json
 import ipaddress
 import re
+import random
 import sys
 import time
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ from urllib.request import urlopen
 try:
     from selenium import webdriver
     from selenium.common.exceptions import WebDriverException
+    from selenium.webdriver.common.action_chains import ActionChains
 except ImportError as exc:
     raise SystemExit(
         "Missing Selenium. Install with: python -m pip install -U selenium"
@@ -613,6 +615,57 @@ window.__liveGameApiReader = {
   status: () => ({lastError: state.lastError, pending: state.queue.length}),
   drain: () => state.queue.splice(0, state.queue.length),
   current: () => state.snapshot(),
+  dragTarget: (uci, expectedFen) => {
+    const board = getBoard();
+    const game = board && board.game;
+    if (!board || !game || typeof game.getFEN !== 'function' ||
+        typeof game.getLegalMoves !== 'function') {
+      return {ok: false, reason: 'board-game-api-unavailable'};
+    }
+    const currentFen = String(callMaybe(game, 'getFEN') || '').trim();
+    if (!currentFen || currentFen !== String(expectedFen || '').trim()) {
+      return {ok: false, reason: 'position-changed-before-drag'};
+    }
+    const text = String(uci || '').toLowerCase();
+    if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(text)) {
+      return {ok: false, reason: 'invalid-uci'};
+    }
+    const raw = callMaybe(game, 'getLegalMoves');
+    if (!Array.isArray(raw)) return {ok: false, reason: 'legal-moves-unavailable'};
+    const from = text.slice(0, 2), to = text.slice(2, 4), promo = text.slice(4, 5);
+    const candidates = raw.filter(m => m &&
+      String(m.from || '').toLowerCase() === from &&
+      String(m.to || '').toLowerCase() === to);
+    if (!candidates.length) return {ok: false, reason: 'legal-move-not-found'};
+    if (promo) {
+      const promotionCode = value => {
+        const v = String(value == null ? '' : value).toLowerCase();
+        if (['q', 'queen'].includes(v)) return 'q';
+        if (['r', 'rook'].includes(v)) return 'r';
+        if (['b', 'bishop'].includes(v)) return 'b';
+        if (['n', 'knight'].includes(v)) return 'n';
+        return '';
+      };
+      if (!candidates.some(m => promotionCode(m.promotion) === promo)) {
+        return {ok: false, reason: 'promotion-choice-not-exposed'};
+      }
+    }
+    const rect = board.getBoundingClientRect();
+    const orientation = detectBottomSide(board);
+    if (!rect.width || !rect.height || Math.abs(rect.width - rect.height) > Math.max(8, rect.width * 0.08)) {
+      return {ok: false, reason: 'board-geometry-not-square'};
+    }
+    if (!['white', 'black'].includes(orientation.side)) {
+      return {ok: false, reason: 'board-orientation-unknown'};
+    }
+    return {
+      ok: true,
+      boardElement: board,
+      width: rect.width,
+      height: rect.height,
+      bottomSide: orientation.side
+    };
+  },
   playUci: (uci, expectedFen) => {
     // Use only the configured site's exposed legal-move/game API.
     const board = getBoard();
@@ -824,6 +877,125 @@ def calculate_engine_search_limit(
     return max(0.005, min(base, clock_cap))
 
 
+def perform_cursor_drag(driver, uci: str, expected_fen: str) -> dict[str, object]:
+    """Perform a real Selenium pointer drag on the configured, non-blocked test board.
+
+    This is intended for UI testing of an owned site. Square centers receive small,
+    independent bounded offsets and the drag path uses varied segment timing. Public
+    competitive chess hosts remain rejected by the existing host guard.
+    """
+    try:
+        target = driver.execute_script(
+            "return window.__liveGameApiReader ? "
+            "window.__liveGameApiReader.dragTarget(arguments[0], arguments[1]) : "
+            "{ok:false, reason:'reader-not-installed'};",
+            uci, expected_fen,
+        )
+    except WebDriverException:
+        return {"ok": False, "reason": "drag-target-unavailable"}
+
+    if not isinstance(target, dict) or not target.get("ok"):
+        return target if isinstance(target, dict) else {"ok": False, "reason": "invalid-drag-target"}
+
+    text = str(uci or "").lower()
+    if len(text) == 5:
+        return {"ok": False, "reason": "promotion-ui-needs-site-specific-selector"}
+
+    board_element = target.get("boardElement")
+    try:
+        width = float(target["width"])
+        height = float(target["height"])
+        bottom_side = str(target["bottomSide"])
+    except (KeyError, TypeError, ValueError):
+        return {"ok": False, "reason": "invalid-board-geometry"}
+    if board_element is None or width <= 0 or height <= 0:
+        return {"ok": False, "reason": "invalid-board-element"}
+
+    # Position for a square, using the detected orientation. Independent random
+    # in-square offsets mean the pointer does not reuse identical square centers.
+    rng = random.SystemRandom()
+    square_w = width / 8.0
+    square_h = height / 8.0
+
+    def square_point(square: str) -> tuple[float, float]:
+        file_index = ord(square[0]) - ord("a")
+        rank_number = int(square[1])
+        if bottom_side == "white":
+            col = file_index
+            row = 8 - rank_number
+        else:
+            col = 7 - file_index
+            row = rank_number - 1
+        jitter_x = rng.uniform(-0.22, 0.22)
+        jitter_y = rng.uniform(-0.22, 0.22)
+        return (
+            (col + 0.5 + jitter_x) * square_w,
+            (row + 0.5 + jitter_y) * square_h,
+        )
+
+    sx, sy = square_point(text[:2])
+    dx, dy = square_point(text[2:4])
+    source_offset = (round(sx - width / 2), round(sy - height / 2))
+    destination_offset = (round(dx - width / 2), round(dy - height / 2))
+    move_duration_ms = rng.randint(18, 48)
+    waypoint_count = rng.randint(3, 6)
+    hover_ms = rng.randint(25, 85)
+    hold_ms = rng.randint(35, 105)
+    segment_pauses_ms = [rng.randint(5, 28) for _ in range(waypoint_count)]
+    release_pause_ms = rng.randint(25, 95)
+    estimated_drag_ms = (
+        waypoint_count * move_duration_ms
+        + hover_ms + hold_ms + sum(segment_pauses_ms) + release_pause_ms
+    )
+
+    try:
+        actions = ActionChains(driver, duration=move_duration_ms)
+        actions.move_to_element_with_offset(
+            board_element, source_offset[0], source_offset[1]
+        ).pause(hover_ms / 1000.0).click_and_hold().pause(hold_ms / 1000.0)
+
+        # Randomized intermediate waypoints, with a separately chosen position
+        # inside each endpoint square. The final waypoint lands inside destination.
+        for index in range(1, waypoint_count + 1):
+            fraction = index / waypoint_count
+            if index == waypoint_count:
+                px, py = dx, dy
+            else:
+                px = sx + (dx - sx) * fraction + rng.uniform(-4.0, 4.0)
+                py = sy + (dy - sy) * fraction + rng.uniform(-4.0, 4.0)
+                px = min(max(2.0, px), width - 2.0)
+                py = min(max(2.0, py), height - 2.0)
+            actions.move_to_element_with_offset(
+                board_element,
+                round(px - width / 2),
+                round(py - height / 2),
+            ).pause(segment_pauses_ms[index - 1] / 1000.0)
+        actions.pause(release_pause_ms / 1000.0).release().perform()
+    except (WebDriverException, ValueError, TypeError):
+        # Release the held mouse button if an intermediate action failed.
+        try:
+            ActionChains(driver).release().perform()
+        except Exception:
+            pass
+        return {"ok": False, "reason": "cursor-action-failed", "drag_ms": estimated_drag_ms}
+
+    # Confirm the UI accepted the move before reporting success.
+    deadline = time.monotonic() + 1.25
+    while time.monotonic() < deadline:
+        try:
+            current_fen = driver.execute_script(
+                "return window.__liveGameApiReader ? "
+                "window.__liveGameApiReader.current().fen : '';"
+            )
+        except WebDriverException:
+            current_fen = ""
+        if current_fen and str(current_fen).strip() != expected_fen.strip():
+            return {"ok": True, "uci": text, "drag_ms": estimated_drag_ms}
+        time.sleep(0.025)
+
+    return {"ok": False, "reason": "cursor-drag-not-confirmed", "drag_ms": estimated_drag_ms}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Attach to Chrome and read live chess DOM/API state; output hides site identifiers."
@@ -857,6 +1029,7 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(auto_play=None)
     parser.add_argument("--stockfish-path", default="", help="Stockfish executable path; can also be set as stockfish_path=... in TXT settings.")
     parser.add_argument("--engine-time", type=float, default=0.040, help="Stockfish search time per move, seconds (ChessKida baseline default: 0.040).")
+    parser.add_argument("--move-input", choices=("api", "cursor"), default=None, help="Move submission method; can also be set with move_input=api|cursor in tracker_settings.txt.")
     return parser.parse_args()
 
 
@@ -873,6 +1046,11 @@ def main() -> int:
     if args.auto_play is None:
         auto_setting = load_optional_txt_setting("auto_play").strip().lower()
         args.auto_play = auto_setting in {"1", "true", "yes", "on", "enabled"}
+    if args.move_input is None:
+        args.move_input = load_optional_txt_setting("move_input").strip().lower() or "api"
+    if args.move_input not in {"api", "cursor"}:
+        print("[CONFIG ERROR] move_input must be api or cursor.", file=sys.stderr, flush=True)
+        return 2
     if args.allowed_domain.strip():
         allowed_host = normalize_host(args.allowed_domain)
         settings_source = "command-line settings"
@@ -1069,6 +1247,10 @@ def main() -> int:
                 print("[BOOK] Opening book unavailable; using Stockfish strategy.", flush=True)
 
             print("[AUTO] ChessKida move-selection behavior enabled for the configured, non-blocked test site.", flush=True)
+            if args.move_input == "cursor":
+                print("[INPUT] Cursor drag mode enabled for the configured test board; public competitive hosts remain blocked.", flush=True)
+            else:
+                print("[INPUT] Direct game API mode enabled.", flush=True)
             print(f"[ENGINE] Threads=2 | Hash=128 MB | depth=12 | MultiPV=15 | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s.", flush=True)
 
         csv_path = Path(args.csv).expanduser().resolve()
@@ -1518,11 +1700,16 @@ def main() -> int:
                                         print(f"[BOT TIMING] delay={natural_delay:.3f}s.", flush=True)
                                         time.sleep(natural_delay)
 
-                                    submit = driver.execute_script(
-                                        "return window.__liveGameApiReader ? window.__liveGameApiReader.playUci(arguments[0], arguments[1]) : {ok:false, reason:'reader-not-installed'};",
-                                        chosen_move.uci(), fen,
-                                    )
+                                    if args.move_input == "cursor":
+                                        submit = perform_cursor_drag(driver, chosen_move.uci(), fen)
+                                    else:
+                                        submit = driver.execute_script(
+                                            "return window.__liveGameApiReader ? window.__liveGameApiReader.playUci(arguments[0], arguments[1]) : {ok:false, reason:'reader-not-installed'};",
+                                            chosen_move.uci(), fen,
+                                        )
                                     if isinstance(submit, dict) and submit.get("ok"):
+                                        if args.move_input == "cursor":
+                                            print(f"[CURSOR] Drag accepted (variable path/timing; approx. {int(submit.get('drag_ms', 0))} ms).", flush=True)
                                         print(f"[AUTO] Submitted selected move: {chosen_san} ({chosen_move.uci()}).", flush=True)
 
                                         after_board = engine_board.copy(stack=True)
