@@ -1007,11 +1007,11 @@ def calculate_engine_search_limit(
 def perform_cursor_drag(
     driver, uci: str, expected_fen: str, expected_color: str | None
 ) -> dict[str, object]:
-    """Perform a real Selenium pointer drag on the configured, non-blocked test board.
+    """Drag a legal move on the configured local/test board.
 
-    This is intended for UI testing of an owned site. Square centers receive small,
-    independent bounded offsets and the drag path uses varied segment timing. Public
-    competitive chess hosts remain rejected by the existing host guard.
+    Each move chooses new points inside the source and destination squares.
+    Pointer travel follows a gentle randomized quadratic curve and its total
+    configured source-to-destination duration is 100-300 ms.
     """
     try:
         target = driver.execute_script(
@@ -1040,8 +1040,6 @@ def perform_cursor_drag(
     if board_element is None or width <= 0 or height <= 0:
         return {"ok": False, "reason": "invalid-board-element"}
 
-    # Position for a square, using the detected orientation. Independent random
-    # in-square offsets mean the pointer does not reuse identical square centers.
     rng = random.SystemRandom()
     square_w = width / 8.0
     square_h = height / 8.0
@@ -1050,11 +1048,12 @@ def perform_cursor_drag(
         file_index = ord(square[0]) - ord("a")
         rank_number = int(square[1])
         if bottom_side == "white":
-            col = file_index
-            row = 8 - rank_number
+            col, row = file_index, 8 - rank_number
         else:
-            col = 7 - file_index
-            row = rank_number - 1
+            col, row = 7 - file_index, rank_number - 1
+
+        # New independent target for every source and destination click.
+        # Keep the pointer within the square, away from its borders.
         jitter_x = rng.uniform(-0.22, 0.22)
         jitter_y = rng.uniform(-0.22, 0.22)
         return (
@@ -1064,51 +1063,91 @@ def perform_cursor_drag(
 
     sx, sy = square_point(text[:2])
     dx, dy = square_point(text[2:4])
-    source_offset = (round(sx - width / 2), round(sy - height / 2))
-    destination_offset = (round(dx - width / 2), round(dy - height / 2))
-    move_duration_ms = rng.randint(18, 48)
-    waypoint_count = rng.randint(3, 6)
-    hover_ms = rng.randint(25, 85)
-    hold_ms = rng.randint(35, 105)
-    segment_pauses_ms = [rng.randint(5, 28) for _ in range(waypoint_count)]
-    release_pause_ms = rng.randint(25, 95)
-    estimated_drag_ms = (
-        waypoint_count * move_duration_ms
-        + hover_ms + hold_ms + sum(segment_pauses_ms) + release_pause_ms
-    )
+
+    # Build a shallow quadratic curve using a randomized perpendicular control
+    # point; source and destination remain inside their selected squares.
+    vx, vy = dx - sx, dy - sy
+    distance = max(1.0, (vx * vx + vy * vy) ** 0.5)
+    normal_x, normal_y = -vy / distance, vx / distance
+    curve_sign = rng.choice((-1.0, 1.0))
+    curve_size = rng.uniform(0.035, 0.085) * min(width, height) * curve_sign
+    control_x = (sx + dx) / 2.0 + normal_x * curve_size
+    control_y = (sy + dy) / 2.0 + normal_y * curve_size
+    control_x = min(max(2.0, control_x), width - 2.0)
+    control_y = min(max(2.0, control_y), height - 2.0)
+
+    waypoint_count = rng.randint(3, 5)
+    total_drag_ms = rng.randint(100, 300)
+    base_duration, extra_ms = divmod(total_drag_ms, waypoint_count)
+    segment_durations = [base_duration] * waypoint_count
+    if extra_ms:
+        for index in rng.sample(range(waypoint_count), extra_ms):
+            segment_durations[index] += 1
+
+    path_points: list[tuple[float, float]] = []
+    for index in range(1, waypoint_count + 1):
+        t = index / waypoint_count
+        one_minus_t = 1.0 - t
+        px = (
+            one_minus_t * one_minus_t * sx
+            + 2.0 * one_minus_t * t * control_x
+            + t * t * dx
+        )
+        py = (
+            one_minus_t * one_minus_t * sy
+            + 2.0 * one_minus_t * t * control_y
+            + t * t * dy
+        )
+        if index < waypoint_count:
+            px += rng.uniform(-2.0, 2.0)
+            py += rng.uniform(-2.0, 2.0)
+            px = min(max(2.0, px), width - 2.0)
+            py = min(max(2.0, py), height - 2.0)
+        else:
+            # Make sure the mouse button is released exactly at the chosen target.
+            px, py = dx, dy
+        path_points.append((px, py))
+
+    source_offset = (round(sx - width / 2.0), round(sy - height / 2.0))
+    hover_ms = rng.randint(20, 75)
 
     try:
-        actions = ActionChains(driver, duration=move_duration_ms)
-        actions.move_to_element_with_offset(
-            board_element, source_offset[0], source_offset[1]
-        ).pause(hover_ms / 1000.0).click_and_hold().pause(hold_ms / 1000.0)
+        # Use W3C pointer actions so each curve segment can receive its own
+        # duration. These durations add up to the randomized 100-300 ms budget.
+        actions = ActionChains(driver)
+        pointer = actions.w3c_actions.pointer_action
+        pointer.move_to(
+            board_element,
+            x=source_offset[0],
+            y=source_offset[1],
+            duration=rng.randint(40, 90),
+        )
+        pointer.pause(hover_ms / 1000.0)
+        pointer.pointer_down()
 
-        # Randomized intermediate waypoints, with a separately chosen position
-        # inside each endpoint square. The final waypoint lands inside destination.
-        for index in range(1, waypoint_count + 1):
-            fraction = index / waypoint_count
-            if index == waypoint_count:
-                px, py = dx, dy
-            else:
-                px = sx + (dx - sx) * fraction + rng.uniform(-4.0, 4.0)
-                py = sy + (dy - sy) * fraction + rng.uniform(-4.0, 4.0)
-                px = min(max(2.0, px), width - 2.0)
-                py = min(max(2.0, py), height - 2.0)
-            actions.move_to_element_with_offset(
+        for (px, py), segment_ms in zip(path_points, segment_durations):
+            pointer.move_to(
                 board_element,
-                round(px - width / 2),
-                round(py - height / 2),
-            ).pause(segment_pauses_ms[index - 1] / 1000.0)
-        actions.pause(release_pause_ms / 1000.0).release().perform()
-    except (WebDriverException, ValueError, TypeError):
-        # Release the held mouse button if an intermediate action failed.
+                x=round(px - width / 2.0),
+                y=round(py - height / 2.0),
+                duration=segment_ms,
+            )
+
+        pointer.pointer_up()
+        actions.perform()
+    except (WebDriverException, ValueError, TypeError, AttributeError):
+        # Never leave the mouse button pressed if a pointer action fails.
         try:
             ActionChains(driver).release().perform()
         except Exception:
             pass
-        return {"ok": False, "reason": "cursor-action-failed", "drag_ms": estimated_drag_ms}
+        return {
+            "ok": False,
+            "reason": "cursor-action-failed",
+            "drag_ms": total_drag_ms,
+        }
 
-    # Confirm the UI accepted the move before reporting success.
+    # Confirm the UI accepted this drag before reporting success.
     deadline = time.monotonic() + 1.25
     while time.monotonic() < deadline:
         try:
@@ -1119,10 +1158,20 @@ def perform_cursor_drag(
         except WebDriverException:
             current_fen = ""
         if current_fen and str(current_fen).strip() != expected_fen.strip():
-            return {"ok": True, "uci": text, "drag_ms": estimated_drag_ms}
+            return {
+                "ok": True,
+                "uci": text,
+                "drag_ms": total_drag_ms,
+                "waypoints": waypoint_count,
+            }
         time.sleep(0.025)
 
-    return {"ok": False, "reason": "cursor-drag-not-confirmed", "drag_ms": estimated_drag_ms}
+    return {
+        "ok": False,
+        "reason": "cursor-drag-not-confirmed",
+        "drag_ms": total_drag_ms,
+        "waypoints": waypoint_count,
+    }
 
 
 def parse_args() -> argparse.Namespace:
