@@ -426,7 +426,7 @@ function describePlayerNameContext(start) {
     const tag = String(node.tagName || 'node').toLowerCase();
     const id = String(node.id || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 60);
     const classes = String(node.className?.baseVal || node.className || '')
-      .split(/\\s+/).filter(Boolean)
+      .split(/\s+/).filter(Boolean)
       .map(value => value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 45))
       .filter(Boolean).slice(0, 6);
     const attrs = [];
