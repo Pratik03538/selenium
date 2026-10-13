@@ -15,7 +15,6 @@ import ipaddress
 import sys
 import time
 from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import urlopen
@@ -35,7 +34,6 @@ except ImportError:
     chess = None  # FEN/DOM capture works; reconstruction/autoplay need python-chess.
 
 BASE_DIR = Path(__file__).resolve().parent
-BLOCKED_PLATFORMS_FILE = BASE_DIR / "blocked_platforms.txt"
 # Use a new private log so a prior CSV with raw URLs is not appended to.
 DEFAULT_CSV = BASE_DIR / "live_dom_events_private_v2.csv"
 CSV_FIELDS = [
@@ -173,37 +171,13 @@ def host_for(url: str | None) -> str:
         return ""
 
 
-@lru_cache(maxsize=1)
-def load_blocked_platforms() -> frozenset[str]:
-    """Load blocked hostnames from blocked_platforms.txt without logging entries."""
-    if not BLOCKED_PLATFORMS_FILE.is_file():
-        raise RuntimeError("Blocked-platform TXT file is missing.")
-    try:
-        lines = BLOCKED_PLATFORMS_FILE.read_text(encoding="utf-8-sig").splitlines()
-    except OSError as exc:
-        raise RuntimeError("Blocked-platform TXT file could not be read.") from exc
-
-    blocked: set[str] = set()
-    for raw_line in lines:
-        entry = raw_line.strip()
-        if not entry or entry.startswith("#"):
-            continue
-        hostname = normalize_host(entry)
-        if hostname:
-            blocked.add(hostname)
-    return frozenset(blocked)
-
-
 def is_public_competitive_host(host: str) -> bool:
-    """Check only the private TXT blocklist; never print or log platform URLs."""
-    normalized_host = normalize_host(host)
-    if not normalized_host:
-        return False
-    return any(
-        normalized_host == blocked
-        or normalized_host.endswith("." + blocked)
-        for blocked in load_blocked_platforms()
+    """Keep this live reader restricted to private/authorized test sites."""
+    host = (host or "").lower().rstrip(".").removeprefix("www.")
+    blocked_roots = (
+        "chess.com", "lichess.org", "chess24.com", "chessclub.com",
     )
+    return any(host == root or host.endswith("." + root) for root in blocked_roots)
 
 
 def target_matches(url: str | None, allowed_host: str) -> bool:
@@ -615,14 +589,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    try:
-        blocked_count = len(load_blocked_platforms())
-    except RuntimeError:
-        print("[CONFIG ERROR] Blocked-platform TXT file could not be loaded.", file=sys.stderr, flush=True)
-        print("Place blocked_platforms.txt beside this script and try again.", file=sys.stderr, flush=True)
-        return 2
-    print(f"[CONFIG] Blocked platform list loaded ({blocked_count} entries).", flush=True)
-
     if args.auto_play is None:
         auto_setting = load_optional_txt_setting("auto_play").strip().lower()
         args.auto_play = auto_setting in {"1", "true", "yes", "on", "enabled"}
