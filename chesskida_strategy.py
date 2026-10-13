@@ -265,6 +265,7 @@ def natural_bot_move_delay(
     previous_eval_white_cp=None,
     initial_time_seconds=None,
     remaining_time_seconds=None,
+    increment_seconds=0.0,
     is_opening_book_move=False
 ):
     """Return a small move delay plus clock-bounded optional pauses.
