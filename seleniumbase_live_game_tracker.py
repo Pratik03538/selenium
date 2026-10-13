@@ -2,9 +2,9 @@
 
 Attaches to an existing Chrome debugging session, reads the exposed game API,
 reconstructs moves from FEN changes, and writes a local CSV. Optional Stockfish
-autoplay is available on the exact configured site unless its hostname is listed
-in blocked_platforms.txt. Blocked hosts are configured in that text file rather
-than hard-coded in the Python source. URLs and page titles are never stored in the CSV.
+autoplay is available only on the exact configured authorized site; known public
+competitive chess hosts are always rejected. URLs, hostnames and page titles are
+never printed or stored in the CSV.
 """
 from __future__ import annotations
 
@@ -175,39 +175,39 @@ def host_for(url: str | None) -> str:
 
 @lru_cache(maxsize=1)
 def load_blocked_platforms() -> frozenset[str]:
-    """Read blocked hostnames from the neighbouring blocked_platforms.txt file."""
+    """Load blocked hostnames from blocked_platforms.txt without logging entries."""
     if not BLOCKED_PLATFORMS_FILE.is_file():
-        return frozenset()
-
-    blocked: set[str] = set()
+        raise RuntimeError("Blocked-platform TXT file is missing.")
     try:
         lines = BLOCKED_PLATFORMS_FILE.read_text(encoding="utf-8-sig").splitlines()
     except OSError as exc:
-        raise RuntimeError("Could not read blocked_platforms.txt.") from exc
+        raise RuntimeError("Blocked-platform TXT file could not be read.") from exc
 
+    blocked: set[str] = set()
     for raw_line in lines:
-        value = raw_line.strip()
-        if not value or value.startswith("#"):
+        entry = raw_line.strip()
+        if not entry or entry.startswith("#"):
             continue
-        host = normalize_host(value)
-        if host:
-            blocked.add(host)
+        hostname = normalize_host(entry)
+        if hostname:
+            blocked.add(hostname)
     return frozenset(blocked)
 
 
-def is_blocked_platform(host: str) -> bool:
-    """Return True only for hosts listed in blocked_platforms.txt (including subdomains)."""
-    normalized = normalize_host(host)
-    if not normalized:
+def is_public_competitive_host(host: str) -> bool:
+    """Check only the private TXT blocklist; never print or log platform URLs."""
+    normalized_host = normalize_host(host)
+    if not normalized_host:
         return False
     return any(
-        normalized == blocked or normalized.endswith("." + blocked)
+        normalized_host == blocked
+        or normalized_host.endswith("." + blocked)
         for blocked in load_blocked_platforms()
     )
 
 
 def target_matches(url: str | None, allowed_host: str) -> bool:
-    """Match the configured host, excluding hosts listed in blocked_platforms.txt."""
+    """Internal allowlist check. Values are never included in user-facing output."""
     if not isinstance(url, str) or not url.strip():
         return False
     try:
@@ -217,7 +217,7 @@ def target_matches(url: str | None, allowed_host: str) -> bool:
     host = host_for(url)
     if parsed.scheme not in {"http", "https"} or not host:
         return False
-    if is_blocked_platform(host):
+    if is_public_competitive_host(host):
         return False
     return host == allowed_host or host.endswith("." + allowed_host)
 
@@ -615,6 +615,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    try:
+        blocked_count = len(load_blocked_platforms())
+    except RuntimeError:
+        print("[CONFIG ERROR] Blocked-platform TXT file could not be loaded.", file=sys.stderr, flush=True)
+        print("Place blocked_platforms.txt beside this script and try again.", file=sys.stderr, flush=True)
+        return 2
+    print(f"[CONFIG] Blocked platform list loaded ({blocked_count} entries).", flush=True)
+
     if args.auto_play is None:
         auto_setting = load_optional_txt_setting("auto_play").strip().lower()
         args.auto_play = auto_setting in {"1", "true", "yes", "on", "enabled"}
@@ -624,22 +632,12 @@ def main() -> int:
     else:
         allowed_host, source_name = load_allowed_host_from_txt()
         settings_source = f"{source_name} TXT file" if source_name else "TXT settings"
-    if not BLOCKED_PLATFORMS_FILE.is_file():
-        print("[CONFIG ERROR] blocked_platforms.txt is missing.", file=sys.stderr)
-        print("Restore the file beside this script before starting the tracker.", file=sys.stderr)
-        return 2
-    try:
-        blocked_platforms = load_blocked_platforms()
-    except RuntimeError:
-        print("[CONFIG ERROR] Could not read blocked_platforms.txt.", file=sys.stderr)
-        return 2
     if not allowed_host:
         print("[CONFIG ERROR] Site settings could not be loaded from TXT.", file=sys.stderr)
         print("Add site_domain=your-hostname to tracker_settings.txt.", file=sys.stderr)
         print("The configured hostname is intentionally hidden in terminal output.", file=sys.stderr)
         return 2
     print(f"[CONFIG] Settings loaded from the {settings_source}.", flush=True)
-    print(f"[CONFIG] Blocked platform list loaded ({len(blocked_platforms)} hostnames).", flush=True)
 
     # Don't echo the local debugger address or any page URL.
     print("[CONNECT] Checking the local Chrome DevTools endpoint...", flush=True)
@@ -663,16 +661,6 @@ def main() -> int:
         print("[CONNECT ERROR] Selenium could not attach to Chrome. Update Selenium and check ChromeDriver compatibility.", file=sys.stderr, flush=True)
         return 2
     print("[CONNECT] Selenium attached.", flush=True)
-    # Bound each WebDriver command so a stalled tab does not appear to freeze forever.
-    try:
-        executor = driver.command_executor
-        if hasattr(executor, "set_timeout"):
-            executor.set_timeout(15)
-            print("[CONNECT] Selenium command timeout set to 15 seconds.", flush=True)
-        else:
-            print("[NOTE] This Selenium version does not expose a command timeout setter.", flush=True)
-    except Exception:
-        print("[NOTE] Could not set a Selenium command timeout; per-tab diagnostics remain enabled.", flush=True)
 
     cfg = {
         "boardSelector": args.board_selector,
@@ -691,20 +679,16 @@ def main() -> int:
     engine = None
     last_auto_attempt_fen = ""
     try:
-        print("[TABS] Requesting browser tab handles...", flush=True)
         handles = driver.window_handles
         candidates: list[tuple[int, str]] = []
-        print(f"[TABS] Browser returned {len(handles)} tab handle(s). Site details are hidden.", flush=True)
+        print("[TABS] Browser tabs (site details hidden):", flush=True)
         for i, handle in enumerate(handles):
-            print(f"[TABS] Inspecting tab {i} ({i + 1}/{len(handles)}): switching focus...", flush=True)
             try:
                 driver.switch_to.window(handle)
-                print(f"[TABS] Tab {i}: switched; reading current page address...", flush=True)
                 url = driver.current_url
-            except WebDriverException as exc:
-                print(f"[TABS] Tab {i}: WebDriver command failed ({type(exc).__name__}).", flush=True)
+            except WebDriverException:
+                print(f"  {i}: unavailable", flush=True)
                 continue
-            print(f"[TABS] Tab {i}: address read; checking configured domain...", flush=True)
             matched = target_matches(url, allowed_host)
             print(f"  {i}: {'matches saved settings' if matched else 'not a matching tab'}", flush=True)
             if matched:
@@ -747,8 +731,8 @@ def main() -> int:
         if args.auto_play:
             if chess is None:
                 raise RuntimeError("Autoplay requires python-chess. Install with: python -m pip install python-chess")
-            if is_blocked_platform(allowed_host):
-                raise RuntimeError("Autoplay is disabled for platforms listed in blocked_platforms.txt.")
+            if is_public_competitive_host(allowed_host):
+                raise RuntimeError("Autoplay is disabled for public competitive chess platforms.")
             if not installed.get("boardFound") or not installed.get("gameApiFound"):
                 raise RuntimeError("Autoplay needs the site's exposed board game API.")
             configured_engine_path = args.stockfish_path.strip() or load_optional_txt_setting("stockfish_path") or "stockfish.exe"
@@ -939,11 +923,7 @@ def main() -> int:
 
     except KeyboardInterrupt:
         print("\n[STOP] Reader stopped.", flush=True)
-    except RuntimeError as exc:
-        # These messages are authored by this script and avoid exposing page URLs.
-        print(f"[ERROR] {exc}", file=sys.stderr, flush=True)
-        return 2
-    except WebDriverException:
+    except (RuntimeError, WebDriverException):
         print("[ERROR] Browser session or site-tab selection failed. Site details were not logged.", file=sys.stderr, flush=True)
         return 2
     finally:
