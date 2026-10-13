@@ -392,7 +392,6 @@ def natural_bot_move_delay(
     remaining_time_seconds=None,
     increment_seconds=0.0,
     is_opening_book_move=False,
-    opponent_time_seconds=None,
 ):
     """Return a small move delay plus clock-bounded optional pauses.
 
@@ -433,7 +432,6 @@ def natural_bot_move_delay(
     _bot_timing_move_count += 1
 
     own_clock = None
-    opponent_clock = None
     try:
         own_clock = (
             max(0.0, float(remaining_time_seconds))
@@ -441,21 +439,9 @@ def natural_bot_move_delay(
         )
     except (TypeError, ValueError):
         pass
-    try:
-        opponent_clock = (
-            max(0.0, float(opponent_time_seconds))
-            if opponent_time_seconds is not None else None
-        )
-    except (TypeError, ValueError):
-        pass
-    clock_gap = (
-        own_clock - opponent_clock
-        if own_clock is not None and opponent_clock is not None
-        else None
-    )
 
-    # Under ten seconds, protect the clock: no discretionary pauses and only
-    # a tiny, randomized handoff interval. The caller separately caps search.
+    # Under ten seconds on OUR clock: skip discretionary waiting.
+    # This mode intentionally ignores the opponent's clock completely.
     if own_clock is not None and own_clock <= 10.0:
         quick_delay = random.choice((
             random.uniform(0.010, 0.025),
@@ -464,10 +450,7 @@ def natural_bot_move_delay(
         ))
         _last_bot_natural_delay = quick_delay
         print(
-            f"[CLOCK MODE] low-clock fast path own={own_clock:.2f}s "
-            f"opponent={opponent_clock:.2f}s"
-            if opponent_clock is not None
-            else f"[CLOCK MODE] low-clock fast path own={own_clock:.2f}s opponent=unknown",
+            f"[CLOCK MODE] own-clock fast path own={own_clock:.2f}s",
             flush=True,
         )
         return quick_delay
@@ -481,17 +464,19 @@ def natural_bot_move_delay(
         opening_book=is_opening_book_move,
     )
     delay = base_delay
-    # Protect a clock lead instead of spending time at the same rate regardless
-    # of the opponent. If clocks are close or we trail, keep moves snappy.
-    if clock_gap is not None:
-        if clock_gap < 0.0:
-            delay = min(delay, random.uniform(0.025, 0.120))
-        elif clock_gap < 3.0:
-            delay = min(delay, random.uniform(0.035, 0.180))
-        elif clock_gap < 8.0:
-            delay = min(delay, random.uniform(0.070, 0.300))
-        elif clock_gap < 15.0:
-            delay = min(delay, random.uniform(0.140, 0.550))
+    # Pace adapts only to OUR remaining time, never to the opponent's clock.
+    # These are upper caps on the sampled delay, not fixed target delays.
+    if own_clock is not None:
+        if own_clock <= 18.0:
+            delay = min(delay, random.choice((
+                random.uniform(0.025, 0.080),
+                random.uniform(0.050, 0.145),
+                random.uniform(0.085, 0.240),
+            )))
+        elif own_clock <= 30.0:
+            delay = min(delay, random.uniform(0.060, 0.400))
+        elif own_clock <= 45.0:
+            delay = min(delay, random.uniform(0.120, 0.720))
     _last_bot_natural_delay = delay
 
     # Never let optional pauses consume the clock reserve needed to finish and
@@ -546,7 +531,8 @@ def natural_bot_move_delay(
     if not thinking_enabled:
         return max(0.0, float(delay))
 
-    if clock_gap is not None and clock_gap < 15.0:
+    # Under 25s on our own clock, use quick moves and avoid discretionary pauses.
+    if own_clock is not None and own_clock <= 25.0:
         return max(0.0, float(delay))
 
     # Late/endgame positions use occasional short pauses rather than the
@@ -574,8 +560,6 @@ def natural_bot_move_delay(
                 else:
                     reserve = max(0.25, min(1.0, remaining_clock * 0.10))
                 pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
-                if clock_gap is not None:
-                    pause_max = min(pause_max, max(0.0, clock_gap - 5.0))
             except (TypeError, ValueError):
                 pass
         if (
@@ -753,8 +737,6 @@ def natural_bot_move_delay(
             else:
                 reserve = max(0.25, min(2.0, remaining_clock * 0.08))
             pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
-            if clock_gap is not None:
-                pause_max = min(pause_max, max(0.0, clock_gap - 5.0))
         except (TypeError, ValueError):
             pass
 
