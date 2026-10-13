@@ -608,7 +608,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(auto_play=None)
     parser.add_argument("--stockfish-path", default="", help="Stockfish executable path; can also be set as stockfish_path=... in TXT settings.")
-    parser.add_argument("--engine-time", type=float, default=0.20, help="Stockfish time budget per move, seconds.")
+    parser.add_argument("--engine-time", type=float, default=0.040, help="Stockfish search time per move, seconds (ChessKida baseline default: 0.040).")
     return parser.parse_args()
 
 
@@ -676,7 +676,16 @@ def main() -> int:
 
     chosen_handle = None
     engine = None
+    book = None
+    strategy_module = None
     last_auto_attempt_fen = ""
+    strategy_board = None
+    strategy_board_fen = ""
+    active_bot_color = None
+    previous_eval_white_cp = None
+    next_human_best_uci = None
+    opponent_match_history: list[float] = []
+    opponent_pressure = False
     try:
         handles = driver.window_handles
         candidates: list[tuple[int, str]] = []
@@ -734,6 +743,12 @@ def main() -> int:
                 raise RuntimeError("Autoplay is disabled for public competitive chess platforms.")
             if not installed.get("boardFound") or not installed.get("gameApiFound"):
                 raise RuntimeError("Autoplay needs the site's exposed board game API.")
+            try:
+                import chesskida_strategy as strategy_module
+                from gm_book import GMBook
+            except ImportError as exc:
+                raise RuntimeError("ChessKida strategy files are missing. Pull the current working branch and install requirements.") from exc
+
             configured_engine_path = args.stockfish_path.strip() or load_optional_txt_setting("stockfish_path") or "stockfish.exe"
             engine_path = Path(configured_engine_path).expanduser()
             if not engine_path.is_absolute():
@@ -742,10 +757,19 @@ def main() -> int:
                 raise RuntimeError("Stockfish executable was not found. Set stockfish_path in the TXT settings or use --stockfish-path.")
             try:
                 engine = chess.engine.SimpleEngine.popen_uci(str(engine_path))
+                engine.configure({"Threads": 2, "Hash": 128})
             except Exception as exc:
-                raise RuntimeError("Stockfish could not be started. Check the configured executable.") from exc
-            print("[AUTO] Stockfish autoplay enabled for the configured authorized site.", flush=True)
-            print(f"[AUTO] Playing the detected bottom side; engine budget={max(0.05, args.engine_time):.2f}s.", flush=True)
+                raise RuntimeError("Stockfish could not be started or configured. Check the configured executable.") from exc
+
+            # The opening book stays local-only; .gitignore keeps the binary out of GitHub.
+            book = GMBook(BASE_DIR / "Ultimate_GM_Bullet.bin")
+            if book.load():
+                print("[BOOK] Opening book loaded.", flush=True)
+            else:
+                print("[BOOK] Opening book unavailable; using Stockfish strategy.", flush=True)
+
+            print("[AUTO] ChessKida move-selection behavior enabled for the configured, non-blocked test site.", flush=True)
+            print(f"[ENGINE] Threads=2 | Hash=128 MB | depth=12 | MultiPV=15 | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s.", flush=True)
 
         csv_path = Path(args.csv).expanduser().resolve()
         csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -806,6 +830,67 @@ def main() -> int:
                             elif chess is not None:
                                 note = "Position changed but transition could not be inferred as one legal move"
                         previous_fen = fen
+
+                    # Keep a persistent python-chess board so the ChessKida strategy
+                    # sees the same move_stack/history state as the original bot.
+                    if chess is not None and fen:
+                        try:
+                            if strategy_board is None:
+                                strategy_board = chess.Board(fen)
+                                strategy_board_fen = fen
+                            elif fen != strategy_board_fen:
+                                strategy_transition = infer_move_between_fens(strategy_board_fen, fen)
+                                was_start = is_start_position(strategy_board_fen)
+                                is_new_start = is_start_position(fen) and not was_start
+
+                                if is_new_start:
+                                    strategy_board = chess.Board(fen)
+                                    opponent_match_history.clear()
+                                    next_human_best_uci = None
+                                    previous_eval_white_cp = None
+                                    opponent_pressure = False
+                                    last_auto_attempt_fen = ""
+                                    active_bot_color = None
+                                elif strategy_transition is not None:
+                                    strategy_move = chess.Move.from_uci(strategy_transition["uci"])
+                                    if strategy_move in strategy_board.legal_moves:
+                                        strategy_board.push(strategy_move)
+                                    else:
+                                        strategy_board = chess.Board(fen)
+                                        opponent_match_history.clear()
+                                        next_human_best_uci = None
+                                        previous_eval_white_cp = None
+                                        opponent_pressure = False
+                                else:
+                                    # Recover synchronization if a page skipped a FEN state.
+                                    strategy_board = chess.Board(fen)
+                                    opponent_match_history.clear()
+                                    next_human_best_uci = None
+                                    previous_eval_white_cp = None
+                                    opponent_pressure = False
+
+                                strategy_board_fen = fen
+
+                                # Compare the opponent's move to the best reply predicted
+                                # from our last move, as the original ChessKida controller does.
+                                bot_side_for_score = active_bot_color or str(event.get("bottomSide") or "").lower()
+                                if (
+                                    strategy_transition is not None
+                                    and bot_side_for_score in {"white", "black"}
+                                    and strategy_transition.get("side") != bot_side_for_score
+                                    and next_human_best_uci
+                                ):
+                                    exact_top_match = (
+                                        100.0
+                                        if strategy_transition.get("uci") == next_human_best_uci
+                                        else 0.0
+                                    )
+                                    opponent_match_history.append(exact_top_match)
+                                    opponent_pressure = not bool(exact_top_match)
+                                    next_human_best_uci = None
+                        except (ValueError, IndexError):
+                            strategy_board = None
+                            strategy_board_fen = ""
 
                     history_copy = [dict(item) for item in reconstructed_history]
                     writer.writerow({
@@ -875,49 +960,124 @@ def main() -> int:
                     # host has already passed the allowlist and public-platform block,
                     # and the detected bottom-side color is to move. Never click by
                     # coordinates; submit through the site's exposed legal-move API.
-                    if args.auto_play and engine is not None and fen:
+                    if args.auto_play and engine is not None and strategy_module is not None and fen and strategy_board is not None:
                         bottom = str(event.get("bottomSide") or "unknown").lower()
-                        # Prefer the site's own turn-vs-playingAs comparison (the
-                        # method used in the supplied userscript). Only fall back
-                        # to bottom-side/FEN comparison when the API values are absent.
                         api_my_turn = event.get("isMyTurn")
+
+                        if bottom in {"white", "black"}:
+                            active_bot_color = bottom
+
                         if fen != last_auto_attempt_fen:
-                            try:
-                                engine_board = chess.Board(fen)
-                            except (ValueError, IndexError):
-                                engine_board = None
-                            if engine_board is not None:
-                                if api_my_turn is True:
-                                    our_turn = True
-                                elif api_my_turn is False:
-                                    our_turn = False
-                                else:
-                                    our_turn = (
-                                        bottom in {"white", "black"}
-                                        and ((engine_board.turn == chess.WHITE and bottom == "white")
-                                             or (engine_board.turn == chess.BLACK and bottom == "black"))
+                            engine_board = strategy_board.copy(stack=True)
+                            if api_my_turn is True:
+                                our_turn = True
+                            elif api_my_turn is False:
+                                our_turn = False
+                            else:
+                                our_turn = (
+                                    bottom in {"white", "black"}
+                                    and ((engine_board.turn == chess.WHITE and bottom == "white")
+                                         or (engine_board.turn == chess.BLACK and bottom == "black"))
+                                )
+
+                            if our_turn and not engine_board.is_game_over(claim_draw=True):
+                                last_auto_attempt_fen = fen
+                                try:
+                                    engine_result = []
+                                    selected_info = None
+                                    selection_meta = None
+                                    book_choice = book.choose(engine_board) if book is not None else None
+
+                                    if book_choice is not None:
+                                        chosen_move = book_choice["move"]
+                                        best_info = None
+                                        selection_meta = {
+                                            "rank": int(book_choice["rank"]) - 1,
+                                            "current_cp": 0,
+                                            "selected_cp": 0,
+                                            "reason": "GM BOOK | weighted opening-book choice",
+                                            "source": "GM_BOOK",
+                                            "book_entries": int(book_choice.get("entries", 0)),
+                                            "book_weight": float(book_choice.get("weight", 0.0)),
+                                        }
+                                    else:
+                                        limit_seconds = max(0.005, min(float(args.engine_time), 5.0))
+                                        engine_result = engine.analyse(
+                                            engine_board,
+                                            chess.engine.Limit(depth=12, time=limit_seconds),
+                                            multipv=strategy_module.TRAINING_MULTI_PV,
+                                        )
+                                        if not isinstance(engine_result, list):
+                                            engine_result = [engine_result]
+                                        best_info = engine_result[0] if engine_result else None
+
+                                        opponent_accuracy, opponent_sample_count = strategy_module.opponent_recent_accuracy(
+                                            opponent_match_history
+                                        )
+                                        chosen_move, selected_info, selection_meta = strategy_module.choose_stockfish_move(
+                                            engine_board,
+                                            engine_result,
+                                            previous_eval_white_cp=previous_eval_white_cp,
+                                            opponent_accuracy=opponent_accuracy,
+                                            opponent_sample_count=opponent_sample_count,
+                                            opponent_pressure=opponent_pressure,
+                                            engine=engine,
+                                        )
+                                        opponent_pressure = False
+
+                                    if chosen_move is None or chosen_move not in engine_board.legal_moves:
+                                        raise RuntimeError("ChessKida selector did not return a legal move.")
+
+                                    chosen_san = engine_board.san(chosen_move)
+                                    rank = selection_meta.get("rank") if isinstance(selection_meta, dict) else None
+                                    rank_text = f"#{int(rank) + 1}" if rank is not None else "FREE"
+                                    reason = str(selection_meta.get("reason", "strategy selection")) if isinstance(selection_meta, dict) else "strategy selection"
+                                    print(f"[STRATEGY] selected={chosen_san} | rank={rank_text} | {reason}", flush=True)
+
+                                    natural_delay = strategy_module.natural_bot_move_delay(
+                                        engine_board,
+                                        chosen_move,
+                                        engine_result=engine_result,
+                                        selection_meta=selection_meta,
+                                        thinking_enabled=strategy_module.BOT_THINKING_ENABLED_DEFAULT,
+                                        previous_eval_white_cp=previous_eval_white_cp,
                                     )
-                                if our_turn and not engine_board.is_game_over(claim_draw=True):
-                                    last_auto_attempt_fen = fen
-                                    try:
-                                        limit_seconds = max(0.05, min(float(args.engine_time), 5.0))
-                                        chosen_move = engine.play(engine_board, chess.engine.Limit(time=limit_seconds)).move
-                                        if chosen_move is not None:
-                                            submit = driver.execute_script(
-                                                "return window.__liveGameApiReader ? window.__liveGameApiReader.playUci(arguments[0], arguments[1]) : {ok:false, reason:'reader-not-installed'};",
-                                                chosen_move.uci(), fen,
+                                    if natural_delay > 0:
+                                        print(f"[BOT TIMING] delay={natural_delay:.3f}s.", flush=True)
+                                        time.sleep(natural_delay)
+
+                                    submit = driver.execute_script(
+                                        "return window.__liveGameApiReader ? window.__liveGameApiReader.playUci(arguments[0], arguments[1]) : {ok:false, reason:'reader-not-installed'};",
+                                        chosen_move.uci(), fen,
+                                    )
+                                    if isinstance(submit, dict) and submit.get("ok"):
+                                        print(f"[AUTO] Submitted selected move: {chosen_san} ({chosen_move.uci()}).", flush=True)
+
+                                        after_board = engine_board.copy(stack=True)
+                                        after_board.push(chosen_move)
+                                        try:
+                                            analysis_state = strategy_module.build_analysis(
+                                                engine,
+                                                engine_board,
+                                                after_board,
+                                                chosen_move,
+                                                best_info=best_info,
                                             )
-                                            if isinstance(submit, dict) and submit.get("ok"):
-                                                try:
-                                                    san = engine_board.san(chosen_move)
-                                                except Exception:
-                                                    san = chosen_move.uci()
-                                                print(f"[AUTO] Submitted move for current player: {san} ({chosen_move.uci()}).", flush=True)
-                                            else:
-                                                reason = submit.get("reason", "move-submit-failed") if isinstance(submit, dict) else "move-submit-failed"
-                                                print(f"[AUTO] Move was not submitted ({reason}).", flush=True)
-                                    except (chess.engine.EngineError, ValueError, WebDriverException):
-                                        print("[AUTO] Move calculation/submission failed; waiting for the next position.", flush=True)
+                                        except Exception:
+                                            analysis_state = None
+
+                                        if analysis_state:
+                                            previous_eval_white_cp = analysis_state.get("eval_cp")
+                                            predicted = analysis_state.get("best_move")
+                                            next_human_best_uci = predicted if predicted and predicted != "-" else None
+                                        else:
+                                            previous_eval_white_cp = None
+                                            next_human_best_uci = None
+                                    else:
+                                        reason = submit.get("reason", "move-submit-failed") if isinstance(submit, dict) else "move-submit-failed"
+                                        print(f"[AUTO] Move was not submitted ({reason}).", flush=True)
+                                except (chess.engine.EngineError, ValueError, WebDriverException, RuntimeError):
+                                    print("[AUTO] Strategy calculation/submission failed; waiting for the next position.", flush=True)
                 time.sleep(max(0.05, args.queue_read_interval))
 
     except KeyboardInterrupt:
@@ -926,6 +1086,11 @@ def main() -> int:
         print("[ERROR] Browser session or site-tab selection failed. Site details were not logged.", file=sys.stderr, flush=True)
         return 2
     finally:
+        if book is not None:
+            try:
+                book.close()
+            except Exception:
+                pass
         if engine is not None:
             try:
                 engine.quit()
