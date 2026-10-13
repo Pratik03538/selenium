@@ -948,7 +948,7 @@ def perform_cursor_drag(
     try:
         target = driver.execute_script(
             "return window.__liveGameApiReader ? "
-            "window.__liveGameApiReader.dragTarget(arguments[0], arguments[1]) : "
+            "window.__liveGameApiReader.dragTarget(arguments[0], arguments[1], arguments[2]) : "
             "{ok:false, reason:'reader-not-installed'};",
             uci, expected_fen, expected_color,
         )
