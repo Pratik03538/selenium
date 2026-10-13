@@ -399,6 +399,82 @@ function normalizeColorToken(value) {
   if (['black', 'b', 'dark', 'black-side', 'black_side'].includes(token)) return 'black';
   return null;
 }
+function normalizePlayerText(value) {
+  return String(value || '').replace(/\\u00a0/g, ' ').replace(/\\s+/g, ' ').trim().toLocaleLowerCase();
+}
+function selectorNameSide(name, selector, color) {
+  if (!name || !selector) return false;
+  for (const el of queryAllDeep(selector)) {
+    const text = normalizePlayerText(el.innerText || el.textContent || '');
+    if (text && text.includes(name)) return true;
+  }
+  return false;
+}
+function sideEvidenceFromNode(start) {
+  let node = start;
+  for (let depth = 0; node && depth <= 7; depth++, node = node.parentElement) {
+    for (const attr of ['data-player-color', 'data-color', 'data-side', 'color']) {
+      const side = normalizeColorToken(node.getAttribute?.(attr));
+      if (side) return {color: side, source: 'player-name-ancestor-attribute'};
+    }
+    const whiteSelector = cfg.whitePlayerSelector;
+    const blackSelector = cfg.blackPlayerSelector;
+    let whiteMatch = false, blackMatch = false;
+    try {
+      whiteMatch = !!whiteSelector && node.matches(whiteSelector);
+      blackMatch = !!blackSelector && node.matches(blackSelector);
+    } catch (_) {}
+    if (whiteMatch !== blackMatch) {
+      return {color: whiteMatch ? 'white' : 'black', source: 'configured-player-container'};
+    }
+    const clues = [
+      String(node.id || ''),
+      String(node.className?.baseVal || node.className || ''),
+      String(node.getAttribute?.('aria-label') || ''),
+      String(node.getAttribute?.('title') || '')
+    ].join(' ').toLowerCase();
+    const whiteHint = /(^|[\\s_-])white([\\s_-]|$)|white-player|player-white/.test(clues);
+    const blackHint = /(^|[\\s_-])black([\\s_-]|$)|black-player|player-black/.test(clues);
+    if (whiteHint !== blackHint) {
+      return {color: whiteHint ? 'white' : 'black', source: 'player-name-ancestor-label'};
+    }
+  }
+  return null;
+}
+function detectConfiguredPlayerColor(configuredName) {
+  const wanted = normalizePlayerText(configuredName);
+  if (!wanted) return {color: null, source: 'player-name-not-configured', matched: false};
+
+  const whiteByContainer = selectorNameSide(wanted, cfg.whitePlayerSelector, 'white');
+  const blackByContainer = selectorNameSide(wanted, cfg.blackPlayerSelector, 'black');
+  if (whiteByContainer !== blackByContainer) {
+    return {
+      color: whiteByContainer ? 'white' : 'black',
+      source: 'configured-player-container',
+      matched: true
+    };
+  }
+  if (whiteByContainer && blackByContainer) {
+    return {color: null, source: 'player-name-matched-both-sides', matched: true};
+  }
+
+  const matches = [];
+  for (const el of queryAllDeep('*')) {
+    const text = normalizePlayerText(el.innerText || el.textContent || '');
+    if (text !== wanted) continue;
+    const evidence = sideEvidenceFromNode(el);
+    if (evidence && !matches.some(item => item.color === evidence.color)) {
+      matches.push(evidence);
+    }
+  }
+  if (matches.length === 1) {
+    return {color: matches[0].color, source: matches[0].source, matched: true};
+  }
+  if (matches.length > 1) {
+    return {color: null, source: 'player-name-matched-conflicting-elements', matched: true};
+  }
+  return {color: null, source: 'player-name-not-found', matched: false};
+}
 function snapshot() {
   const board = getBoard();
   const game = board && board.game;
@@ -414,6 +490,7 @@ function snapshot() {
   const playingAs = callMaybe(game, 'getPlayingAs');
   const turnColor = normalizeColorToken(turn);
   const playingAsColor = normalizeColorToken(playingAs);
+  const playerNameSide = detectConfiguredPlayerColor(cfg.playerName);
   // Raw values can differ by API representation (for example "w" vs "white").
   // Compare normalized colors only; unknown values stay unknown, not guessed.
   const isMyTurn = !turnColor || !playingAsColor
@@ -428,6 +505,9 @@ function snapshot() {
     turnColor,
     playingAs,
     playingAsColor,
+    playerNameColor: playerNameSide.color,
+    playerNameColorSource: playerNameSide.source,
+    playerNameMatched: playerNameSide.matched,
     isMyTurn,
     bottomSide: orientation.side,
     bottomSideSource: orientation.source,
@@ -741,6 +821,8 @@ def main() -> int:
         return 2
     if args.auto_play and configured_bot_color:
         print(f"[CONFIG] Explicit bot color loaded: {configured_bot_color}.", flush=True)
+    if args.auto_play and load_optional_txt_setting("player_name").strip():
+        print("[CONFIG] Player-name side detection enabled; configured name is hidden.", flush=True)
     print(f"[CONFIG] Settings loaded from the {settings_source}.", flush=True)
 
     # Don't echo the local debugger address or any page URL.
@@ -777,6 +859,17 @@ def main() -> int:
         "whiteClockSelector": args.white_clock_selector,
         "blackClockSelector": args.black_clock_selector,
         "resultSelector": args.result_selector,
+        "playerName": load_optional_txt_setting("player_name").strip(),
+        "whitePlayerSelector": (
+            load_optional_txt_setting("white_player_selector")
+            or ".white.player, .player.white, [data-color='white'], [data-side='white'], "
+               "[data-player-color='white'], #white-player, .white-player"
+        ),
+        "blackPlayerSelector": (
+            load_optional_txt_setting("black_player_selector")
+            or ".black.player, .player.black, [data-color='black'], [data-side='black'], "
+               "[data-player-color='black'], #black-player, .black-player"
+        ),
     }
 
     chosen_handle = None
@@ -942,10 +1035,11 @@ def main() -> int:
                         normalize_chess_color(event.get("playingAsColor"))
                         or normalize_chess_color(event.get("playingAs"))
                     )
+                    player_name_color = normalize_chess_color(event.get("playerNameColor"))
                     if configured_bot_color:
                         active_bot_color = configured_bot_color
-                    elif active_bot_color is None and api_bot_color:
-                        active_bot_color = api_bot_color
+                    elif active_bot_color is None and (player_name_color or api_bot_color):
+                        active_bot_color = player_name_color or api_bot_color
                     white_clock_seconds = parse_clock_seconds(event.get("whiteClock"))
                     black_clock_seconds = parse_clock_seconds(event.get("blackClock"))
                     observed_clocks = [
@@ -1089,6 +1183,9 @@ def main() -> int:
                         "turnColor": event.get("turnColor"),
                         "playingAs": event.get("playingAs"),
                         "playingAsColor": event.get("playingAsColor"),
+                        "playerNameColor": event.get("playerNameColor"),
+                        "playerNameColorSource": event.get("playerNameColorSource"),
+                        "playerNameMatched": event.get("playerNameMatched"),
                         "isMyTurn": event.get("isMyTurn"),
                         "bottomSide": event.get("bottomSide", "unknown"),
                         "historyLen": len(history_copy),
@@ -1101,6 +1198,8 @@ def main() -> int:
                         print(
                             f"[LIVE] turn={event.get('turn')} (normalized={event.get('turnColor')}) | "
                             f"player={event.get('playingAsColor') or 'unknown'} | "
+                            f"nameSide={event.get('playerNameColor') or 'unknown'} "
+                            f"({event.get('playerNameColorSource') or 'no-evidence'}) | "
                             f"botSide={active_bot_color or 'unconfirmed'} | ply={len(history_copy)} | "
                             f"FEN={'OK' if fen else 'missing'} | "
                             f"API={'OK' if event.get('gameApiFound') else 'missing'} | "
@@ -1129,15 +1228,18 @@ def main() -> int:
                             normalize_chess_color(event.get("playingAsColor"))
                             or normalize_chess_color(event.get("playingAs"))
                         )
+                        player_name_color = normalize_chess_color(event.get("playerNameColor"))
                         if configured_bot_color:
                             active_bot_color = configured_bot_color
-                        elif active_bot_color is None and api_bot_color:
-                            active_bot_color = api_bot_color
+                        elif active_bot_color is None and (player_name_color or api_bot_color):
+                            active_bot_color = player_name_color or api_bot_color
 
                         color_conflict = bool(
-                            api_bot_color
-                            and active_bot_color
-                            and api_bot_color != active_bot_color
+                            active_bot_color
+                            and (
+                                (api_bot_color and api_bot_color != active_bot_color)
+                                or (player_name_color and player_name_color != active_bot_color)
+                            )
                         )
 
                         if fen != last_auto_attempt_fen:
