@@ -16,7 +16,7 @@ import chess.engine
 ANALYSIS_TIME = 0.010
 ANALYSIS_DEPTH = 8
 BOT_EVERY_MOVE_DELAY_MIN = 0.035
-BOT_EVERY_MOVE_DELAY_MAX = 0.750
+BOT_EVERY_MOVE_DELAY_MAX = 0.950
 BOT_THINKING_ENABLED_DEFAULT = True
 BOT_THINKING_START_AFTER_MOVE = 8
 BOT_BOOK_INSTANT_MOVES = 8
@@ -340,7 +340,10 @@ def _sample_base_move_delay(
             base = random.triangular(0.300, 0.900, 0.470)
     complexity_factor = 0.82 + 0.72 * complexity
     micro_jitter = random.uniform(0.0, 0.065)
-    return min(0.950, max(0.020, base * complexity_factor + micro_jitter))
+    return min(
+        BOT_EVERY_MOVE_DELAY_MAX,
+        max(BOT_EVERY_MOVE_DELAY_MIN, base * complexity_factor + micro_jitter),
+    )
 
 
 def _sample_thinking_pause(pause_max: float, complexity: float = 0.0) -> float:
