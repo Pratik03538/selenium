@@ -814,14 +814,26 @@ def main() -> int:
         print("Add site_domain=your-hostname to tracker_settings.txt.", file=sys.stderr)
         print("The configured hostname is intentionally hidden in terminal output.", file=sys.stderr)
         return 2
+    configured_player_name = load_optional_txt_setting("player_name").strip()
     configured_bot_color_raw = load_optional_txt_setting("bot_color")
     configured_bot_color = normalize_chess_color(configured_bot_color_raw)
     if args.auto_play and configured_bot_color_raw and configured_bot_color is None:
         print("[CONFIG ERROR] bot_color must be exactly white or black.", file=sys.stderr, flush=True)
         return 2
+
+    # The configured username identifies the player's side per game. A fixed
+    # bot_color must not override this when the player alternates between White/Black.
+    if configured_player_name and configured_bot_color:
+        print(
+            "[CONFIG] player_name is set; ignoring fixed bot_color so the player's "
+            "side can be detected independently for each game.",
+            flush=True,
+        )
+        configured_bot_color = None
+
     if args.auto_play and configured_bot_color:
-        print(f"[CONFIG] Explicit bot color loaded: {configured_bot_color}.", flush=True)
-    if args.auto_play and load_optional_txt_setting("player_name").strip():
+        print(f"[CONFIG] Fallback bot color loaded: {configured_bot_color}.", flush=True)
+    if args.auto_play and configured_player_name:
         print("[CONFIG] Player-name side detection enabled; configured name is hidden.", flush=True)
     print(f"[CONFIG] Settings loaded from the {settings_source}.", flush=True)
 
@@ -859,7 +871,7 @@ def main() -> int:
         "whiteClockSelector": args.white_clock_selector,
         "blackClockSelector": args.black_clock_selector,
         "resultSelector": args.result_selector,
-        "playerName": load_optional_txt_setting("player_name").strip(),
+        "playerName": configured_player_name,
         "whitePlayerSelector": (
             load_optional_txt_setting("white_player_selector")
             or ".white.player, .player.white, [data-color='white'], [data-side='white'], "
