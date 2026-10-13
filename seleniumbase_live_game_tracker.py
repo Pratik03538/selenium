@@ -925,7 +925,11 @@ def main() -> int:
 
     except KeyboardInterrupt:
         print("\n[STOP] Reader stopped.", flush=True)
-    except (RuntimeError, WebDriverException):
+    except RuntimeError as exc:
+        # These messages are authored by this script and avoid exposing page URLs.
+        print(f"[ERROR] {exc}", file=sys.stderr, flush=True)
+        return 2
+    except WebDriverException:
         print("[ERROR] Browser session or site-tab selection failed. Site details were not logged.", file=sys.stderr, flush=True)
         return 2
     finally:
