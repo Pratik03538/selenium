@@ -1318,42 +1318,89 @@ def perform_api_premove(
     return result if isinstance(result, dict) else {"ok": False, "reason": "invalid-premove-response"}
 
 
+PREMOVE_OPENING_FULLMOVE_MAX = 5
+PREMOVE_ENDGAME_MAX_PIECES = 10
+PREMOVE_MIN_BOT_EVAL_CP = -100
+PREMOVE_MAX_EVAL_DROP_CP = 75
+
+
+def premove_phase_allowed(board) -> tuple[bool, str]:
+    """Only permit premoves in the opening or a genuine low-piece endgame."""
+    if chess is None or board is None:
+        return False, "board-unavailable"
+    try:
+        if int(board.fullmove_number) <= PREMOVE_OPENING_FULLMOVE_MAX:
+            return True, "opening"
+        if len(board.piece_map()) <= PREMOVE_ENDGAME_MAX_PIECES:
+            return True, "endgame"
+    except (AttributeError, TypeError, ValueError):
+        return False, "phase-unavailable"
+    return False, "outside-opening-endgame"
+
+
+def _premove_score_for_bot(info, bot_color: str) -> int | None:
+    """Return centipawns from our side's POV; missing scores fail closed."""
+    if not isinstance(info, dict) or chess is None:
+        return None
+    raw_score = info.get("score")
+    if raw_score is None:
+        return None
+    try:
+        bot_turn = chess.WHITE if bot_color == "white" else chess.BLACK
+        if hasattr(raw_score, "pov"):
+            raw_score = raw_score.pov(bot_turn)
+        if hasattr(raw_score, "score"):
+            value = raw_score.score(mate_score=100000)
+            return int(value) if value is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return None
+
+
 def choose_premove_candidate(
     engine, board, strategy_module, bot_color: str, args, book=None,
     opponent_match_history: list[float] | None = None,
 ) -> tuple[object | None, object | None, str]:
-    """Predict one likely opponent reply, then choose a move legal after that reply."""
+    """Select a safe premove only in the opening/endgame, without changing normal strategy state."""
     if chess is None or engine is None or strategy_module is None or board is None:
         return None, None, "premove-prerequisites-unavailable"
+    allowed, phase = premove_phase_allowed(board)
+    if not allowed:
+        return None, None, phase
     if board.is_game_over(claim_draw=True):
         return None, None, "game-over"
+
+    bot_turn = chess.WHITE if bot_color == "white" else chess.BLACK
+    if board.turn == bot_turn:
+        return None, None, "bot-turn-already-active"
+
     search_time = max(0.005, min(float(args.engine_time), 0.025))
     try:
+        # Do not premove from a position Stockfish already considers losing.
         opponent_lines = engine.analyse(
             board, chess.engine.Limit(depth=8, time=search_time), multipv=3
         )
         if not isinstance(opponent_lines, list):
             opponent_lines = [opponent_lines]
-        opponent_line = next(
-            (info for info in opponent_lines
-             if isinstance(info, dict) and info.get("pv")
-             and info["pv"][0] in board.legal_moves),
-            None,
-        )
-        if opponent_line is None:
+        opponent_lines = [
+            info for info in opponent_lines
+            if isinstance(info, dict) and info.get("pv")
+            and info["pv"][0] in board.legal_moves
+        ]
+        if not opponent_lines:
             return None, None, "opponent-reply-not-found"
-        predicted_reply = opponent_line["pv"][0]
+        current_eval = _premove_score_for_bot(opponent_lines[0], bot_color)
+        if current_eval is None:
+            return None, None, "current-evaluation-unavailable"
+        if current_eval < PREMOVE_MIN_BOT_EVAL_CP:
+            return None, None, "bot-position-already-losing"
+
+        predicted_reply = opponent_lines[0]["pv"][0]
         hypothetical = board.copy(stack=True)
         hypothetical.push(predicted_reply)
-        expected_turn = chess.WHITE if bot_color == "white" else chess.BLACK
-        if hypothetical.turn != expected_turn:
+        if hypothetical.turn != bot_turn:
             return None, predicted_reply, "hypothetical-turn-mismatch"
 
-        book_choice = book.choose(hypothetical) if book is not None else None
-        if book_choice is not None:
-            selected = book_choice.get("move")
-            if selected in hypothetical.legal_moves:
-                return selected, predicted_reply, "opening-book"
         own_lines = engine.analyse(
             hypothetical,
             chess.engine.Limit(depth=10, time=search_time),
@@ -1368,12 +1415,38 @@ def choose_premove_candidate(
         ]
         if not own_lines:
             return None, predicted_reply, "premove-candidate-not-found"
-        # A premove is speculative, so use the strongest line without touching
-        # the strategy's persistent per-game selection state during this forecast.
-        selected = own_lines[0]["pv"][0]
+
+        best_after_reply_eval = _premove_score_for_bot(own_lines[0], bot_color)
+        if best_after_reply_eval is None:
+            return None, predicted_reply, "reply-evaluation-unavailable"
+        if best_after_reply_eval < PREMOVE_MIN_BOT_EVAL_CP:
+            return None, predicted_reply, "predicted-reply-leaves-bot-losing"
+
+        # Opening-book choices are retained when available, but they must pass
+        # the same engine safety check as every other premove candidate.
+        book_choice = book.choose(hypothetical) if book is not None else None
+        selected = book_choice.get("move") if book_choice is not None else own_lines[0]["pv"][0]
         if selected not in hypothetical.legal_moves:
-            return None, predicted_reply, "premove-candidate-not-legal-after-prediction"
-        return selected, predicted_reply, "stockfish-prediction"
+            selected = own_lines[0]["pv"][0]
+
+        after_selected = hypothetical.copy(stack=True)
+        after_selected.push(selected)
+        final_info = engine.analyse(
+            after_selected,
+            chess.engine.Limit(depth=8, time=search_time),
+            multipv=1,
+        )
+        if isinstance(final_info, list):
+            final_info = final_info[0] if final_info else None
+        selected_eval = _premove_score_for_bot(final_info, bot_color)
+        if selected_eval is None:
+            return None, predicted_reply, "selected-move-evaluation-unavailable"
+        if selected_eval < PREMOVE_MIN_BOT_EVAL_CP:
+            return None, predicted_reply, "selected-premove-leaves-bot-losing"
+        if best_after_reply_eval - selected_eval > PREMOVE_MAX_EVAL_DROP_CP:
+            return None, predicted_reply, "premove-reduces-evaluation-too-much"
+
+        return selected, predicted_reply, f"{phase}-safe-eval={selected_eval / 100:+.2f}"
     except (chess.engine.EngineError, ValueError, RuntimeError, TypeError):
         return None, None, "premove-analysis-failed"
 
@@ -2147,6 +2220,7 @@ def main() -> int:
                                 and not turn_conflict
                                 and api_my_turn is not True
                                 and fen != last_premove_attempt_fen
+                                and premove_phase_allowed(engine_board)[0]
                                 and not engine_board.is_game_over(claim_draw=True)
                             ):
                                 # A premove is speculative: analyze the likely opponent reply,
