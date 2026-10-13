@@ -55,6 +55,18 @@ def now_utc() -> str:
     )
 
 
+def normalize_chess_color(value: object) -> str | None:
+    """Normalize explicit color tokens; never infer a player's color from board orientation."""
+    if value is None or isinstance(value, bool):
+        return None
+    token = str(value).strip().lower()
+    if token in {"white", "w", "light", "white-side", "white_side"}:
+        return "white"
+    if token in {"black", "b", "dark", "black-side", "black_side"}:
+        return "black"
+    return None
+
+
 def normalize_host(value: str) -> str:
     """Accept a specific hostname or URL; reject public-suffix-only values."""
     value = (value or "").strip().lower()
@@ -380,6 +392,13 @@ function detectBottomSide(board) {
 
   return {side: 'unknown', source: 'orientation-not-exposed'};
 }
+function normalizeColorToken(value) {
+  if (value === null || value === undefined || typeof value === 'boolean') return null;
+  const token = String(value).trim().toLowerCase();
+  if (['white', 'w', 'light', 'white-side', 'white_side'].includes(token)) return 'white';
+  if (['black', 'b', 'dark', 'black-side', 'black_side'].includes(token)) return 'black';
+  return null;
+}
 function snapshot() {
   const board = getBoard();
   const game = board && board.game;
@@ -393,16 +412,22 @@ function snapshot() {
   const legalMoves = getLegalMoves(game);
   const turn = callMaybe(game, 'getTurn');
   const playingAs = callMaybe(game, 'getPlayingAs');
-  const isMyTurn = turn == null || playingAs == null
+  const turnColor = normalizeColorToken(turn);
+  const playingAsColor = normalizeColorToken(playingAs);
+  // Raw values can differ by API representation (for example "w" vs "white").
+  // Compare normalized colors only; unknown values stay unknown, not guessed.
+  const isMyTurn = !turnColor || !playingAsColor
     ? null
-    : (String(turn) === String(playingAs));
+    : (turnColor === playingAsColor);
   return {
     boardFound: !!board,
     gameApiFound: !!(game && (typeof game.getFEN === 'function' || typeof game.getTurn === 'function')),
     apiMethods: getApiMethods(game),
     fen: typeof fen === 'string' ? fen.trim() : '',
     turn,
+    turnColor,
     playingAs,
+    playingAsColor,
     isMyTurn,
     bottomSide: orientation.side,
     bottomSideSource: orientation.source,
