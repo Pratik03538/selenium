@@ -3361,7 +3361,7 @@ def choose_premove_candidate(
     if not allowed:
         return choose_middle_game_premove(engine, board, strategy_module, bot_color, args)
 
-    search_time = max(0.005, min(float(args.engine_time), 0.025))
+    search_time = max(0.010, min(float(args.engine_time), 0.050))
     try:
         # Preserve the previous opening/endgame policy, with its existing
         # loss/evaluation-drop checks.
@@ -3403,7 +3403,7 @@ def choose_premove_candidate(
         own_lines = engine.analyse(
             hypothetical,
             chess.engine.Limit(depth=10, time=search_time),
-            multipv=min(24, max(1, len(hypothetical.legal_moves))),
+            multipv=min(12, max(1, len(hypothetical.legal_moves))),
         )
         if not isinstance(own_lines, list):
             own_lines = [own_lines]
@@ -3427,7 +3427,8 @@ def choose_premove_candidate(
         # not prevent a later safe opening continuation from being queued.
         cursor_input = getattr(args, "move_input", "api") == "cursor"
         safe_candidates = []
-        for candidate_info in own_lines:
+        # Check a manageable top subset with a slightly longer, more stable search.
+        for candidate_info in own_lines[:8]:
             selected = candidate_info["pv"][0]
             if selected.promotion is not None and cursor_input:
                 continue
