@@ -483,6 +483,23 @@ def _clock_time_profile(
     }
 
 
+def _clock_deficit_forces_fast_pacing(
+    own_seconds, opponent_seconds, initial_seconds=None
+) -> bool:
+    """Whether a meaningful clock deficit should suppress discretionary thinking."""
+    try:
+        own = max(0.0, float(own_seconds)) if own_seconds is not None else None
+        opponent = max(0.0, float(opponent_seconds)) if opponent_seconds is not None else None
+        initial = max(0.0, float(initial_seconds)) if initial_seconds is not None else None
+    except (TypeError, ValueError):
+        return False
+    if own is None or opponent is None:
+        return False
+    reference = initial if initial is not None and initial > 0.0 else max(own, opponent, 1.0)
+    deficit_threshold = max(2.0, min(12.0, reference * 0.025))
+    return (opponent - own) >= deficit_threshold
+
+
 def natural_bot_move_delay(
     board,
     move,
@@ -714,6 +731,21 @@ def natural_bot_move_delay(
         and own_clock <= float(_quick_only_clock_threshold or 25.0)
     ):
         return max(0.0, float(delay))
+
+    # If we have materially less time than the opponent, do not add a long
+    # optional thinking pause. Keep only a short, situation-shaped move delay.
+    if _clock_deficit_forces_fast_pacing(
+        own_clock, opponent_clock, initial_time_seconds
+    ):
+        deficit = max(0.0, float(opponent_clock) - float(own_clock))
+        accelerated_delay = min(float(delay), random.uniform(0.035, 0.220))
+        _last_bot_natural_delay = accelerated_delay
+        print(
+            f"[BOT CLOCK] Behind opponent by {deficit:.1f}s; "
+            f"skipping discretionary pause, delay={accelerated_delay:.3f}s.",
+            flush=True,
+        )
+        return max(0.0, accelerated_delay)
 
     # Late/endgame positions use occasional short pauses rather than the
     # regular multi-second pause. Piece count complements move-count detection.
