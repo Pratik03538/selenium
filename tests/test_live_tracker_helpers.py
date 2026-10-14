@@ -7,6 +7,7 @@ from seleniumbase_live_game_tracker import (
     PREMOVE_OPENING_MAX_EVAL_DROP_CP,
     PREMOVE_OPENING_MIN_BOT_EVAL_CP,
     PlayerSideResolver,
+    normalize_api_bot_color,
     calculate_engine_search_limit,
     choose_mate_phase_premove,
     infer_move_between_fens,
@@ -22,16 +23,33 @@ class PlayerSideResolverTests(unittest.TestCase):
         self.assertIsNone(resolver.resolve(None, "black"))
         self.assertEqual(resolver.resolve(None, "black"), "black")
 
-    def test_api_side_takes_precedence_over_name_match(self):
+    def test_conflicting_api_and_name_signals_do_not_resolve(self):
         resolver = PlayerSideResolver(player_name_enabled=True)
-        self.assertEqual(resolver.resolve("black", "white"), "black")
+        self.assertIsNone(resolver.resolve("black", "white"))
+        self.assertEqual(resolver.resolve("black", "black"), "black")
 
-    def test_opposite_name_match_pauses_until_confirmed(self):
+    def test_api_side_does_not_flip_after_a_transient_conflicting_snapshot(self):
+        resolver = PlayerSideResolver(player_name_enabled=True)
+        self.assertEqual(resolver.resolve("black", None), "black")
+        self.assertIsNone(resolver.resolve("white", None))
+        self.assertIsNone(resolver.resolve("white", None))
+        self.assertEqual(resolver.resolve("black", None), "black")
+
+    def test_name_side_does_not_flip_until_new_game_reset(self):
         resolver = PlayerSideResolver(player_name_enabled=True)
         self.assertIsNone(resolver.resolve(None, "black"))
         self.assertEqual(resolver.resolve(None, "black"), "black")
         self.assertIsNone(resolver.resolve(None, "white"))
+        self.assertIsNone(resolver.resolve(None, "white"))
+        self.assertEqual(resolver.resolve(None, "black"), "black")
+        resolver.reset_for_new_game()
+        self.assertIsNone(resolver.resolve(None, "white"))
         self.assertEqual(resolver.resolve(None, "white"), "white")
+
+    def test_fixed_color_mismatch_pauses_instead_of_overriding_api(self):
+        resolver = PlayerSideResolver(fixed_color="white", player_name_enabled=True)
+        self.assertIsNone(resolver.resolve("black", "white"))
+        self.assertEqual(resolver.resolve("white", "white"), "white")
 
     def test_reset_requires_fresh_name_evidence(self):
         resolver = PlayerSideResolver(player_name_enabled=True)
@@ -39,6 +57,11 @@ class PlayerSideResolverTests(unittest.TestCase):
         self.assertEqual(resolver.resolve(None, "black"), "black")
         resolver.reset_for_new_game()
         self.assertIsNone(resolver.resolve(None, "black"))
+
+    def test_api_color_fields_must_agree_when_both_are_present(self):
+        self.assertEqual(normalize_api_bot_color("white", "w"), ("white", False))
+        self.assertEqual(normalize_api_bot_color("black", "white"), (None, True))
+        self.assertEqual(normalize_api_bot_color(None, "black"), ("black", False))
 
 
 class LateClockAndPremoveSafetyTests(unittest.TestCase):
