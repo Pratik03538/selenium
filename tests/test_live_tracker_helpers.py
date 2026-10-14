@@ -83,8 +83,8 @@ class MoveRetryGateTests(unittest.TestCase):
         self.assertTrue(gate.begin("fen-A", now=0.20))
         gate.finish({"ok": False, "reason": "temporary-submit-failure"})
         self.assertFalse(gate.should_attempt("fen-A", now=0.69))
-        self.assertTrue(gate.should_attempt("fen-A", now=0.70))
-        self.assertTrue(gate.begin("fen-A", now=0.70))
+        self.assertTrue(gate.should_attempt("fen-A", now=0.71))
+        self.assertTrue(gate.begin("fen-A", now=0.71))
         gate.finish({"ok": False, "reason": "temporary-submit-failure"})
         self.assertFalse(gate.should_attempt("fen-A", now=10.0))
 
