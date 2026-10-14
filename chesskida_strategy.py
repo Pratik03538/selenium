@@ -517,6 +517,7 @@ def natural_bot_move_delay(
     low_clock_total_budget_seconds=None,
     elapsed_seconds_before_delay=0.0,
     submission_reserve_seconds=0.0,
+    low_clock_mode=None,
 ):
     """Return a move delay; low-clock waits fit inside one total latency budget.
 
@@ -614,7 +615,12 @@ def natural_bot_move_delay(
         low_clock_threshold = min(10.0, max(5.0, float(low_clock_trigger_seconds)))
     except (TypeError, ValueError):
         low_clock_threshold = 10.0
-    if own_clock is not None and own_clock <= low_clock_threshold:
+    use_low_clock_path = (
+        bool(low_clock_mode)
+        if low_clock_mode is not None
+        else own_clock is not None and own_clock <= low_clock_threshold
+    )
+    if own_clock is not None and use_low_clock_path:
         try:
             total_budget = (
                 random.choice((0.030, 0.040, 0.050))
@@ -670,6 +676,17 @@ def natural_bot_move_delay(
         elif own_clock <= 45.0:
             delay = min(delay, random.uniform(0.120, 0.720))
     _last_bot_natural_delay = delay
+
+    if own_clock is None:
+        # Unknown own clock means there is no reliable pause budget. Keep a short
+        # base delay only; never add discretionary multi-second thinking pauses.
+        conservative_delay = min(float(delay), random.uniform(0.035, 0.220))
+        _last_bot_natural_delay = conservative_delay
+        print(
+            "[BOT CLOCK] Own clock unavailable; optional thinking pause suppressed.",
+            flush=True,
+        )
+        return max(0.0, conservative_delay)
 
     # Never let optional pauses consume the clock reserve needed to finish and
     # confirm a move. The remaining clock is an observation, not a fake timer.
@@ -1260,6 +1277,19 @@ def opponent_recent_accuracy(
         weighted / total_weight,
         n
     )
+
+
+def opponent_move_centipawn_loss(expected_best_cp, played_position_cp):
+    """Return non-negative centipawn loss only when both evaluations are usable."""
+    try:
+        if expected_best_cp is None or played_position_cp is None:
+            return None
+        return max(
+            0.0,
+            min(400.0, float(expected_best_cp) - float(played_position_cp)),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def opponent_quality_from_centipawn_loss(centipawn_loss):
