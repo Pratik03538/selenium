@@ -2875,7 +2875,7 @@ def choose_middle_game_premove(
     return None, None, "no-midgame-premove-passed-all-reply-checks"
 
 
-PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP = 100
+PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP = 50
 
 
 def choose_low_clock_conversion_premove(
@@ -3123,45 +3123,27 @@ def choose_low_clock_likely_reply_premove(
             candidates.append((move, info))
             seen.add(move.uci())
 
-        if not candidates:
-            # Last-resort low-clock coverage: choose a legal move on the
-            # hypothetical post-reply board even if Stockfish returns no usable PV.
-            # Promotions/castling are omitted for cursor input because they may
-            # require site-specific handling. The site still decides whether the
-            # speculative gesture can be queued as a premove.
-            legal_fallbacks = []
-            piece_values = {
-                chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
-                chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 20000,
-            }
-            for move in hypothetical.legal_moves:
-                if move.promotion is not None and getattr(args, "move_input", "api") == "cursor":
-                    continue
-                if hypothetical.is_castling(move) and getattr(args, "move_input", "api") == "cursor":
-                    continue
-                if strategy_module.candidate_hangs_own_piece(hypothetical, move):
-                    continue
-                victim = hypothetical.piece_at(move.to_square)
-                if hypothetical.is_en_passant(move):
-                    victim_value = piece_values[chess.PAWN]
-                else:
-                    victim_value = piece_values.get(victim.piece_type, 0) if victim else 0
-                priority = (
-                    0 if move.promotion is not None
-                    else 1 if hypothetical.is_capture(move)
-                    else 2 if hypothetical.gives_check(move)
-                    else 3
-                )
-                legal_fallbacks.append((priority, -victim_value, move.uci(), move))
-            if not legal_fallbacks:
-                return None, predicted_reply, "low-clock-fallback-no-submittable-continuation"
-            legal_fallbacks.sort(key=lambda item: (item[0], item[1], item[2]))
-            selected = legal_fallbacks[0][3]
-            reply_san = board.san(predicted_reply)
-            return selected, predicted_reply, f"low-clock-legal-continuation-fallback reply={reply_san}"
+        # Never fall back to a merely-legal move when the engine could not
+        # score it. Late-clock premoves still must pass the material guard above
+        # and a tight evaluation-drop threshold; otherwise use normal-turn logic.
+        best_after_reply_eval = _premove_score_for_bot(own_lines[0], bot_color) if own_lines else None
+        if best_after_reply_eval is None:
+            return None, predicted_reply, "low-clock-follow-up-evaluation-unavailable"
+        if best_after_reply_eval < PREMOVE_MIN_BOT_EVAL_CP:
+            return None, predicted_reply, "low-clock-position-too-losing-for-premove"
 
-        selected, selected_info = candidates[0]
-        selected_eval = _premove_score_for_bot(selected_info, bot_color)
+        guarded_candidates = []
+        for move, info in candidates:
+            selected_eval = _premove_score_for_bot(info, bot_color)
+            if selected_eval is None or selected_eval < PREMOVE_MIN_BOT_EVAL_CP:
+                continue
+            if best_after_reply_eval - selected_eval > PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP:
+                continue
+            guarded_candidates.append((move, info, selected_eval))
+        if not guarded_candidates:
+            return None, predicted_reply, "low-clock-candidates-failed-material-or-evaluation-guards"
+
+        selected, selected_info, selected_eval = guarded_candidates[0]
         reply_san = board.san(predicted_reply)
         eval_text = f" eval={selected_eval / 100:+.2f}" if selected_eval is not None else ""
         return (
