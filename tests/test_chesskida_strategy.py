@@ -5,6 +5,18 @@ import chess
 import chesskida_strategy as strategy
 
 
+class OpponentMoveQualityTests(unittest.TestCase):
+    def test_centipawn_loss_maps_to_smooth_bounded_quality(self):
+        self.assertEqual(strategy.opponent_quality_from_centipawn_loss(0), 100.0)
+        self.assertEqual(strategy.opponent_quality_from_centipawn_loss(20), 95.0)
+        self.assertEqual(strategy.opponent_quality_from_centipawn_loss(100), 75.0)
+        self.assertEqual(strategy.opponent_quality_from_centipawn_loss(400), 0.0)
+
+    def test_quality_handles_negative_and_invalid_loss_safely(self):
+        self.assertEqual(strategy.opponent_quality_from_centipawn_loss(-25), 100.0)
+        self.assertIsNone(strategy.opponent_quality_from_centipawn_loss("unknown"))
+
+
 class NearEqualRecoveryPoolTests(unittest.TestCase):
     def test_non_winning_position_allows_bounded_70cp_recovery_band(self):
         candidates = [
