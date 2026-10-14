@@ -22,7 +22,7 @@ BOT_THINKING_START_AFTER_MOVE = 8
 BOT_BOOK_INSTANT_MOVES = 8
 BOT_ENDGAME_PAUSE_MIN = 0.25
 BOT_ENDGAME_PAUSE_MAX = 2.400
-BOT_ENDGAME_PAUSE_CHANCE = 0.23
+BOT_ENDGAME_PAUSE_CHANCE = 0.0
 BOT_PAUSE_MOVE_COOLDOWN_MIN = 2
 BOT_PAUSE_MOVE_COOLDOWN_MAX = 12
 BOT_PAUSE_ELIGIBILITY_SCALE = 0.62
@@ -590,12 +590,12 @@ def natural_bot_move_delay(
     if own_clock is not None and own_clock <= low_clock_threshold:
         try:
             total_budget = (
-                random.choice((0.100, 0.150, 0.200))
+                random.choice((0.100, 0.125, 0.150))
                 if low_clock_total_budget_seconds is None
-                else min(0.200, max(0.100, float(low_clock_total_budget_seconds)))
+                else min(0.150, max(0.075, float(low_clock_total_budget_seconds)))
             )
         except (TypeError, ValueError):
-            total_budget = random.choice((0.100, 0.150, 0.200))
+            total_budget = random.choice((0.100, 0.125, 0.150))
         try:
             elapsed_before = max(0.0, float(elapsed_seconds_before_delay))
         except (TypeError, ValueError):
