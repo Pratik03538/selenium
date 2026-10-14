@@ -3668,6 +3668,7 @@ def main() -> int:
                                         previous_eval_white_cp=previous_eval_white_cp,
                                         initial_time_seconds=(initial_game_clock_seconds if args.clock_management else None),
                                         remaining_time_seconds=(remaining_clock_seconds if args.clock_management else None),
+                                        opponent_time_seconds=(opponent_clock_seconds if args.clock_management else None),
                                         increment_seconds=(clock_increment_seconds if args.clock_management else 0.0),
                                         is_opening_book_move=(
                                             isinstance(selection_meta, dict)
