@@ -18,14 +18,14 @@ ANALYSIS_DEPTH = 8
 BOT_EVERY_MOVE_DELAY_MIN = 0.035
 BOT_EVERY_MOVE_DELAY_MAX = 2.100
 BOT_THINKING_ENABLED_DEFAULT = True
-BOT_THINKING_START_AFTER_MOVE = 8
+BOT_THINKING_START_AFTER_MOVE = 5
 BOT_BOOK_INSTANT_MOVES = 8
 BOT_ENDGAME_PAUSE_MIN = 0.25
 BOT_ENDGAME_PAUSE_MAX = 2.400
 BOT_ENDGAME_PAUSE_CHANCE = 0.20
 BOT_PAUSE_MOVE_COOLDOWN_MIN = 2
 BOT_PAUSE_MOVE_COOLDOWN_MAX = 12
-BOT_PAUSE_ELIGIBILITY_SCALE = 0.62
+BOT_PAUSE_ELIGIBILITY_SCALE = 0.78
 BOT_POST_50_MOVE = 50
 BOT_MATE_PAUSE_MIN_MATE = 1
 BOT_MATE_PAUSE_MAX_MATE = 5
@@ -35,8 +35,8 @@ BOT_MATE_PAUSE_MIN = 1.5
 BOT_MATE_PAUSE_MAX = 6.5
 BOT_THINK_BUDGET_MIN = 14.0
 BOT_THINK_BUDGET_MAX = 26.0
-BOT_THINK_ELIGIBILITY_MIN = 0.10
-BOT_THINK_ELIGIBILITY_MAX = 0.72
+BOT_THINK_ELIGIBILITY_MIN = 0.16
+BOT_THINK_ELIGIBILITY_MAX = 0.82
 BOT_THINK_REASONABLE_CP = 60
 BOT_THINK_UNCERTAINTY_CP = 75
 BOT_THINK_SHARP_EVAL_CP = 80
@@ -358,26 +358,29 @@ def _sample_base_move_delay(
     forced=False,
     opening_book=False,
 ) -> float:
-    """Continuously sample a varied delay scaled by current position complexity."""
+    """Sample a per-move delay with stronger separation between routine and hard decisions."""
     complexity = _timing_position_complexity(
         board, move, engine_result=engine_result, selection_meta=selection_meta
     )
-    # Sample a fresh continuous timing range on every move. There are no
-    # discrete timing bands or a repeating move-number schedule.
     if forced or opening_book:
-        low = random.uniform(0.012, 0.035)
-        high = random.uniform(0.090, 0.235)
+        # Forced and book moves are already clear; keep these intentionally short.
+        low = random.uniform(0.012, 0.040)
+        high = random.uniform(0.075, 0.300)
+        mode_fraction = random.uniform(0.18, 0.48)
+        complexity_factor = 0.82 + 0.35 * complexity
     else:
-        low = random.uniform(0.025, 0.085)
-        high = random.uniform(0.55, 1.95) * (0.72 + 0.28 * complexity)
-    mode_fraction = random.uniform(
-        0.12 + 0.10 * complexity,
-        0.48 + 0.20 * complexity,
-    )
-    mode = low + (high - low) * min(0.82, mode_fraction)
+        # A complex/uncertain position receives a broader potential range than
+        # a quiet, straightforward move. Clock management applies the final cap.
+        low = random.uniform(0.025, 0.075 + 0.060 * complexity)
+        high = random.uniform(0.40, 1.35 + 1.75 * complexity)
+        mode_fraction = random.uniform(
+            0.10 + 0.16 * complexity,
+            0.36 + 0.40 * complexity,
+        )
+        complexity_factor = 0.68 + 0.90 * complexity
+    mode = low + (high - low) * min(0.88, mode_fraction)
     base = random.triangular(low, high, mode)
-    complexity_factor = 0.86 + 0.46 * complexity
-    micro_jitter = random.uniform(0.0, 0.090)
+    micro_jitter = random.uniform(0.0, 0.120)
     return min(
         BOT_EVERY_MOVE_DELAY_MAX,
         max(BOT_EVERY_MOVE_DELAY_MIN, base * complexity_factor + micro_jitter),
@@ -520,14 +523,23 @@ def natural_bot_move_delay(
 
     if _thinking_budget_remaining is None or len(board.move_stack) <= 1:
         _bot_timing_move_count = 0
-        _thinking_warmup_moves = random.randint(4, BOT_THINKING_START_AFTER_MOVE)
-        _book_fast_move_limit = random.randint(4, BOT_BOOK_INSTANT_MOVES)
+        _thinking_warmup_moves = random.randint(2, BOT_THINKING_START_AFTER_MOVE)
+        _book_fast_move_limit = random.randint(2, min(5, BOT_BOOK_INSTANT_MOVES))
         _thinking_clock_reserve_fraction = random.uniform(0.30, 0.43)
         if initial_time_seconds is not None and float(initial_time_seconds) > 0:
             initial_clock = float(initial_time_seconds)
-            _quick_only_clock_threshold = min(
-                25.0, max(5.0, initial_clock * random.uniform(0.14, 0.32))
-            )
+            if initial_clock <= 90.0:
+                # Keep normal position-based thinking available until the
+                # actual late-clock window in blitz/bullet-sized controls.
+                _quick_only_clock_threshold = min(
+                    10.0, max(5.0, initial_clock * random.uniform(0.10, 0.18))
+                )
+            else:
+                # Longer controls can still switch to quick-only mode later,
+                # while preserving more time for complex decisions earlier.
+                _quick_only_clock_threshold = min(
+                    25.0, max(10.0, initial_clock * random.uniform(0.06, 0.10))
+                )
             # Sample a fresh game budget while protecting time for later turns.
             expected = _estimate_remaining_decisions(board)
             increment = max(0.0, float(increment_seconds or 0.0))
@@ -721,7 +733,17 @@ def natural_bot_move_delay(
             float(_thinking_budget_remaining)
         )
         if clock_pace_seconds is not None:
-            pace_pause_cap = clock_pace_seconds * 1.20
+            endgame_complexity_for_cap = _timing_position_complexity(
+                board, move, engine_result=engine_result, selection_meta=selection_meta
+            )
+            pace_pause_cap = clock_pace_seconds * (
+                0.90 + 1.40 * endgame_complexity_for_cap
+            )
+            try:
+                already_spent = max(0.0, float(elapsed_seconds_before_delay)) + max(0.0, float(delay))
+            except (TypeError, ValueError):
+                already_spent = max(0.0, float(delay))
+            pace_pause_cap = max(0.0, pace_pause_cap - already_spent)
             if clock_margin is not None:
                 if clock_margin < 0.0:
                     pace_pause_cap *= 0.62
@@ -923,9 +945,17 @@ def natural_bot_move_delay(
         float(_thinking_budget_remaining)
     )
     if clock_pace_seconds is not None:
-        # Complex positions may receive a longer thinking pause when the game
-        # clock supports it. Short controls naturally get a much smaller cap.
-        pace_pause_cap = clock_pace_seconds * 1.35
+        # Allocate extra time from position complexity, but subtract engine
+        # processing and the base delay already spent on this decision.
+        pause_complexity_for_cap = min(1.0, max(0.0, signal_score / 1.55))
+        pace_pause_cap = clock_pace_seconds * (
+            1.05 + 1.75 * pause_complexity_for_cap
+        )
+        try:
+            already_spent = max(0.0, float(elapsed_seconds_before_delay)) + max(0.0, float(delay))
+        except (TypeError, ValueError):
+            already_spent = max(0.0, float(delay))
+        pace_pause_cap = max(0.0, pace_pause_cap - already_spent)
         if clock_margin is not None:
             if clock_margin < 0.0:
                 pace_pause_cap *= 0.62
