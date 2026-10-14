@@ -1204,25 +1204,28 @@ function extractSan(value) {
   return '';
 }
 function getMoves() {
-  // Merge all configured move-list sources instead of stopping at the first
-  // selector; pages often render partial lists in more than one container.
+  // Try each selector independently and choose the largest coherent SAN-node
+  // set. Merging a move node with an ancestor move-list container can duplicate
+  // its first SAN and corrupt the replay, so selector sets must not be mixed.
   const selectors = ['.white.node, .black.node', cfg.moveListSelector, cfg.movesSelector];
-  const seenElements = new Set();
-  const found = [];
+  let best = [];
   for (const selector of selectors) {
+    const seen = new Set();
+    const candidate = [];
     for (const el of queryAllDeep(selector)) {
-      if (seenElements.has(el)) continue;
-      seenElements.add(el);
+      if (seen.has(el)) continue;
+      seen.add(el);
       const san = extractSan(el.innerText || el.textContent || '');
       if (!san) continue;
       const ply = String(el.getAttribute(cfg.plyAttribute) || '').trim();
-      found.push({ply, text: san, order: found.length});
+      candidate.push({ply, text: san, order: candidate.length});
     }
+    if (candidate.length > best.length) best = candidate;
   }
-  if (found.length && found.every(item => /^\d+$/.test(item.ply))) {
-    found.sort((a, b) => Number(a.ply) - Number(b.ply) || a.order - b.order);
+  if (best.length && best.every(item => /^\d+$/.test(item.ply))) {
+    best.sort((a, b) => Number(a.ply) - Number(b.ply) || a.order - b.order);
   }
-  return found.map((item, index) => ({
+  return best.map((item, index) => ({
     ply: item.ply || String(index + 1),
     text: item.text
   }));
@@ -2184,7 +2187,7 @@ def calculate_engine_search_limit(
     return max(0.005, min(base, clock_cap))
 
 
-def perform_cursor_drag(
+def _perform_cursor_drag_once(
     driver, uci: str, expected_fen: str, expected_color: str | None,
     allow_premove: bool = False, low_clock_mode: bool = False,
 ) -> dict[str, object]:
@@ -2394,6 +2397,45 @@ def perform_cursor_drag(
         "pre_delay_ms": pre_delay_ms,
         "waypoints": waypoint_count,
     }
+
+
+def perform_cursor_drag(
+    driver, uci: str, expected_fen: str, expected_color: str | None,
+    allow_premove: bool = False, low_clock_mode: bool = False,
+) -> dict[str, object]:
+    """Perform one guarded retry only when the first drag left the board unchanged."""
+    first = _perform_cursor_drag_once(
+        driver, uci, expected_fen, expected_color,
+        allow_premove=allow_premove, low_clock_mode=low_clock_mode,
+    )
+    if first.get("ok") or allow_premove:
+        # Unconfirmed premove gestures are never retried: the site might have
+        # queued the move without exposing that state.
+        return first
+    reason = str(first.get("reason") or "")
+    if reason not in {"cursor-drag-not-confirmed", "cursor-action-failed"}:
+        return first
+    try:
+        current_fen = driver.execute_script(
+            "return window.__liveGameApiReader ? "
+            "window.__liveGameApiReader.current().fen : '';"
+        )
+    except WebDriverException:
+        return first
+    # Never replay a stale move if the first gesture or an opponent action
+    # already changed the board.
+    if not current_fen or str(current_fen).strip() != expected_fen.strip():
+        return first
+    retry = _perform_cursor_drag_once(
+        driver, uci, expected_fen, expected_color,
+        allow_premove=False, low_clock_mode=low_clock_mode,
+    )
+    retry["retry_attempted"] = True
+    if retry.get("ok"):
+        retry["retry_after"] = reason
+        return retry
+    retry["first_failure"] = reason
+    return retry
 
 
 def perform_api_move(
