@@ -502,9 +502,9 @@ function clockValueFromNode(node) {
 }
 function readClockText(selector, side) {
   const selectors = [
-    selector,
     '.clock-component.clock-' + side,
     '.clock-' + side + '.clock-component',
+    selector,
     '[class~="clock-' + side + '"]',
     '[data-clock="' + side + '"]',
     '#' + side + '-clock',
@@ -2404,8 +2404,12 @@ def main() -> int:
         "plyAttribute": args.ply_attribute,
         "timeAttribute": args.time_attribute,
         "moveListSelector": args.move_list_selector,
-        "whiteClockSelector": args.white_clock_selector,
-        "blackClockSelector": args.black_clock_selector,
+        "whiteClockSelector": (
+            load_optional_txt_setting("white_clock_selector") or args.white_clock_selector
+        ),
+        "blackClockSelector": (
+            load_optional_txt_setting("black_clock_selector") or args.black_clock_selector
+        ),
         "resultSelector": args.result_selector,
         "playerName": configured_player_name,
         "whitePlayerSelector": (
