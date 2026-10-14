@@ -327,7 +327,7 @@ class RuntimeSettingsWindow:
         self._draw_eval_bar()
 
         move_frame = tk.LabelFrame(
-            self.root, text="Live move history — latest 30 moves",
+            self.root, text="Live move history — scroll for earlier moves",
             padx=5, pady=4, bg="#f3f5f8", fg="#283548",
         )
         move_frame.pack(fill="both", expand=True, pady=(0, 5))
@@ -498,7 +498,7 @@ class RuntimeSettingsWindow:
             f"Low-clock threshold: {float(low_clock_threshold):.1f}s"
         )
 
-    def update_game_status(self, game_number, board, bot_color=None):
+    def update_game_status(self, game_number, board, bot_color=None, game_result=None):
         """Refresh turn, progress, material and terminal-state summary."""
         if board is None:
             return
@@ -515,7 +515,12 @@ class RuntimeSettingsWindow:
                 legal_count = board.legal_moves.count()
             except Exception:
                 legal_count = "?"
-            if board.is_checkmate():
+            result_text = str(game_result or "").strip()
+            if result_text and result_text.lower() not in {
+                "*", "live", "ongoing", "in progress", "playing", "none"
+            }:
+                state = f"FINISHED · {result_text[:24]}"
+            elif board.is_checkmate():
                 winner = "Black wins" if board.turn else "White wins"
                 state = f"CHECKMATE · {winner}"
             elif board.is_stalemate():
@@ -524,6 +529,8 @@ class RuntimeSettingsWindow:
                 state = "DRAW · MATERIAL"
             elif board.is_game_over(claim_draw=False):
                 state = "GAME OVER"
+            elif board.is_check():
+                state = "LIVE · CHECK"
             else:
                 state = "LIVE"
 
@@ -657,7 +664,7 @@ class RuntimeSettingsWindow:
         if is_new:
             self.moves_tree.move(iid, "", 0)
 
-        while len(self.move_order) > 30:
+        while len(self.move_order) > 200:
             old_key = self.move_order.pop()
             old = self.move_rows.pop(old_key, None)
             if old and self.moves_tree.exists(old["iid"]):
@@ -3717,7 +3724,10 @@ def main() -> int:
                         try:
                             dashboard_board = chess.Board(fen)
                             settings_window.update_game_status(
-                                game_number, dashboard_board, bot_color=active_bot_color
+                                game_number,
+                                dashboard_board,
+                                bot_color=active_bot_color,
+                                game_result=event.get("result"),
                             )
 
                             # Refresh the advantage bar after an opponent position
@@ -3730,7 +3740,8 @@ def main() -> int:
                                 else None
                             )
                             bot_to_move = (
-                                bot_color_value is not None
+                                args.auto_play
+                                and bot_color_value is not None
                                 and dashboard_board.turn == bot_color_value
                             )
                             if (
