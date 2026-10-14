@@ -1836,12 +1836,7 @@ def infer_move_between_fens(previous_fen: str, current_fen: str) -> dict[str, st
         san = before.san(move)
         after = before.copy(stack=False)
         after.push(move)
-        if (
-            after.board_fen() == target.board_fen()
-            and after.turn == target.turn
-            and after.castling_rights == target.castling_rights
-            and after.ep_square == target.ep_square
-        ):
+        if _same_chess_position(after, target):
             return {
                 "san": san,
                 "uci": move.uci(),
@@ -1852,12 +1847,18 @@ def infer_move_between_fens(previous_fen: str, current_fen: str) -> dict[str, st
 
 
 def _same_chess_position(left, right) -> bool:
-    """Compare board state without relying on halfmove/fullmove counters."""
+    """Compare legal position state, ignoring non-capturable en-passant targets."""
+    def effective_ep_square(board):
+        # python-chess can retain the passed-over square after e.g. e2-e4 while
+        # standard FEN commonly writes '-'. That square affects legal moves only
+        # when an en-passant capture is actually legal.
+        return board.ep_square if board.has_legal_en_passant() else None
+
     return (
         left.board_fen() == right.board_fen()
         and left.turn == right.turn
         and left.castling_rights == right.castling_rights
-        and left.ep_square == right.ep_square
+        and effective_ep_square(left) == effective_ep_square(right)
     )
 
 
