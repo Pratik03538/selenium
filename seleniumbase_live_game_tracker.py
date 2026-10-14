@@ -154,7 +154,85 @@ class PlayerSideResolver:
         return None
 
 
-def normalize_host(value: str) -> str:
+class MoveAttemptRetryGate:
+    """Bounded retries for a position, without duplicate submissions after ambiguous acceptance."""
+
+    MAX_ATTEMPTS = 3
+    RETRY_BACKOFF_SECONDS = (0.20, 0.50)
+
+    def __init__(self):
+        self.fen: str | None = None
+        self.attempts = 0
+        self.last_attempt_at = 0.0
+        self.retryable = False
+        self.pending = False
+        self.accepted_unconfirmed = False
+
+    def should_attempt(self, fen: str, now: float | None = None) -> bool:
+        if not fen:
+            return False
+        if fen != self.fen:
+            return True
+        if (
+            self.pending
+            or self.accepted_unconfirmed
+            or not self.retryable
+            or self.attempts >= self.MAX_ATTEMPTS
+        ):
+            return False
+        current = time.monotonic() if now is None else float(now)
+        delay_index = min(max(0, self.attempts - 1), len(self.RETRY_BACKOFF_SECONDS) - 1)
+        return current - self.last_attempt_at >= self.RETRY_BACKOFF_SECONDS[delay_index]
+
+    def begin(self, fen: str, now: float | None = None) -> bool:
+        if not fen:
+            return False
+        current = time.monotonic() if now is None else float(now)
+        if fen != self.fen:
+            self.fen = fen
+            self.attempts = 0
+            self.last_attempt_at = 0.0
+            self.retryable = False
+            self.pending = False
+            self.accepted_unconfirmed = False
+        elif not self.should_attempt(fen, current):
+            return False
+        if self.attempts >= self.MAX_ATTEMPTS:
+            return False
+        self.attempts += 1
+        self.last_attempt_at = current
+        self.retryable = False
+        self.pending = True
+        self.accepted_unconfirmed = False
+        return True
+
+    def finish(self, result: object) -> None:
+        if not self.pending:
+            return
+        self.pending = False
+        if isinstance(result, dict) and result.get("ok"):
+            self.retryable = False
+            self.accepted_unconfirmed = False
+        elif isinstance(result, dict) and (
+            result.get("api_accepted")
+            or result.get("reason") == "api-submit-unavailable"
+        ):
+            # Ambiguous acceptance must not be blindly duplicated on the same FEN.
+            self.retryable = False
+            self.accepted_unconfirmed = True
+        else:
+            self.retryable = self.attempts < self.MAX_ATTEMPTS
+            self.accepted_unconfirmed = False
+
+    def finish_exception(self) -> None:
+        # Exceptions after a confirmed submission must not reopen that position.
+        if self.pending:
+            self.pending = False
+            self.retryable = self.attempts < self.MAX_ATTEMPTS
+            self.accepted_unconfirmed = False
+
+
+def normalize_host(value: str):
     """Accept a specific hostname or URL; reject public-suffix-only values."""
     value = (value or "").strip().lower()
     if not value:
@@ -2167,6 +2245,22 @@ def parse_clock_seconds(raw_value: object) -> float | None:
     return None
 
 
+def is_low_clock_mode(
+    remaining_seconds: float | None,
+    threshold_seconds: float = 10.0,
+    force_fast_mode: bool = False,
+) -> bool:
+    """Central clock-mode predicate shared by all runtime paths."""
+    if remaining_seconds is None:
+        return False
+    try:
+        remaining = max(0.0, float(remaining_seconds))
+        threshold = min(10.0, max(5.0, float(threshold_seconds)))
+    except (TypeError, ValueError):
+        return False
+    return bool(force_fast_mode or remaining <= threshold)
+
+
 def calculate_engine_search_limit(
     base_seconds: float,
     remaining_seconds: float | None,
@@ -2174,16 +2268,20 @@ def calculate_engine_search_limit(
     increment_seconds: float,
     board,
     opponent_seconds: float | None = None,
+    low_clock_trigger_seconds: float = 10.0,
+    force_fast_mode: bool = False,
 ) -> float:
-    """Cap engine calculation time using the observed clock; never exceed the configured cap."""
+    """Cap engine calculation time using one shared clock-mode boundary."""
     base = max(0.005, min(float(base_seconds), 5.0))
     if remaining_seconds is None:
-        return base
+        # Unknown clock: conservative short search rather than spending the
+        # normal configured engine time without knowing the available reserve.
+        return max(0.005, min(base, 0.050))
 
     remaining = max(0.0, float(remaining_seconds))
-    # At <=10s, cap engine work hard so calculation doesn't consume the
-    # time needed to submit and confirm a move.
-    if remaining <= 10.0:
+    if is_low_clock_mode(
+        remaining, low_clock_trigger_seconds, force_fast_mode
+    ):
         return max(0.001, min(base, 0.035, remaining * 0.004))
     initial = max(1.0, float(initial_seconds or remaining or 1.0))
     increment = max(0.0, min(float(increment_seconds or 0.0), 60.0))
@@ -3499,6 +3597,11 @@ def choose_premove_candidate(
         safe_candidates = []
         # Check a manageable top subset with a slightly longer, more stable search.
         for candidate_info in own_lines[:8]:
+            if (
+                analysis_deadline is not None
+                and time.monotonic() >= float(analysis_deadline) - 0.012
+            ):
+                return None, predicted_reply, "premove-analysis-deadline-exceeded"
             selected = candidate_info["pv"][0]
             if selected.promotion is not None and cursor_input:
                 continue
@@ -3802,6 +3905,7 @@ def main() -> int:
     book = None
     strategy_module = None
     last_auto_attempt_fen = ""
+    move_retry_gate = MoveAttemptRetryGate()
     last_premove_attempt_fen = ""
     last_low_clock_premove_fen = ""
     last_premove_gate_report_fen = ""
@@ -3814,7 +3918,6 @@ def main() -> int:
     )
     last_side_warning_fen = ""
     previous_eval_white_cp = None
-    next_human_best_uci = None
     next_opponent_best_cp = None
     pending_opponent_best_cp = None
     pending_opponent_color = None
@@ -4009,6 +4112,25 @@ def main() -> int:
                     print("[STOP] Browser tab closed or DevTools disconnected. No URL was logged.", flush=True)
                     break
 
+                # If the queue is quiet, re-read the authoritative state when a retry is due.
+                if (
+                    not events
+                    and move_retry_gate.fen
+                    and move_retry_gate.should_attempt(move_retry_gate.fen)
+                ):
+                    try:
+                        retry_snapshot = driver.execute_script(
+                            "return window.__liveGameApiReader ? "
+                            "window.__liveGameApiReader.current() : null;"
+                        )
+                    except WebDriverException:
+                        retry_snapshot = None
+                    if (
+                        isinstance(retry_snapshot, dict)
+                        and str(retry_snapshot.get("fen") or "").strip() == move_retry_gate.fen
+                    ):
+                        events = [retry_snapshot]
+
                 for event in events or []:
                     if settings_window is not None:
                         settings_window.pump()
@@ -4031,7 +4153,9 @@ def main() -> int:
                         own_clock_for_poll = None
                     low_clock_polling_active = (
                         own_clock_for_poll is not None
-                        and (short_control_fast_mode or own_clock_for_poll <= low_clock_trigger_seconds)
+                        and is_low_clock_mode(
+                            own_clock_for_poll, low_clock_trigger_seconds, short_control_fast_mode
+                        )
                         and (args.clock_management or args.premove_enabled)
                     )
                     if low_clock_polling_active != last_fast_polling_state:
@@ -4255,8 +4379,7 @@ def main() -> int:
                                 if is_new_start:
                                     strategy_board = chess.Board(fen)
                                     opponent_match_history.clear()
-                                    next_human_best_uci = None
-                                    next_opponent_best_cp = None
+                                                                    next_opponent_best_cp = None
                                     pending_opponent_best_cp = None
                                     pending_opponent_color = None
                                     previous_eval_white_cp = None
@@ -4274,8 +4397,7 @@ def main() -> int:
                                     else:
                                         strategy_board = chess.Board(fen)
                                         opponent_match_history.clear()
-                                        next_human_best_uci = None
-                                        next_opponent_best_cp = None
+                                                                            next_opponent_best_cp = None
                                         pending_opponent_best_cp = None
                                         pending_opponent_color = None
                                         previous_eval_white_cp = None
@@ -4284,8 +4406,7 @@ def main() -> int:
                                     # Recover synchronization if a page skipped a FEN state.
                                     strategy_board = chess.Board(fen)
                                     opponent_match_history.clear()
-                                    next_human_best_uci = None
-                                    next_opponent_best_cp = None
+                                                                    next_opponent_best_cp = None
                                     pending_opponent_best_cp = None
                                     pending_opponent_color = None
                                     previous_eval_white_cp = None
@@ -4305,8 +4426,7 @@ def main() -> int:
                                 ):
                                     pending_opponent_best_cp = float(next_opponent_best_cp)
                                     pending_opponent_color = strategy_transition.get("side")
-                                    next_human_best_uci = None
-                                    next_opponent_best_cp = None
+                                                                    next_opponent_best_cp = None
                         except (ValueError, IndexError):
                             strategy_board = None
                             strategy_board_fen = ""
@@ -4531,7 +4651,7 @@ def main() -> int:
                             )
                         )
 
-                        if fen != last_auto_attempt_fen:
+                        if fen != last_auto_attempt_fen or move_retry_gate.should_attempt(fen):
                             engine_board = strategy_board.copy(stack=True)
                             side_to_move = (
                                 "white" if engine_board.turn == chess.WHITE else "black"
@@ -4582,9 +4702,17 @@ def main() -> int:
                                     )
 
                             if our_turn and not engine_board.is_game_over(claim_draw=True):
+                                move_cycle_started_at = time.monotonic()
+                                if not move_retry_gate.begin(fen, move_cycle_started_at):
+                                    continue
                                 last_auto_attempt_fen = fen
+                                if move_retry_gate.attempts > 1:
+                                    print(
+                                        f"[AUTO RETRY] Same position retry "
+                                        f"{move_retry_gate.attempts}/{move_retry_gate.MAX_ATTEMPTS}.",
+                                        flush=True,
+                                    )
                                 try:
-                                    move_cycle_started_at = time.monotonic()
                                     engine_result = []
                                     selected_info = None
                                     selection_meta = None
@@ -4598,9 +4726,10 @@ def main() -> int:
                                         if engine_board.turn == chess.WHITE
                                         else white_clock_seconds
                                     )
-                                    low_clock_mode = (
-                                        remaining_clock_seconds is not None
-                                        and (short_control_fast_mode or remaining_clock_seconds <= low_clock_trigger_seconds)
+                                    low_clock_mode = is_low_clock_mode(
+                                        remaining_clock_seconds,
+                                        low_clock_trigger_seconds,
+                                        short_control_fast_mode,
                                     )
                                     low_clock_total_budget_seconds = (
                                         random.uniform(0.025, 0.045)
@@ -4638,17 +4767,15 @@ def main() -> int:
                                             "book_weight": float(book_choice.get("weight", 0.0)),
                                         }
                                     else:
-                                        limit_seconds = (
-                                            calculate_engine_search_limit(
-                                                base_seconds=args.engine_time,
-                                                remaining_seconds=remaining_clock_seconds,
-                                                initial_seconds=initial_game_clock_seconds,
-                                                increment_seconds=clock_increment_seconds,
-                                                board=engine_board,
-                                                opponent_seconds=opponent_clock_seconds,
-                                            )
-                                            if remaining_clock_seconds is not None
-                                            else max(0.005, min(float(args.engine_time), 5.0))
+                                        limit_seconds = calculate_engine_search_limit(
+                                            base_seconds=args.engine_time,
+                                            remaining_seconds=remaining_clock_seconds,
+                                            initial_seconds=initial_game_clock_seconds,
+                                            increment_seconds=clock_increment_seconds,
+                                            board=engine_board,
+                                            opponent_seconds=opponent_clock_seconds,
+                                            low_clock_trigger_seconds=low_clock_trigger_seconds,
+                                            force_fast_mode=short_control_fast_mode,
                                         )
                                         if remaining_clock_seconds is None:
                                             print(
@@ -4679,8 +4806,27 @@ def main() -> int:
                                         best_info = engine_result[0] if engine_result else None
                                         if pending_opponent_best_cp is not None:
                                             try:
-                                                score_obj = best_info.get("score") if isinstance(best_info, dict) else None
-                                                if score_obj is not None and pending_opponent_color in {"white", "black"}:
+                                                # Compare evaluations with the same shallow search limits.
+                                                quality_info = None
+                                                if not low_clock_mode:
+                                                    quality_info = engine.analyse(
+                                                        engine_board,
+                                                        chess.engine.Limit(
+                                                            depth=int(getattr(strategy_module, "ANALYSIS_DEPTH", 8)),
+                                                            time=max(0.005, min(
+                                                                float(getattr(strategy_module, "ANALYSIS_TIME", 0.010)),
+                                                                0.025,
+                                                            )),
+                                                        ),
+                                                    )
+                                                score_obj = (
+                                                    quality_info.get("score")
+                                                    if isinstance(quality_info, dict) else None
+                                                )
+                                                if (
+                                                    score_obj is not None
+                                                    and pending_opponent_color in {"white", "black"}
+                                                ):
                                                     opponent_chess_color = (
                                                         chess.WHITE if pending_opponent_color == "white"
                                                         else chess.BLACK
@@ -4688,14 +4834,10 @@ def main() -> int:
                                                     played_position_cp = strategy_module.score_to_cp(
                                                         score_obj.pov(opponent_chess_color)
                                                     )
-                                                    if played_position_cp is not None:
-                                                        estimated_cpl = max(
-                                                            0.0,
-                                                            min(
-                                                                400.0,
-                                                                float(pending_opponent_best_cp) - float(played_position_cp),
-                                                            ),
-                                                        )
+                                                    estimated_cpl = strategy_module.opponent_move_centipawn_loss(
+                                                        pending_opponent_best_cp, played_position_cp
+                                                    )
+                                                    if estimated_cpl is not None:
                                                         move_quality = strategy_module.opponent_quality_from_centipawn_loss(
                                                             estimated_cpl
                                                         )
@@ -4703,12 +4845,12 @@ def main() -> int:
                                                             opponent_match_history.append(float(move_quality))
                                                             opponent_pressure = move_quality >= 85.0
                                                             print(
-                                                                f"[OPPONENT QUALITY] estimated_cpl={estimated_cpl:.0f}cp "
+                                                                f"[OPPONENT QUALITY] comparable-search CPL={estimated_cpl:.0f}cp "
                                                                 f"| score={move_quality:.1f}/100.",
                                                                 flush=True,
                                                             )
-                                            except (ValueError, TypeError, AttributeError):
-                                                pass
+                                            except (chess.engine.EngineError, ValueError, TypeError, AttributeError, RuntimeError):
+                                                print("[OPPONENT QUALITY] Sample skipped; comparable evaluation unavailable.", flush=True)
                                             finally:
                                                 pending_opponent_best_cp = None
                                                 pending_opponent_color = None
@@ -4818,6 +4960,7 @@ def main() -> int:
                                         ),
                                         low_clock_trigger_seconds=low_clock_trigger_seconds,
                                         low_clock_total_budget_seconds=low_clock_total_budget_seconds,
+                                        low_clock_mode=low_clock_mode,
                                         elapsed_seconds_before_delay=time.monotonic() - move_cycle_started_at,
                                         submission_reserve_seconds=(
                                             0.075 if args.move_input == "cursor" else 0.035
@@ -4852,6 +4995,7 @@ def main() -> int:
                                             low_clock_mode=low_clock_mode,
                                         )
                                     if isinstance(submit, dict) and submit.get("ok"):
+                                        move_retry_gate.finish(submit)
                                         if low_clock_mode:
                                             move_elapsed = time.monotonic() - move_cycle_started_at
                                             print(
@@ -4896,13 +5040,15 @@ def main() -> int:
                                                     source="After-move analysis",
                                                 )
                                             predicted = analysis_state.get("next_reply_best_move")
-                                            next_human_best_uci = predicted if predicted and predicted != "-" else None
-                                            next_opponent_best_cp = analysis_state.get("next_reply_eval_cp")
+                                                    next_opponent_best_cp = analysis_state.get("next_reply_eval_cp")
                                         else:
                                             previous_eval_white_cp = None
-                                            next_human_best_uci = None
-                                            next_opponent_best_cp = None
+                                                                                    next_opponent_best_cp = None
                                     else:
+                                        move_retry_gate.finish(
+                                            submit if isinstance(submit, dict)
+                                            else {"ok": False, "reason": "invalid-submit-result"}
+                                        )
                                         reason = submit.get("reason", "move-submit-failed") if isinstance(submit, dict) else "move-submit-failed"
                                         detail = ""
                                         if args.move_input == "cursor" and isinstance(submit, dict) and submit.get("error"):
@@ -4924,7 +5070,8 @@ def main() -> int:
                                                 f"Failed: {str(reason)[:28]}",
                                             )
                                 except (chess.engine.EngineError, ValueError, WebDriverException, RuntimeError):
-                                    print("[AUTO] Strategy calculation/submission failed; waiting for the next position.", flush=True)
+                                    move_retry_gate.finish_exception()
+                                    print("[AUTO] Strategy calculation/submission failed; bounded retry remains available if no move was accepted.", flush=True)
                             elif (
                                 args.auto_play
                                 and args.premove_enabled
@@ -4958,9 +5105,10 @@ def main() -> int:
                                     black_clock_seconds if active_bot_color == "white"
                                     else white_clock_seconds
                                 )
-                                low_clock_premove_mode = (
-                                    bot_clock_for_premove is not None
-                                    and (short_control_fast_mode or bot_clock_for_premove <= low_clock_trigger_seconds)
+                                low_clock_premove_mode = is_low_clock_mode(
+                                    bot_clock_for_premove,
+                                    low_clock_trigger_seconds,
+                                    short_control_fast_mode,
                                 )
                                 low_clock_premove_budget_seconds = (
                                     random.uniform(0.025, 0.045)
@@ -5010,6 +5158,12 @@ def main() -> int:
                                         analysis_deadline=premove_analysis_deadline,
                                     )
                                     premove_analysis_elapsed = time.monotonic() - premove_cycle_started_at
+                                    if (
+                                        premove_move is not None
+                                        and time.monotonic() >= premove_analysis_deadline - 0.012
+                                    ):
+                                        premove_move = None
+                                        premove_source = "premove-analysis-deadline-exceeded"
                                     print("[PREMOVE CHECK] candidate=" + (premove_move.uci() if premove_move is not None else "none") + " | reason=" + str(premove_source) + " | analysis=" + format(premove_analysis_elapsed, ".3f") + "s", flush=True)
                                     if premove_move is None:
                                         print(
