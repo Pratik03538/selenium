@@ -2109,6 +2109,87 @@ def choose_low_clock_conversion_premove(
         return None, None, "low-clock-premove-analysis-failed"
 
 
+
+def choose_low_clock_likely_reply_premove(
+    engine, board, bot_color: str, args,
+) -> tuple[object | None, object | None, str]:
+    """Fast low-clock fallback: best continuation after the most likely reply.
+
+    This speculative fallback runs only on the configured authorized test site.
+    It is less restrictive than the universal-safe middlegame path but still
+    requires a real legal reply and a legal, submittable continuation.
+    """
+    if chess is None or engine is None or board is None:
+        return None, None, "low-clock-fallback-prerequisites-unavailable"
+
+    bot_turn = chess.WHITE if bot_color == "white" else chess.BLACK
+    if board.turn == bot_turn or board.is_game_over(claim_draw=True):
+        return None, None, "low-clock-fallback-not-opponent-turn-or-game-over"
+
+    try:
+        reply_count = board.legal_moves.count()
+        if reply_count <= 0:
+            return None, None, "low-clock-fallback-no-legal-reply"
+
+        search_time = max(0.002, min(float(args.engine_time), 0.005))
+        opponent_lines = engine.analyse(
+            board,
+            chess.engine.Limit(depth=7, time=search_time),
+            multipv=min(3, reply_count),
+        )
+        if not isinstance(opponent_lines, list):
+            opponent_lines = [opponent_lines]
+        opponent_lines = [
+            info for info in opponent_lines
+            if isinstance(info, dict) and info.get("pv")
+            and info["pv"][0] in board.legal_moves
+        ]
+        if not opponent_lines:
+            return None, None, "low-clock-fallback-opponent-reply-unavailable"
+
+        predicted_reply = opponent_lines[0]["pv"][0]
+        hypothetical = board.copy(stack=True)
+        hypothetical.push(predicted_reply)
+        if hypothetical.turn != bot_turn or hypothetical.is_game_over(claim_draw=True):
+            return None, predicted_reply, "low-clock-fallback-no-follow-up-after-predicted-reply"
+
+        own_lines = engine.analyse(
+            hypothetical,
+            chess.engine.Limit(depth=7, time=search_time),
+            multipv=min(8, max(1, hypothetical.legal_moves.count())),
+        )
+        if not isinstance(own_lines, list):
+            own_lines = [own_lines]
+        candidates = []
+        seen = set()
+        for info in own_lines:
+            pv = info.get("pv") if isinstance(info, dict) else None
+            if not pv:
+                continue
+            move = pv[0]
+            if move not in hypothetical.legal_moves or move.uci() in seen:
+                continue
+            if move.promotion is not None and getattr(args, "move_input", "api") == "cursor":
+                continue
+            candidates.append((move, info))
+            seen.add(move.uci())
+
+        if not candidates:
+            return None, predicted_reply, "low-clock-fallback-no-submittable-continuation"
+
+        selected, selected_info = candidates[0]
+        selected_eval = _premove_score_for_bot(selected_info, bot_color)
+        reply_san = board.san(predicted_reply)
+        eval_text = f" eval={selected_eval / 100:+.2f}" if selected_eval is not None else ""
+        return (
+            selected,
+            predicted_reply,
+            f"low-clock-likely-reply-fallback reply={reply_san} rank=1{eval_text}",
+        )
+    except (chess.engine.EngineError, ValueError, RuntimeError, TypeError, AttributeError):
+        return None, None, "low-clock-fallback-analysis-failed"
+
+
 def choose_premove_candidate(
     engine, board, strategy_module, bot_color: str, args, book=None,
     opponent_match_history: list[float] | None = None,
@@ -2130,6 +2211,12 @@ def choose_premove_candidate(
         )
         if low_clock_move is not None:
             return low_clock_move, low_clock_reply, low_clock_reason
+        fallback_move, fallback_reply, fallback_reason = choose_low_clock_likely_reply_premove(
+            engine, board, bot_color, args
+        )
+        if fallback_move is not None:
+            return fallback_move, fallback_reply, fallback_reason
+        return None, fallback_reply or low_clock_reply, f"{low_clock_reason}; {fallback_reason}"
 
     allowed, phase = premove_phase_allowed(board)
     if not allowed:
@@ -2217,7 +2304,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debugger-address", default="127.0.0.1:9223")
     parser.add_argument(
         "--browser-mode", choices=("attach", "uc"), default=None,
-        help="Browser startup mode: UC Mode by default; use attach to reuse an existing debugging Chrome session.",
+        help="Browser startup mode: attach to the existing debugging Chrome session by default; use uc only to launch a separate browser.",
     )
     parser.add_argument(
         "--allowed-domain", default="",
@@ -2276,7 +2363,7 @@ def main() -> int:
     print(f"[CONFIG] Blocked platform list loaded ({len(blocked_platforms)} entries).", flush=True)
 
     if args.browser_mode is None:
-        args.browser_mode = load_optional_txt_setting("browser_mode").strip().lower() or "uc"
+        args.browser_mode = "attach"
     if args.browser_mode not in {"attach", "uc"}:
         print("[CONFIG ERROR] browser_mode must be attach or uc.", file=sys.stderr, flush=True)
         return 2
@@ -2443,6 +2530,7 @@ def main() -> int:
     strategy_module = None
     last_auto_attempt_fen = ""
     last_premove_attempt_fen = ""
+    last_low_clock_premove_fen = ""
     strategy_board = None
     strategy_board_fen = ""
     active_bot_color = configured_bot_color
@@ -2470,7 +2558,7 @@ def main() -> int:
     except ValueError:
         clock_increment_seconds = 0.0
     clock_source_reported = False
-    low_clock_trigger_seconds = random.uniform(5.0, 10.0)
+    low_clock_trigger_seconds = random.uniform(7.0, 10.0)
     print(
         f"[LOW CLOCK] Random late-clock threshold for this game: <= {low_clock_trigger_seconds:.2f}s.",
         flush=True,
@@ -2683,7 +2771,7 @@ def main() -> int:
                         and not is_start_position(previous_fen)
                     )
                     if is_new_game_snapshot:
-                        low_clock_trigger_seconds = random.uniform(5.0, 10.0)
+                        low_clock_trigger_seconds = random.uniform(7.0, 10.0)
                         print(
                             f"[LOW CLOCK] New game threshold sampled: <= {low_clock_trigger_seconds:.2f}s.",
                             flush=True,
@@ -2743,6 +2831,7 @@ def main() -> int:
                                     opponent_pressure = False
                                     last_auto_attempt_fen = ""
                                     last_premove_attempt_fen = ""
+                                    last_low_clock_premove_fen = ""
                                     active_bot_color = configured_bot_color or player_name_color or api_bot_color
                                 elif strategy_transition is not None:
                                     strategy_move = chess.Move.from_uci(strategy_transition["uci"])
@@ -3176,7 +3265,16 @@ def main() -> int:
                                 and not color_conflict
                                 and not turn_conflict
                                 and api_my_turn is not True
-                                and fen != last_premove_attempt_fen
+                                and (
+                                    fen != last_premove_attempt_fen
+                                    or (
+                                        fen != last_low_clock_premove_fen
+                                        and (
+                                            (active_bot_color == "white" and white_clock_seconds is not None and white_clock_seconds <= low_clock_trigger_seconds)
+                                            or (active_bot_color == "black" and black_clock_seconds is not None and black_clock_seconds <= low_clock_trigger_seconds)
+                                        )
+                                    )
+                                )
                                 and not engine_board.is_game_over(claim_draw=True)
                             ):
                                 # A premove is speculative: analyze the likely opponent reply,
@@ -3196,6 +3294,7 @@ def main() -> int:
                                     if low_clock_premove_mode else None
                                 )
                                 if low_clock_premove_mode:
+                                    last_low_clock_premove_fen = fen
                                     print(
                                         f"[PREMOVE] Random-threshold low-clock priority active "
                                         f"({bot_clock_for_premove:.2f}s <= {low_clock_trigger_seconds:.2f}s); "
