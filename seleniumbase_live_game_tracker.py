@@ -2947,7 +2947,7 @@ def main() -> int:
                                             f"| threshold={low_clock_trigger_seconds:.2f}s.",
                                             flush=True,
                                         )
-                                    book_choice = book.choose(engine_board) if book is not None else None
+                                    book_choice = book.choose(engine_board) if book is not None and not low_clock_mode else None
 
                                     if book_choice is not None:
                                         chosen_move = book_choice["move"]
