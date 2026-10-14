@@ -2593,14 +2593,23 @@ def choose_stockfish_move(
             }
         )
 
+    # Do not let conversion priorities override a defensive line when
+    # Stockfish reports a forced mate against us.
+    forced_loss_position = (
+        best["mate"] is not None
+        and best["mate"] < 0
+    )
+
     # Convert an extra pawn when a queen promotion is genuinely
     # available. Promotion is a stronger conversion priority than
-    # wandering/shuffling in a winning position.
-    priority_promotion = find_priority_queen_promotion(
-        board,
-        candidates,
-        best_cp
-    )
+    # wandering/shuffling, including in equal/losing positions.
+    priority_promotion = None
+    if not forced_loss_position:
+        priority_promotion = find_priority_queen_promotion(
+            board,
+            candidates,
+            best_cp
+        )
 
     if priority_promotion is not None:
         return (
@@ -2620,12 +2629,14 @@ def choose_stockfish_move(
 
     # Before normal fuzzy selection, prefer safe captures so "human-like"
     # does not become "wander around while a free piece is hanging".
-    priority_capture = find_priority_capture(
-        board,
-        candidates,
-        best_cp,
-        engine=engine
-    )
+    priority_capture = None
+    if not forced_loss_position:
+        priority_capture = find_priority_capture(
+            board,
+            candidates,
+            best_cp,
+            engine=engine
+        )
 
     if priority_capture is not None:
         return (
