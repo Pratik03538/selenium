@@ -471,7 +471,70 @@ function callMaybe(obj, name) {
 function readText(selector) {
   if (!selector) return '';
   const el = queryDeep(selector);
-  return el ? String(el.innerText || el.textContent || '').trim() : '';
+  if (!el) return '';
+  return String(
+    el.innerText ||
+    el.textContent ||
+    el.getAttribute?.('aria-label') ||
+    el.getAttribute?.('title') ||
+    ''
+  ).replace(/\u00a0/g, ' ').trim();
+}
+function clockValueFromNode(node) {
+  if (!node) return '';
+  const values = [
+    node.getAttribute?.('data-time'),
+    node.getAttribute?.('data-remaining-time'),
+    node.getAttribute?.('aria-valuetext'),
+    node.getAttribute?.('aria-label'),
+    node.getAttribute?.('title'),
+    node.innerText,
+    node.textContent
+  ].filter(value => value != null && String(value).trim() !== '');
+  for (const raw of values) {
+    const value = String(raw).replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+    const clockMatch = value.match(/\d{1,3}:[0-5]?\d(?:[.,]\d+)?/);
+    if (clockMatch) return clockMatch[0].replace(',', '.');
+    const secondsMatch = value.match(/(?:^|\D)(\d{1,3}(?:[.,]\d+)?)(?:\s*(?:s|sec|secs|second|seconds))?(?:$|\D)/i);
+    if (secondsMatch) return secondsMatch[1].replace(',', '.');
+  }
+  return '';
+}
+function readClockText(selector, side) {
+  const selectors = [
+    selector,
+    '.clock-component.clock-' + side,
+    '.clock-' + side + '.clock-component',
+    '[class~="clock-' + side + '"]',
+    '[data-clock="' + side + '"]',
+    '#' + side + '-clock',
+    '.' + side + '.clock'
+  ].filter(Boolean);
+  const seen = new Set();
+  for (const candidateSelector of selectors) {
+    for (const clock of queryAllDeep(candidateSelector)) {
+      if (seen.has(clock)) continue;
+      seen.add(clock);
+      const style = getComputedStyle(clock);
+      const rect = clock.getBoundingClientRect?.();
+      const visible = !!rect && rect.width > 0 && rect.height > 0 &&
+        style.display !== 'none' && style.visibility !== 'hidden' &&
+        Number(style.opacity || 1) > 0;
+      if (!visible) continue;
+      const inner = queryAllWithinDeep(
+        clock,
+        '.clock-time, .clock-time-monospace, .clock-digital, [data-time], [data-remaining-time], [aria-valuetext], time'
+      );
+      for (const node of inner) {
+        if (node === clock) continue;
+        const value = clockValueFromNode(node);
+        if (value) return value;
+      }
+      const ownValue = clockValueFromNode(clock);
+      if (ownValue) return ownValue;
+    }
+  }
+  return '';
 }
 function getBoard() {
   return queryDeep(cfg.boardSelector) || queryDeep('chess-board') ||
@@ -783,8 +846,8 @@ function snapshot() {
     moves,
     legalMoveCount: legalMoves.length,
     legalMoves,
-    whiteClock: readText(cfg.whiteClockSelector),
-    blackClock: readText(cfg.blackClockSelector),
+    whiteClock: readClockText(cfg.whiteClockSelector, 'white'),
+    blackClock: readClockText(cfg.blackClockSelector, 'black'),
     result: readText(cfg.resultSelector)
   };
 }
@@ -803,7 +866,7 @@ function refresh(forceRoots = false) {
 state.observer = new MutationObserver(() => refresh(false));
 state.observer.observe(document.documentElement, {
   subtree: true, childList: true, characterData: true, attributes: true,
-  attributeFilter: ['class', 'aria-label', 'data-fen', 'data-ply', 'data-time', 'data-result', 'data-turn']
+  attributeFilter: ['class', 'style', 'title', 'aria-label', 'aria-valuetext', 'aria-valuenow', 'data-clock', 'data-remaining-time', 'data-fen', 'data-ply', 'data-time', 'data-result', 'data-turn']
 });
 window.__liveGameApiReader = {
   observer: state.observer,
@@ -1202,13 +1265,18 @@ return (() => {
 
 _CLOCK_MMSS_RE = re.compile(r"^(\d+):([0-5]?\d)(?:\.(\d+))?$")
 _CLOCK_HHMMSS_RE = re.compile(r"^(\d+):([0-5]?\d):([0-5]?\d)(?:\.(\d+))?$")
+_CLOCK_SECONDS_SUFFIX_RE = re.compile(r"^(\d+(?:\.\d+)?)(?:s|sec|secs|second|seconds)$", re.IGNORECASE)
 
 
 def parse_clock_seconds(raw_value: object) -> float | None:
-    """Parse a visible chess clock such as 1:00, 00:59.4, or 59.4 seconds."""
+    """Parse visible clocks like 1:00, 00:09.8, 9.8s, or 9 seconds."""
     text = re.sub(r"\s+", "", str(raw_value or "")).replace(",", ".")
     if not text:
         return None
+    # Some clock components expose accessibility text rather than only digits.
+    suffix_match = _CLOCK_SECONDS_SUFFIX_RE.fullmatch(text)
+    if suffix_match:
+        return max(0.0, float(suffix_match.group(1)))
     match = _CLOCK_HHMMSS_RE.fullmatch(text)
     if match:
         hours, minutes, seconds, fraction = match.groups()
@@ -1967,8 +2035,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ply-attribute", default="data-ply")
     parser.add_argument("--time-attribute", default="data-time")  # kept for CLI compatibility
     parser.add_argument("--move-list-selector", default="vertical-move-list, wc-simple-move-list")
-    parser.add_argument("--white-clock-selector", default=".white.clock, #white-clock")
-    parser.add_argument("--black-clock-selector", default=".black.clock, #black-clock")
+    parser.add_argument("--white-clock-selector", default=".clock-component.clock-white")
+    parser.add_argument("--black-clock-selector", default=".clock-component.clock-black")
     parser.add_argument("--result-selector", default="#game-result, [data-result]")
     parser.add_argument("--csv", default=str(DEFAULT_CSV))
     parser.add_argument("--queue-read-interval", type=float, default=0.2)
@@ -2313,6 +2381,7 @@ def main() -> int:
             print("[MODE] Live state reader active (DOM observer + 200ms state fallback); Ctrl+C to stop.", flush=True)
             last_console_signature = None
             last_name_debug_signature = None
+            last_clock_signature = None
             while True:
                 # Closing the chosen tab often yields current_url=None in ChromeDriver.
                 if chosen_handle not in driver.window_handles:
@@ -2351,6 +2420,27 @@ def main() -> int:
                         active_bot_color = player_name_color or api_bot_color
                     white_clock_seconds = parse_clock_seconds(event.get("whiteClock"))
                     black_clock_seconds = parse_clock_seconds(event.get("blackClock"))
+                    clock_signature = (
+                        str(event.get("whiteClock") or ""),
+                        str(event.get("blackClock") or ""),
+                        white_clock_seconds,
+                        black_clock_seconds,
+                    )
+                    if clock_signature != last_clock_signature:
+                        last_clock_signature = clock_signature
+                        if active_bot_color == "white":
+                            own_clock_for_log = white_clock_seconds
+                        elif active_bot_color == "black":
+                            own_clock_for_log = black_clock_seconds
+                        else:
+                            own_clock_for_log = None
+                        fmt_clock = lambda value: "unreadable" if value is None else f"{value:.2f}s"
+                        print(
+                            f"[CLOCK READ] white raw={clock_signature[0]!r} -> {fmt_clock(white_clock_seconds)} | "
+                            f"black raw={clock_signature[1]!r} -> {fmt_clock(black_clock_seconds)} | "
+                            f"own={fmt_clock(own_clock_for_log)}",
+                            flush=True,
+                        )
                     observed_clocks = [
                         value for value in (white_clock_seconds, black_clock_seconds)
                         if value is not None
