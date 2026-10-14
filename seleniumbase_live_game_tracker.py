@@ -434,7 +434,7 @@ def prepare_bot_components(args, allowed_host, installed):
         print("[INPUT] Direct game API mode enabled.", flush=True)
     print(
         f"[ENGINE] Threads=2 | Hash=128 MB | depth=12 | "
-        f"MultiPV=15 | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s.",
+        f"MultiPV={strategy_module.TRAINING_MULTI_PV} | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s.",
         flush=True,
     )
     return engine, book, strategy_module
