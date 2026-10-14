@@ -2324,13 +2324,17 @@ def calculate_engine_search_limit(
         remaining - opponent_remaining
         if opponent_remaining is not None else None
     )
-    deficit_threshold = max(2.0, min(12.0, initial * 0.025))
-    if clock_margin is not None and clock_margin <= -deficit_threshold:
-        search_fraction = random.uniform(0.08, 0.16)
-    elif clock_margin is not None and clock_margin < 0.0:
-        search_fraction = random.uniform(0.11, 0.21)
+    normal_search_fraction = random.uniform(0.14, 0.28)
+    if clock_margin is not None and clock_margin < 0.0:
+        deficit_threshold = max(2.0, min(12.0, initial * 0.10))
+        deficit_scale = min(1.0, abs(clock_margin) / deficit_threshold)
+        faster_search_fraction = random.uniform(0.08, 0.18)
+        search_fraction = (
+            normal_search_fraction
+            + (faster_search_fraction - normal_search_fraction) * deficit_scale
+        )
     else:
-        search_fraction = random.uniform(0.14, 0.28)
+        search_fraction = normal_search_fraction
     clock_cap = max(0.005, per_move_clock * search_fraction * factor)
     return max(0.005, min(base, clock_cap))
 
@@ -4229,13 +4233,27 @@ def main() -> int:
                         )
                         initial_game_clock_seconds = None
                         clock_source_reported = False
-                    if not clock_increment_is_configured and not (is_new_game_snapshot or is_initial_start_snapshot):
+                    if (
+                        not clock_increment_is_configured
+                        and not (is_new_game_snapshot or is_initial_start_snapshot)
+                        and fen and previous_fen and fen != previous_fen
+                    ):
+                        moved_side = None
+                        try:
+                            previous_turn = previous_fen.split()[1]
+                            moved_side = "white" if previous_turn == "w" else "black" if previous_turn == "b" else None
+                        except (IndexError, AttributeError):
+                            moved_side = None
                         for side_name, current_clock in (
                             ("white", white_clock_seconds),
                             ("black", black_clock_seconds),
                         ):
                             previous_clock = last_seen_clock_by_side.get(side_name)
-                            if previous_clock is not None and current_clock is not None:
+                            if (
+                                side_name == moved_side
+                                and previous_clock is not None
+                                and current_clock is not None
+                            ):
                                 clock_gain = float(current_clock) - float(previous_clock)
                                 if 0.35 <= clock_gain <= 10.0:
                                     clock_increment_samples.append(clock_gain)
