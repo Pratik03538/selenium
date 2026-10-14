@@ -728,7 +728,9 @@ def natural_bot_move_delay(
     # Keep the regular short randomized delay, but do not add optional pauses
     # when clocks are tied or we are behind.
     if clock_margin is not None and clock_margin <= 0.0:
-        return max(0.0, float(delay))
+        tied_or_behind_delay = min(float(delay), random.uniform(0.035, 0.220))
+        _last_bot_natural_delay = tied_or_behind_delay
+        return max(0.0, tied_or_behind_delay)
 
     # Under 25s on our own clock, use quick moves and avoid discretionary pauses.
     if (
