@@ -1922,9 +1922,184 @@ def choose_middle_game_premove(
     return None, None, "no-midgame-premove-passed-all-reply-checks"
 
 
+PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP = 100
+
+
+def choose_low_clock_conversion_premove(
+    engine, board, strategy_module, bot_color: str, args,
+) -> tuple[object | None, object | None, str]:
+    """Fast, safety-checked capture/promotion premove for a favorable low-clock endgame."""
+    if chess is None or engine is None or strategy_module is None or board is None:
+        return None, None, "low-clock-prerequisites-unavailable"
+
+    bot_turn = chess.WHITE if bot_color == "white" else chess.BLACK
+    if board.turn == bot_turn or board.is_game_over(claim_draw=True):
+        return None, None, "not-opponent-turn-or-game-over"
+
+    try:
+        opponent_movable_pieces = len({move.from_square for move in board.legal_moves})
+        bot_non_king_count = sum(
+            1 for piece in board.piece_map().values()
+            if piece.color == bot_turn and piece.piece_type != chess.KING
+        )
+        opponent_non_king_count = sum(
+            1 for piece in board.piece_map().values()
+            if piece.color != bot_turn and piece.piece_type != chess.KING
+        )
+        bot_material = strategy_module.side_material(board, bot_turn)
+        opponent_material = strategy_module.side_material(board, not bot_turn)
+    except Exception:
+        return None, None, "low-clock-position-metrics-unavailable"
+
+    if not (1 <= opponent_movable_pieces <= 3):
+        return None, None, f"opponent-has-{opponent_movable_pieces}-movable-pieces"
+    if bot_non_king_count <= opponent_non_king_count or bot_material <= opponent_material:
+        return None, None, "material-advantage-not-confirmed"
+
+    search_time = max(0.003, min(float(args.engine_time), 0.006))
+    try:
+        reply_count = max(1, min(3, board.legal_moves.count()))
+        opponent_lines = engine.analyse(
+            board,
+            chess.engine.Limit(depth=8, time=search_time),
+            multipv=reply_count,
+        )
+        if not isinstance(opponent_lines, list):
+            opponent_lines = [opponent_lines]
+        opponent_lines = [
+            info for info in opponent_lines
+            if isinstance(info, dict) and info.get("pv")
+            and info["pv"][0] in board.legal_moves
+        ]
+        if not opponent_lines:
+            return None, None, "low-clock-opponent-reply-unavailable"
+
+        predicted_reply = opponent_lines[0]["pv"][0]
+        current_eval = _premove_score_for_bot(opponent_lines[0], bot_color)
+        if current_eval is None or current_eval < PREMOVE_MIN_BOT_EVAL_CP:
+            return None, predicted_reply, "low-clock-position-not-safely-winning"
+
+        hypothetical = board.copy(stack=True)
+        hypothetical.push(predicted_reply)
+        if hypothetical.turn != bot_turn:
+            return None, predicted_reply, "low-clock-hypothetical-turn-mismatch"
+
+        own_lines = engine.analyse(
+            hypothetical,
+            chess.engine.Limit(depth=8, time=search_time),
+            multipv=min(8, max(1, hypothetical.legal_moves.count())),
+        )
+        if not isinstance(own_lines, list):
+            own_lines = [own_lines]
+        own_lines = [
+            info for info in own_lines
+            if isinstance(info, dict) and info.get("pv")
+            and info["pv"][0] in hypothetical.legal_moves
+        ]
+        if not own_lines:
+            return None, predicted_reply, "low-clock-own-candidates-unavailable"
+
+        best_after_reply_eval = _premove_score_for_bot(own_lines[0], bot_color)
+        if best_after_reply_eval is None or best_after_reply_eval < PREMOVE_MIN_BOT_EVAL_CP:
+            return None, predicted_reply, "low-clock-best-follow-up-not-safe"
+
+        # If the current short analysis already sees mate, select the shortest
+        # mate line it found, randomizing only exact-distance ties.
+        mate_options = []
+        for info in own_lines:
+            score = info.get("score")
+            pv = info.get("pv") or []
+            if not score or not pv:
+                continue
+            try:
+                mate_distance = score.pov(bot_turn).mate()
+            except (AttributeError, TypeError, ValueError):
+                mate_distance = None
+            if mate_distance is not None and mate_distance > 0:
+                mate_options.append((int(mate_distance), info["pv"][0], info))
+        if mate_options:
+            fastest_distance = min(item[0] for item in mate_options)
+            fastest = [item for item in mate_options if item[0] == fastest_distance]
+            mate_distance, move, info = random.choice(fastest)
+            return (
+                move,
+                predicted_reply,
+                f"low-clock-fast-mate-premove M{mate_distance} after likely reply",
+            )
+
+        # Enumerate actual tactical moves so promotions/captures are not limited
+        # to those that happened to land inside the first MultiPV slice.
+        info_by_uci = {
+            info["pv"][0].uci(): info
+            for info in own_lines if info.get("pv")
+        }
+        tactical = []
+        piece_values = {
+            chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
+            chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 20000,
+        }
+        allow_promotion = getattr(args, "move_input", "api") != "cursor"
+        for move in hypothetical.legal_moves:
+            if move.promotion is not None and not allow_promotion:
+                continue
+            is_promotion = move.promotion is not None
+            is_capture = hypothetical.is_capture(move)
+            if not (is_promotion or is_capture or hypothetical.gives_check(move)):
+                continue
+            victim = hypothetical.piece_at(move.to_square)
+            if hypothetical.is_en_passant(move):
+                victim_value = piece_values[chess.PAWN]
+            else:
+                victim_value = piece_values.get(victim.piece_type, 0) if victim else 0
+            promotion_value = piece_values.get(move.promotion, 0) if move.promotion else 0
+            tactical.append((
+                0 if is_promotion else (1 if is_capture else 2),
+                -promotion_value if is_promotion else -victim_value,
+                move,
+            ))
+        tactical.sort(key=lambda item: (item[0], item[1], item[2].uci()))
+
+        # Cap extra one-move checks so a low-clock decision cannot turn into a
+        # long search. A move is accepted only if it stays winning enough.
+        checked = set()
+        for _kind, _value, move in tactical[:6]:
+            uci = move.uci()
+            if uci in checked:
+                continue
+            checked.add(uci)
+            info = info_by_uci.get(uci)
+            if info is None:
+                info = _single_premove_info(
+                    engine,
+                    hypothetical,
+                    chess.engine.Limit(depth=7, time=search_time),
+                    root_moves=[move],
+                )
+            selected_eval = _premove_score_for_bot(info, bot_color)
+            if selected_eval is None or selected_eval < PREMOVE_MIN_BOT_EVAL_CP:
+                continue
+            if best_after_reply_eval - selected_eval > PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP:
+                continue
+            tactical_type = (
+                "promotion" if move.promotion is not None
+                else ("capture" if hypothetical.is_capture(move) else "check")
+            )
+            return (
+                move,
+                predicted_reply,
+                f"low-clock-{tactical_type}-priority | eval={selected_eval / 100:+.2f} "
+                f"| opponent-movable={opponent_movable_pieces}",
+            )
+
+        return None, predicted_reply, "no-low-clock-tactic-passed-evaluation-guard"
+    except (chess.engine.EngineError, ValueError, RuntimeError, TypeError):
+        return None, None, "low-clock-premove-analysis-failed"
+
+
 def choose_premove_candidate(
     engine, board, strategy_module, bot_color: str, args, book=None,
     opponent_match_history: list[float] | None = None,
+    low_clock_mode: bool = False,
 ) -> tuple[object | None, object | None, str]:
     """Choose an opening/endgame premove or a verified-safe middlegame candidate."""
     if chess is None or engine is None or strategy_module is None or board is None:
@@ -1935,6 +2110,13 @@ def choose_premove_candidate(
     bot_turn = chess.WHITE if bot_color == "white" else chess.BLACK
     if board.turn == bot_turn:
         return None, None, "bot-turn-already-active"
+
+    if low_clock_mode:
+        low_clock_move, low_clock_reply, low_clock_reason = choose_low_clock_conversion_premove(
+            engine, board, strategy_module, bot_color, args
+        )
+        if low_clock_move is not None:
+            return low_clock_move, low_clock_reply, low_clock_reason
 
     allowed, phase = premove_phase_allowed(board)
     if not allowed:
