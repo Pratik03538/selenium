@@ -2506,8 +2506,8 @@ PREMOVE_OPENING_FULLMOVE_MAX = 10
 PREMOVE_ENDGAME_MAX_PIECES = 10
 PREMOVE_MIN_BOT_EVAL_CP = -25
 PREMOVE_MAX_EVAL_DROP_CP = 40
-PREMOVE_OPENING_MIN_BOT_EVAL_CP = -100
-PREMOVE_OPENING_MAX_EVAL_DROP_CP = 100
+PREMOVE_OPENING_MIN_BOT_EVAL_CP = -50
+PREMOVE_OPENING_MAX_EVAL_DROP_CP = 50
 PREMOVE_MATE_REPLY_MULTIPV = 3
 PREMOVE_MATE_FOLLOWUP_MULTIPV = 8
 # Middlegame recaptures: accept a reasonably broad reply set, not every legal blunder.
@@ -2804,7 +2804,12 @@ def choose_middle_game_premove(
 
         # Keep the latency bounded. If the strongest common recapture is unsafe,
         # skip this square rather than trying a long list of speculative moves.
-        for candidate in ordered[:1]:
+        for candidate in ordered[:3]:
+            if any(
+                strategy_module.candidate_hangs_own_piece(after_capture, candidate)
+                for _reply, after_capture in outcomes
+            ):
+                continue
             safe, worst_eval, reason = _candidate_safe_across_outcomes(
                 engine, outcomes, candidate, bot_color, search_time, baseline_cache
             )
@@ -2851,7 +2856,12 @@ def choose_middle_game_premove(
             candidates.append(move)
             seen.add(move.uci())
 
-    for candidate in candidates[:2]:
+    for candidate in candidates[:4]:
+        if any(
+            strategy_module.candidate_hangs_own_piece(after_reply, candidate)
+            for _reply, after_reply in response_boards
+        ):
+            continue
         safe, worst_eval, _reason = _candidate_safe_across_outcomes(
             engine, response_boards, candidate, bot_color, search_time, baseline_cache
         )
@@ -3008,6 +3018,8 @@ def choose_low_clock_conversion_premove(
         # long search. A move is accepted only if it stays winning enough.
         checked = set()
         for _kind, _value, move in tactical[:6]:
+            if strategy_module.candidate_hangs_own_piece(hypothetical, move):
+                continue
             uci = move.uci()
             if uci in checked:
                 continue
@@ -3043,7 +3055,7 @@ def choose_low_clock_conversion_premove(
 
 
 def choose_low_clock_likely_reply_premove(
-    engine, board, bot_color: str, args,
+    engine, board, bot_color: str, args, strategy_module=None,
 ) -> tuple[object | None, object | None, str]:
     """Fast low-clock fallback: best continuation after the most likely reply.
 
@@ -3051,8 +3063,10 @@ def choose_low_clock_likely_reply_premove(
     It is less restrictive than the universal-safe middlegame path but still
     requires a real legal reply and a legal, submittable continuation.
     """
-    if chess is None or engine is None or board is None:
+    if chess is None or engine is None or board is None or strategy_module is None:
         return None, None, "low-clock-fallback-prerequisites-unavailable"
+    if not callable(getattr(strategy_module, "candidate_hangs_own_piece", None)):
+        return None, None, "low-clock-fallback-safety-check-unavailable"
 
     bot_turn = chess.WHITE if bot_color == "white" else chess.BLACK
     if board.turn == bot_turn or board.is_game_over(claim_draw=True):
@@ -3103,6 +3117,9 @@ def choose_low_clock_likely_reply_premove(
                 continue
             if move.promotion is not None and getattr(args, "move_input", "api") == "cursor":
                 continue
+            # Reject an immediate, uncompensated material loss after this premove.
+            if strategy_module.candidate_hangs_own_piece(hypothetical, move):
+                continue
             candidates.append((move, info))
             seen.add(move.uci())
 
@@ -3121,6 +3138,8 @@ def choose_low_clock_likely_reply_premove(
                 if move.promotion is not None and getattr(args, "move_input", "api") == "cursor":
                     continue
                 if hypothetical.is_castling(move) and getattr(args, "move_input", "api") == "cursor":
+                    continue
+                if strategy_module.candidate_hangs_own_piece(hypothetical, move):
                     continue
                 victim = hypothetical.piece_at(move.to_square)
                 if hypothetical.is_en_passant(move):
@@ -3287,7 +3306,7 @@ def choose_premove_candidate(
         if low_clock_move is not None:
             return low_clock_move, low_clock_reply, low_clock_reason
         fallback_move, fallback_reply, fallback_reason = choose_low_clock_likely_reply_premove(
-            engine, board, bot_color, args
+            engine, board, bot_color, args, strategy_module=strategy_module
         )
         if fallback_move is not None:
             return fallback_move, fallback_reply, fallback_reason
@@ -3371,6 +3390,9 @@ def choose_premove_candidate(
         for candidate_info in own_lines:
             selected = candidate_info["pv"][0]
             if selected.promotion is not None and cursor_input:
+                continue
+            # A bounded eval drop alone can miss a one-move hanging piece.
+            if strategy_module.candidate_hangs_own_piece(hypothetical, selected):
                 continue
 
             after_selected = hypothetical.copy(stack=True)
