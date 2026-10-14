@@ -22,7 +22,7 @@ BOT_THINKING_START_AFTER_MOVE = 8
 BOT_BOOK_INSTANT_MOVES = 8
 BOT_ENDGAME_PAUSE_MIN = 0.25
 BOT_ENDGAME_PAUSE_MAX = 2.400
-BOT_ENDGAME_PAUSE_CHANCE = 0.0
+BOT_ENDGAME_PAUSE_CHANCE = 0.20
 BOT_PAUSE_MOVE_COOLDOWN_MIN = 2
 BOT_PAUSE_MOVE_COOLDOWN_MAX = 12
 BOT_PAUSE_ELIGIBILITY_SCALE = 0.62
@@ -114,6 +114,9 @@ _thinking_budget_total = None
 _thinking_move_cooldown_remaining = 0
 _mate_pause_used = False
 _rank1_selection_streak = 0
+_thinking_warmup_moves = None
+_book_fast_move_limit = None
+_thinking_clock_reserve_fraction = None
 
 
 def _near_equal_selection_pool(candidates, best_cp, rank_cap):
@@ -358,31 +361,22 @@ def _sample_base_move_delay(
     complexity = _timing_position_complexity(
         board, move, engine_result=engine_result, selection_meta=selection_meta
     )
+    # Sample a fresh continuous timing range on every move. There are no
+    # discrete timing bands or a repeating move-number schedule.
     if forced or opening_book:
-        # Forcing replies stay quick; jitter prevents a fixed-looking interval.
-        base = random.choice((
-            random.uniform(0.018, 0.055),
-            random.uniform(0.045, 0.115),
-            random.uniform(0.080, 0.185),
-        ))
+        low = random.uniform(0.012, 0.035)
+        high = random.uniform(0.090, 0.235)
     else:
-        # Pick among separated bands first, then sample inside the band. This
-        # avoids the previous heavy clustering around roughly 0.5-0.7 seconds.
-        roll = random.random()
-        if roll < 0.18:
-            base = random.uniform(0.070, 0.240)
-        elif roll < 0.40:
-            base = random.uniform(0.190, 0.460)
-        elif roll < 0.61:
-            base = random.uniform(0.360, 0.760)
-        elif roll < 0.78:
-            base = random.uniform(0.620, 1.080)
-        elif roll < 0.92:
-            base = random.uniform(0.900, 1.520)
-        else:
-            base = random.uniform(1.250, 2.000)
-    complexity_factor = 0.88 + 0.42 * complexity
-    micro_jitter = random.uniform(0.0, 0.085)
+        low = random.uniform(0.025, 0.085)
+        high = random.uniform(0.55, 1.95) * (0.72 + 0.28 * complexity)
+    mode_fraction = random.uniform(
+        0.12 + 0.10 * complexity,
+        0.48 + 0.20 * complexity,
+    )
+    mode = low + (high - low) * min(0.82, mode_fraction)
+    base = random.triangular(low, high, mode)
+    complexity_factor = 0.86 + 0.46 * complexity
+    micro_jitter = random.uniform(0.0, 0.090)
     return min(
         BOT_EVERY_MOVE_DELAY_MAX,
         max(BOT_EVERY_MOVE_DELAY_MIN, base * complexity_factor + micro_jitter),
@@ -394,18 +388,12 @@ def _sample_thinking_pause(pause_max: float, complexity: float = 0.0) -> float:
     if high <= 0.0:
         return 0.0
     complexity = min(1.0, max(0.0, float(complexity)))
-    roll = random.random()
-    if roll < 0.54:
-        low = min(0.45, high)
-        high = min(high, 1.7 + 1.4 * complexity)
-        mode = min(high, 0.75 + 1.0 * complexity)
-    elif roll < 0.88:
-        low = min(1.0, high)
-        high = min(high, 4.2 + 2.0 * complexity)
-        mode = min(high, 1.8 + 1.7 * complexity)
-    else:
-        low = min(2.4, high)
-        mode = min(high, 4.6 + 2.0 * complexity)
+    # One continuous per-call distribution replaces short/medium/long bins.
+    low = min(random.uniform(0.10, 0.42), high)
+    mode_fraction = random.triangular(
+        0.12, 0.82, min(0.82, max(0.12, 0.28 + 0.38 * complexity))
+    )
+    mode = low + (high - low) * mode_fraction
     if high <= low:
         return max(0.0, high)
     return random.triangular(low, high, min(high, max(low, mode)))
@@ -524,26 +512,30 @@ def natural_bot_move_delay(
     global _thinking_budget_total
     global _thinking_move_cooldown_remaining
     global _mate_pause_used
+    global _thinking_warmup_moves
+    global _book_fast_move_limit
+    global _thinking_clock_reserve_fraction
 
     if _thinking_budget_remaining is None or len(board.move_stack) <= 1:
         _bot_timing_move_count = 0
+        _thinking_warmup_moves = random.randint(4, BOT_THINKING_START_AFTER_MOVE)
+        _book_fast_move_limit = random.randint(4, BOT_BOOK_INSTANT_MOVES)
+        _thinking_clock_reserve_fraction = random.uniform(0.30, 0.43)
         if initial_time_seconds is not None and float(initial_time_seconds) > 0:
             initial_clock = float(initial_time_seconds)
-            # Optional pauses have their own finite budget. Faster increments
-            # add a modest reserve, but cannot override the live clock reserve.
+            # Sample a fresh game budget while protecting time for later turns.
             expected = _estimate_remaining_decisions(board)
             increment = max(0.0, float(increment_seconds or 0.0))
-            reserve = min(initial_clock * 0.08, max(0.5, initial_clock * 0.40))
+            reserve = initial_clock * _thinking_clock_reserve_fraction
+            think_fraction = random.uniform(0.28, 0.43)
+            increment_share = random.uniform(0.10, 0.22)
             _thinking_budget_total = min(
                 max(0.0, initial_clock - reserve),
-                initial_clock * 0.38 + increment * expected * 0.18,
+                initial_clock * think_fraction + increment * expected * increment_share,
             )
         else:
-            # The site clock is not exposed; use a variable total pause budget.
-            _thinking_budget_total = random.triangular(
-                BOT_THINK_BUDGET_MIN,
-                BOT_THINK_BUDGET_MAX,
-                18.0
+            _thinking_budget_total = random.uniform(
+                BOT_THINK_BUDGET_MIN, BOT_THINK_BUDGET_MAX
             )
         _thinking_budget_remaining = _thinking_budget_total
         _thinking_move_cooldown_remaining = 0
@@ -650,7 +642,7 @@ def natural_bot_move_delay(
         try:
             remaining_clock = max(0.0, float(remaining_time_seconds))
             if initial_time_seconds is not None and float(initial_time_seconds) > 0:
-                clock_reserve = max(1.0, float(initial_time_seconds) * 0.40)
+                clock_reserve = max(1.0, float(initial_time_seconds) * float(_thinking_clock_reserve_fraction or 0.36))
             else:
                 clock_reserve = max(0.25, min(2.0, remaining_clock * 0.08))
             safe_pause_budget = max(0.0, remaining_clock - clock_reserve)
@@ -662,7 +654,7 @@ def natural_bot_move_delay(
 
     # Opening-book moves are already known; do not wait unnecessarily on the
     # first eight book selections. The site must still confirm the move.
-    if is_opening_book_move and _bot_timing_move_count <= BOT_BOOK_INSTANT_MOVES:
+    if is_opening_book_move and _bot_timing_move_count <= int(_book_fast_move_limit or BOT_BOOK_INSTANT_MOVES):
         # A book choice is already prepared; keep it quick regardless of the
         # larger discretionary allowance available in a long time control.
         delay = min(base_delay, delay, 0.185)
@@ -692,7 +684,7 @@ def natural_bot_move_delay(
         pass
 
     # First eight bot moves: no long pause.
-    if _bot_timing_move_count <= BOT_THINKING_START_AFTER_MOVE:
+    if _bot_timing_move_count <= int(_thinking_warmup_moves or BOT_THINKING_START_AFTER_MOVE):
         return max(0.0, float(delay))
 
     if not thinking_enabled:
@@ -731,20 +723,21 @@ def natural_bot_move_delay(
             try:
                 remaining_clock = max(0.0, float(remaining_time_seconds))
                 if initial_time_seconds is not None and float(initial_time_seconds) > 0:
-                    reserve = max(1.0, float(initial_time_seconds) * 0.40)
+                    reserve = max(1.0, float(initial_time_seconds) * float(_thinking_clock_reserve_fraction or 0.36))
                 else:
                     reserve = max(0.25, min(1.0, remaining_clock * 0.10))
                 pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
             except (TypeError, ValueError):
                 pass
-        if (
-            pause_max < BOT_ENDGAME_PAUSE_MIN
-            or random.random() >= BOT_ENDGAME_PAUSE_CHANCE
-        ):
-            return max(0.0, float(delay))
         endgame_complexity = _timing_position_complexity(
             board, move, engine_result=engine_result, selection_meta=selection_meta
         )
+        pause_chance = min(
+            BOT_ENDGAME_PAUSE_CHANCE,
+            0.06 + 0.14 * endgame_complexity,
+        )
+        if pause_max < BOT_ENDGAME_PAUSE_MIN or random.random() >= pause_chance:
+            return max(0.0, float(delay))
         pause_duration = _sample_thinking_pause(pause_max, endgame_complexity)
         _thinking_budget_remaining = max(
             0.0, float(_thinking_budget_remaining) - pause_duration
@@ -934,7 +927,7 @@ def natural_bot_move_delay(
         try:
             remaining_clock = max(0.0, float(remaining_time_seconds))
             if initial_time_seconds is not None and float(initial_time_seconds) > 0:
-                reserve = max(1.0, float(initial_time_seconds) * 0.40)
+                reserve = max(1.0, float(initial_time_seconds) * float(_thinking_clock_reserve_fraction or 0.36))
             else:
                 reserve = max(0.25, min(2.0, remaining_clock * 0.08))
             pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
