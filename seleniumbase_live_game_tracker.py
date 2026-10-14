@@ -4187,9 +4187,17 @@ def main() -> int:
                         # snapshot. The explicit API is authoritative; player-name
                         # evidence is a stable two-snapshot fallback only.
                         color_conflict = bool(
-                            configured_bot_color
-                            and api_bot_color
-                            and api_bot_color != configured_bot_color
+                            (
+                                configured_bot_color
+                                and api_bot_color
+                                and api_bot_color != configured_bot_color
+                            )
+                            or (
+                                configured_player_name
+                                and api_bot_color
+                                and player_name_color
+                                and api_bot_color != player_name_color
+                            )
                         )
 
                         if fen != last_auto_attempt_fen:
@@ -4231,8 +4239,8 @@ def main() -> int:
                                     )
                                 elif color_conflict:
                                     print(
-                                        "[AUTO SAFETY] Configured/API player color conflicts. "
-                                        "Move generation paused; check bot_color in TXT settings.",
+                                        "[AUTO SAFETY] Player-side sources conflict. "
+                                        "Move generation paused; verify player-name selectors and bot_color in TXT settings.",
                                         flush=True,
                                     )
                                 else:
