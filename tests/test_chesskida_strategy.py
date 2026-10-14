@@ -192,7 +192,7 @@ class FastClockProtectionTests(unittest.TestCase):
     def test_discretionary_endgame_pauses_are_disabled(self):
         self.assertEqual(strategy.BOT_ENDGAME_PAUSE_CHANCE, 0.0)
 
-    def test_low_clock_delay_budget_is_capped_at_150ms(self):
+    def test_low_clock_delay_budget_is_capped_at_60ms(self):
         board = chess.Board()
         move = chess.Move.from_uci("e2e4")
         delay = strategy.natural_bot_move_delay(
@@ -206,7 +206,7 @@ class FastClockProtectionTests(unittest.TestCase):
             submission_reserve_seconds=0.0,
         )
         self.assertGreaterEqual(delay, 0.0)
-        self.assertLessEqual(delay, 0.150)
+        self.assertLessEqual(delay, 0.060)
 
 
 if __name__ == "__main__":
