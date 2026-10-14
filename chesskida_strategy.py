@@ -383,6 +383,86 @@ def _sample_thinking_pause(pause_max: float, complexity: float = 0.0) -> float:
     return random.triangular(low, high, min(high, max(low, mode)))
 
 
+def _estimate_remaining_decisions(board) -> int:
+    """Estimate our remaining decisions from the phase, not a fixed move number."""
+    try:
+        pieces = len(board.piece_map())
+    except Exception:
+        pieces = 32
+    if pieces <= 6:
+        return 14
+    if pieces <= 12:
+        return 20
+    if pieces <= 20:
+        return 28
+    return 36
+
+
+def _clock_time_profile(
+    board,
+    remaining_seconds=None,
+    initial_seconds=None,
+    increment_seconds=0.0,
+    opponent_seconds=None,
+):
+    """Return a per-decision allowance and delay scale based on live clocks.
+
+    This is a timing budget only. It reserves clock for actual moves and uses
+    increment as future time, while allowing extra discretionary time only when
+    the position/time situation safely supports it.
+    """
+    try:
+        own = max(0.0, float(remaining_seconds)) if remaining_seconds is not None else None
+    except (TypeError, ValueError):
+        own = None
+    try:
+        opponent = max(0.0, float(opponent_seconds)) if opponent_seconds is not None else None
+    except (TypeError, ValueError):
+        opponent = None
+    try:
+        initial = max(0.0, float(initial_seconds)) if initial_seconds is not None else None
+    except (TypeError, ValueError):
+        initial = None
+    try:
+        increment = max(0.0, min(60.0, float(increment_seconds or 0.0)))
+    except (TypeError, ValueError):
+        increment = 0.0
+
+    if own is None:
+        return {
+            "own_clock": None, "opponent_clock": opponent, "clock_margin": None,
+            "expected_decisions": _estimate_remaining_decisions(board),
+            "seconds_per_decision": None, "pace_scale": 1.0,
+            "lead_buffer": 0.0, "spendable_lead": 0.0,
+        }
+
+    expected = _estimate_remaining_decisions(board)
+    reference = initial if initial and initial > 0.0 else own
+    reserve = max(0.35, min(reference * 0.08, own * 0.18))
+    future_increment = increment * expected
+    available = max(0.0, own + future_increment - reserve)
+    seconds_per_decision = available / max(1, expected)
+    pace_scale = min(1.90, max(0.25, seconds_per_decision / 2.75))
+
+    margin = own - opponent if opponent is not None else None
+    lead_buffer = max(1.5, min(4.0, reference * 0.04))
+    spendable_lead = max(0.0, margin - lead_buffer) if margin is not None else 0.0
+    if margin is not None:
+        if margin < 0.0:
+            # When behind on the clock, avoid optional delays where possible.
+            pace_scale *= 0.78
+        elif spendable_lead > 0.0:
+            # Spend only a small share of the safe clock lead on normal pacing.
+            pace_scale *= 1.0 + min(0.18, spendable_lead * 0.006)
+    pace_scale = min(1.90, max(0.25, pace_scale))
+    return {
+        "own_clock": own, "opponent_clock": opponent, "clock_margin": margin,
+        "expected_decisions": expected,
+        "seconds_per_decision": seconds_per_decision, "pace_scale": pace_scale,
+        "lead_buffer": lead_buffer, "spendable_lead": spendable_lead,
+    }
+
+
 def natural_bot_move_delay(
     board,
     move,
@@ -393,6 +473,7 @@ def natural_bot_move_delay(
     previous_eval_white_cp=None,
     initial_time_seconds=None,
     remaining_time_seconds=None,
+    opponent_time_seconds=None,
     increment_seconds=0.0,
     is_opening_book_move=False,
     low_clock_trigger_seconds=10.0,
@@ -420,10 +501,14 @@ def natural_bot_move_delay(
         _bot_timing_move_count = 0
         if initial_time_seconds is not None and float(initial_time_seconds) > 0:
             initial_clock = float(initial_time_seconds)
-            # Allocate at most 60% of the starting clock to optional pauses.
+            # Optional pauses have their own finite budget. Faster increments
+            # add a modest reserve, but cannot override the live clock reserve.
+            expected = _estimate_remaining_decisions(board)
+            increment = max(0.0, float(increment_seconds or 0.0))
+            reserve = min(initial_clock * 0.08, max(0.5, initial_clock * 0.40))
             _thinking_budget_total = min(
-                initial_clock * 0.60,
-                max(0.0, initial_clock - min(3.0, max(0.5, initial_clock * 0.08)))
+                max(0.0, initial_clock - reserve),
+                initial_clock * 0.38 + increment * expected * 0.18,
             )
         else:
             # The site clock is not exposed; use a variable total pause budget.
@@ -446,6 +531,27 @@ def natural_bot_move_delay(
         )
     except (TypeError, ValueError):
         pass
+
+    opponent_clock = None
+    try:
+        opponent_clock = (
+            max(0.0, float(opponent_time_seconds))
+            if opponent_time_seconds is not None else None
+        )
+    except (TypeError, ValueError):
+        pass
+
+    clock_profile = _clock_time_profile(
+        board,
+        remaining_seconds=own_clock,
+        initial_seconds=initial_time_seconds,
+        increment_seconds=increment_seconds,
+        opponent_seconds=opponent_clock,
+    )
+    clock_pace_seconds = clock_profile["seconds_per_decision"]
+    clock_margin = clock_profile["clock_margin"]
+    clock_lead_buffer = clock_profile["lead_buffer"]
+    clock_spendable_lead = clock_profile["spendable_lead"]
 
     # Late-clock threshold is sampled once per game by the caller.
     # Only the final 5-10s window changes; all regular-clock timing stays intact.
@@ -492,7 +598,10 @@ def natural_bot_move_delay(
         opening_book=is_opening_book_move,
     )
     delay = base_delay
-    # Pace adapts only to OUR remaining time, never to the opponent's clock.
+    # Normal quiet moves scale with the clock's estimated per-decision allowance.
+    # Book moves, captures/recaptures, checks and promotions still hit the fast path below.
+    pace_scale = float(clock_profile["pace_scale"])
+    delay = min(BOT_EVERY_MOVE_DELAY_MAX * 1.75, delay * pace_scale)
     # These are upper caps on the sampled delay, not fixed target delays.
     if own_clock is not None:
         if own_clock <= 18.0:
@@ -580,6 +689,14 @@ def natural_bot_move_delay(
             BOT_ENDGAME_PAUSE_MAX,
             float(_thinking_budget_remaining)
         )
+        if clock_pace_seconds is not None:
+            pace_pause_cap = clock_pace_seconds * 1.20
+            if clock_margin is not None:
+                if clock_margin < 0.0:
+                    pace_pause_cap *= 0.62
+                elif clock_spendable_lead > 0.0:
+                    pace_pause_cap += min(1.25, clock_spendable_lead * 0.08)
+            pause_max = min(pause_max, max(0.0, pace_pause_cap))
         if remaining_time_seconds is not None:
             try:
                 remaining_clock = max(0.0, float(remaining_time_seconds))
@@ -745,6 +862,11 @@ def natural_bot_move_delay(
             )
         )
     )
+    if clock_margin is not None:
+        if clock_margin < 0.0:
+            eligibility *= 0.68
+        elif clock_spendable_lead > 0.0:
+            eligibility = min(BOT_THINK_ELIGIBILITY_MAX, eligibility * 1.10)
 
     if random.random() >= eligibility:
         return max(0.0, float(delay))
@@ -757,6 +879,16 @@ def natural_bot_move_delay(
         BOT_THINK_PAUSE_MAX,
         float(_thinking_budget_remaining)
     )
+    if clock_pace_seconds is not None:
+        # Complex positions may receive a longer thinking pause when the game
+        # clock supports it. Short controls naturally get a much smaller cap.
+        pace_pause_cap = clock_pace_seconds * 1.35
+        if clock_margin is not None:
+            if clock_margin < 0.0:
+                pace_pause_cap *= 0.62
+            elif clock_spendable_lead > 0.0:
+                pace_pause_cap += min(1.5, clock_spendable_lead * 0.10)
+        pause_max = min(pause_max, max(0.0, pace_pause_cap))
     if remaining_time_seconds is not None:
         try:
             remaining_clock = max(0.0, float(remaining_time_seconds))
