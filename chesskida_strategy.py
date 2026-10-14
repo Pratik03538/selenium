@@ -83,7 +83,7 @@ MATE_CLEANUP_MAX_REMAINING_PIECES = 1
 MATE_CLEANUP_MIN_VALUE = 1
 MIN_POSITIVE_CP = 5
 # Controlled eval tolerance for non-winning positions.
-LOSING_POSITION_MAX_DROP_CP = 70
+NON_ADVANTAGE_SELECTION_MAX_DROP_CP = 70
 MAX_CONSECUTIVE_RANK1_SELECTIONS = 2
 OPPONENT_ACCURACY_WINDOW = 12
 OPPONENT_MIN_SAMPLES = 5
@@ -117,8 +117,8 @@ _rank1_selection_streak = 0
 
 
 def _near_equal_selection_pool(candidates, best_cp, rank_cap):
-    """Build a bounded evaluation pool for the non-winning fallback."""
-    drop_cap = LOSING_POSITION_MAX_DROP_CP if best_cp < HUMAN_ADVANTAGE_START_CP else 20
+    """Build a bounded fallback pool: wider before a clear +4.0 advantage."""
+    drop_cap = NON_ADVANTAGE_SELECTION_MAX_DROP_CP if best_cp < HUMAN_ADVANTAGE_START_CP else 20
     floor_cp = best_cp - drop_cap
     pool = [candidate for candidate in candidates if candidate["cp"] >= floor_cp and candidate["rank"] <= rank_cap]
     return pool, floor_cp, drop_cap
