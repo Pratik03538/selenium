@@ -635,7 +635,9 @@ def natural_bot_move_delay(
     # Opening-book moves are already known; do not wait unnecessarily on the
     # first eight book selections. The site must still confirm the move.
     if is_opening_book_move and _bot_timing_move_count <= BOT_BOOK_INSTANT_MOVES:
-        # Opening-book moves remain fast, but no longer fire with a zero-second gap.
+        # A book choice is already prepared; keep it quick regardless of the
+        # larger discretionary allowance available in a long time control.
+        delay = min(base_delay, delay, 0.185)
         _last_bot_natural_delay = delay
         return max(0.010, float(delay))
 
@@ -826,6 +828,17 @@ def natural_bot_move_delay(
 
     if legal_count >= BOT_THINK_STRATEGIC_LEGAL_MOVES:
         signal_score += 0.14
+
+    # Include the overall position's calculated complexity so a genuinely
+    # difficult quiet decision can earn a little more thinking time. Tactical
+    # captures/checks still return through the fast path above.
+    try:
+        complexity = _timing_position_complexity(
+            board, move, engine_result=engine_result, selection_meta=selection_meta
+        )
+        signal_score += min(0.30, complexity * 0.35)
+    except Exception:
+        pass
 
     # Strongly forcing current moves are poor pause candidates.
     try:
