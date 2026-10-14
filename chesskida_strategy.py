@@ -725,6 +725,11 @@ def natural_bot_move_delay(
     if not thinking_enabled:
         return max(0.0, float(delay))
 
+    # Keep the regular short randomized delay, but do not add optional pauses
+    # when clocks are tied or we are behind.
+    if clock_margin is not None and clock_margin <= 0.0:
+        return max(0.0, float(delay))
+
     # Under 25s on our own clock, use quick moves and avoid discretionary pauses.
     if (
         own_clock is not None
@@ -1124,6 +1129,13 @@ def build_analysis(
             )
         )
 
+        next_reply_best_move = after_info.get("pv", [None])[0]
+        if next_reply_best_move not in after_board.legal_moves:
+            next_reply_best_move = None
+        next_reply_eval_cp = score_to_cp(
+            after_score_obj.pov(after_board.turn)
+        )
+
         pv = []
         temp = after_board.copy()
 
@@ -1163,6 +1175,12 @@ def build_analysis(
                 if best_move is not None
                 else "-"
             ),
+            "next_reply_best_move": (
+                next_reply_best_move.uci()
+                if next_reply_best_move is not None
+                else "-"
+            ),
+            "next_reply_eval_cp": next_reply_eval_cp,
             "depth": after_info.get(
                 "depth",
                 ANALYSIS_DEPTH
@@ -1240,6 +1258,16 @@ def opponent_recent_accuracy(
         weighted / total_weight,
         n
     )
+
+
+def opponent_quality_from_centipawn_loss(centipawn_loss):
+    """Map estimated centipawn loss to a bounded 0-100 move-quality score."""
+    try:
+        loss = max(0.0, min(400.0, float(centipawn_loss)))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(100.0, 100.0 - 0.25 * loss))
+
 
 def adaptive_accuracy_profile(
     opponent_accuracy,
