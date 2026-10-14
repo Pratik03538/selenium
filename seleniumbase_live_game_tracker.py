@@ -4852,6 +4852,7 @@ def main() -> int:
                                     )
                                 try:
                                     premove_cycle_started_at = time.monotonic()
+                                    print("[PREMOVE CHECK] Candidate analysis started", flush=True)
                                     premove_move, predicted_reply, premove_source = choose_premove_candidate(
                                         engine,
                                         engine_board,
@@ -4862,6 +4863,8 @@ def main() -> int:
                                         opponent_match_history=opponent_match_history,
                                         low_clock_mode=low_clock_premove_mode,
                                     )
+                                    premove_analysis_elapsed = time.monotonic() - premove_cycle_started_at
+                                    print("[PREMOVE CHECK] candidate=" + (premove_move.uci() if premove_move is not None else "none") + " | reason=" + str(premove_source) + " | analysis=" + format(premove_analysis_elapsed, ".3f") + "s", flush=True)
                                     if premove_move is None:
                                         print(
                                             f"[PREMOVE] Skipped ({premove_source}); normal turn handling remains enabled.",
