@@ -2110,9 +2110,9 @@ def choose_stockfish_move(
             }
         )
 
-    # Candidate scores are converted to the side-to-move perspective below.
-    # For this bot integration, the side-to-move must also be the verified bot side.
-    if bot_color is not None and board.turn != bot_color:
+    # Move preferences and evaluations are only meaningful for our verified side.
+    # Fail closed on an unknown/mismatched side; never silently select for the opponent.
+    if bot_color not in (chess.WHITE, chess.BLACK):
         return (
             None,
             None,
@@ -2120,7 +2120,18 @@ def choose_stockfish_move(
                 "rank": 0,
                 "current_cp": 0,
                 "selected_cp": 0,
-                "reason": "BOT COLOR GUARD | position is not the bot's turn"
+                "reason": "BOT COLOR GUARD | verified bot side is unknown"
+            }
+        )
+    if board.turn != bot_color:
+        return (
+            None,
+            None,
+            {
+                "rank": 0,
+                "current_cp": 0,
+                "selected_cp": 0,
+                "reason": "BOT COLOR GUARD | position is not the verified bot's turn"
             }
         )
 
