@@ -1,5 +1,6 @@
 """Regression tests for restored baseline move selection and bounded rank variety."""
 import unittest
+from unittest.mock import patch
 
 import chess
 import chesskida_strategy as strategy
@@ -15,6 +16,12 @@ class OpponentMoveQualityTests(unittest.TestCase):
     def test_quality_handles_negative_and_invalid_loss_safely(self):
         self.assertEqual(strategy.opponent_quality_from_centipawn_loss(-25), 100.0)
         self.assertIsNone(strategy.opponent_quality_from_centipawn_loss("unknown"))
+
+    def test_opponent_centipawn_loss_requires_comparable_numeric_scores(self):
+        self.assertEqual(strategy.opponent_move_centipawn_loss(100, 30), 70.0)
+        self.assertEqual(strategy.opponent_move_centipawn_loss(100, 130), 0.0)
+        self.assertIsNone(strategy.opponent_move_centipawn_loss(None, 30))
+        self.assertIsNone(strategy.opponent_move_centipawn_loss(100, "unknown"))
 
 
 class NearEqualRecoveryPoolTests(unittest.TestCase):
@@ -220,6 +227,21 @@ class FastClockProtectionTests(unittest.TestCase):
         )
         self.assertGreaterEqual(delay, 0.0)
         self.assertLessEqual(delay, 0.060)
+
+    def test_missing_own_clock_suppresses_optional_pause(self):
+        board = chess.Board()
+        move = chess.Move.from_uci("e2e4")
+        strategy._thinking_budget_remaining = None
+        with patch.object(strategy, "_sample_base_move_delay", return_value=0.8):
+            with patch("chesskida_strategy.random.uniform", return_value=0.1):
+                delay = strategy.natural_bot_move_delay(
+                    board, move, thinking_enabled=True,
+                    initial_time_seconds=None, remaining_time_seconds=None,
+                    opponent_time_seconds=None,
+                )
+        self.assertGreaterEqual(delay, 0.0)
+        self.assertLessEqual(delay, 0.22)
+        strategy._thinking_budget_remaining = None
 
 
 class RandomizedTimingTests(unittest.TestCase):
