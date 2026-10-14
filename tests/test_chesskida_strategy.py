@@ -209,5 +209,29 @@ class FastClockProtectionTests(unittest.TestCase):
         self.assertLessEqual(delay, 0.060)
 
 
+class BotSideGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.board = chess.Board()
+        self.move = chess.Move.from_uci("e2e4")
+        self.infos = [{
+            "pv": [self.move],
+            "score": chess.engine.PovScore(chess.engine.Cp(25), chess.WHITE),
+        }]
+
+    def test_selector_refuses_to_choose_for_opposite_color(self):
+        selected, _info, meta = strategy.choose_stockfish_move(
+            self.board, self.infos, bot_color=chess.BLACK
+        )
+        self.assertIsNone(selected)
+        self.assertIn("not the verified bot's turn", meta["reason"])
+
+    def test_selector_refuses_to_choose_when_bot_color_is_unknown(self):
+        selected, _info, meta = strategy.choose_stockfish_move(
+            self.board, self.infos, bot_color=None
+        )
+        self.assertIsNone(selected)
+        self.assertIn("verified bot side is unknown", meta["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()
