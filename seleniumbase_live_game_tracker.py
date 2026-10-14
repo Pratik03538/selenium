@@ -2453,6 +2453,11 @@ def main() -> int:
     except ValueError:
         clock_increment_seconds = 0.0
     clock_source_reported = False
+    low_clock_trigger_seconds = random.uniform(5.0, 10.0)
+    print(
+        f"[LOW CLOCK] Random late-clock threshold for this game: <= {low_clock_trigger_seconds:.2f}s.",
+        flush=True,
+    )
     try:
         handles = driver.window_handles
         candidates: list[tuple[int, str]] = []
@@ -2632,6 +2637,12 @@ def main() -> int:
                         and is_start_position(fen)
                         and not is_start_position(previous_fen)
                     )
+                    if is_new_game_snapshot:
+                        low_clock_trigger_seconds = random.uniform(5.0, 10.0)
+                        print(
+                            f"[LOW CLOCK] New game threshold sampled: <= {low_clock_trigger_seconds:.2f}s.",
+                            flush=True,
+                        )
                     if is_new_game_snapshot and configured_time_control_seconds is None:
                         initial_game_clock_seconds = None
                         clock_source_reported = False
@@ -2926,6 +2937,16 @@ def main() -> int:
                                         if engine_board.turn == chess.WHITE
                                         else black_clock_seconds
                                     )
+                                    low_clock_mode = (
+                                        remaining_clock_seconds is not None
+                                        and remaining_clock_seconds <= low_clock_trigger_seconds
+                                    )
+                                    if low_clock_mode:
+                                        print(
+                                            f"[LOW CLOCK] Active | own={remaining_clock_seconds:.2f}s "
+                                            f"| threshold={low_clock_trigger_seconds:.2f}s.",
+                                            flush=True,
+                                        )
                                     book_choice = book.choose(engine_board) if book is not None else None
 
                                     if book_choice is not None:
@@ -2986,6 +3007,7 @@ def main() -> int:
                                             opponent_pressure=opponent_pressure,
                                             engine=engine,
                                             bot_color=(active_bot_color == "white"),
+                                            low_clock_mode=low_clock_mode,
                                         )
                                         opponent_pressure = False
 
@@ -3012,13 +3034,10 @@ def main() -> int:
                                             isinstance(selection_meta, dict)
                                             and selection_meta.get("source") == "GM_BOOK"
                                         ),
+                                        low_clock_trigger_seconds=low_clock_trigger_seconds,
                                     )
                                     if natural_delay > 0:
-                                        mode_text = (
-                                            "LOW_CLOCK"
-                                            if remaining_clock_seconds is not None and remaining_clock_seconds <= 10.0
-                                            else "OWN_CLOCK"
-                                        )
+                                        mode_text = "LOW_CLOCK" if low_clock_mode else "OWN_CLOCK"
                                         print(
                                             f"[BOT TIMING] delay={natural_delay:.3f}s | mode={mode_text}"
                                             f" | own_clock={remaining_clock_seconds if remaining_clock_seconds is not None else 'unknown'}s.",
@@ -3092,10 +3111,15 @@ def main() -> int:
                                     white_clock_seconds if active_bot_color == "white"
                                     else black_clock_seconds
                                 )
-                                if bot_clock_for_premove is not None and bot_clock_for_premove <= 10.0:
+                                low_clock_premove_mode = (
+                                    bot_clock_for_premove is not None
+                                    and bot_clock_for_premove <= low_clock_trigger_seconds
+                                )
+                                if low_clock_premove_mode:
                                     print(
-                                        f"[PREMOVE] Low-clock priority active ({bot_clock_for_premove:.2f}s); "
-                                        "checking a legal/safety-guarded premove for this position.",
+                                        f"[PREMOVE] Random-threshold low-clock priority active "
+                                        f"({bot_clock_for_premove:.2f}s <= {low_clock_trigger_seconds:.2f}s); "
+                                        "checking safe capture/promotion conversion first.",
                                         flush=True,
                                     )
                                 try:
@@ -3107,6 +3131,7 @@ def main() -> int:
                                         args,
                                         book=book,
                                         opponent_match_history=opponent_match_history,
+                                        low_clock_mode=low_clock_premove_mode,
                                     )
                                     if premove_move is None:
                                         print(
