@@ -2959,9 +2959,12 @@ def main() -> int:
         )
     except ValueError:
         configured_time_control_seconds = None
-    initial_game_clock_seconds = configured_time_control_seconds
+    # Detect each match from its live start clocks. The TXT value is a fallback
+    # only when attaching to a game already in progress.
+    initial_game_clock_seconds = None
     raw_increment_setting = load_optional_txt_setting("clock_increment_seconds").strip()
-    clock_increment_is_configured = bool(raw_increment_setting)
+    raw_increment_fixed = load_optional_txt_setting("clock_increment_fixed").strip().lower()
+    clock_increment_is_configured = raw_increment_fixed in {"1", "true", "yes", "on", "enabled"}
     try:
         clock_increment_seconds = max(0.0, float(raw_increment_setting or 0.0))
     except ValueError:
@@ -3193,20 +3196,23 @@ def main() -> int:
                         and is_start_position(fen)
                         and not is_start_position(previous_fen)
                     )
-                    if is_new_game_snapshot:
+                    is_initial_start_snapshot = bool(
+                        fen and not previous_fen and is_start_position(fen)
+                    )
+                    if is_new_game_snapshot or is_initial_start_snapshot:
                         last_seen_clock_by_side = {"white": None, "black": None}
                         clock_increment_samples = []
                         if not clock_increment_is_configured:
                             clock_increment_seconds = 0.0
+                    if is_new_game_snapshot:
                         low_clock_trigger_seconds = random.uniform(7.0, 10.0)
                         print(
                             f"[LOW CLOCK] New game threshold sampled: <= {low_clock_trigger_seconds:.2f}s.",
                             flush=True,
                         )
-                    if is_new_game_snapshot and configured_time_control_seconds is None:
                         initial_game_clock_seconds = None
                         clock_source_reported = False
-                    if not clock_increment_is_configured and not is_new_game_snapshot:
+                    if not clock_increment_is_configured and not (is_new_game_snapshot or is_initial_start_snapshot):
                         for side_name, current_clock in (
                             ("white", white_clock_seconds),
                             ("black", black_clock_seconds),
@@ -3228,7 +3234,10 @@ def main() -> int:
                             if current_clock is not None:
                                 last_seen_clock_by_side[side_name] = float(current_clock)
                     if initial_game_clock_seconds is None and observed_clocks:
-                        initial_game_clock_seconds = max(observed_clocks)
+                        if is_start_position(fen) or configured_time_control_seconds is None:
+                            initial_game_clock_seconds = max(observed_clocks)
+                        else:
+                            initial_game_clock_seconds = configured_time_control_seconds
                     if not is_new_game_snapshot:
                         for side_name, current_clock in (
                             ("white", white_clock_seconds),
@@ -3247,8 +3256,8 @@ def main() -> int:
                         )
                     if observed_clocks and not clock_source_reported:
                         source_note = (
-                            "configured time-control value"
-                            if configured_time_control_seconds is not None
+                            "configured fallback (game already in progress)"
+                            if configured_time_control_seconds is not None and not is_start_position(fen)
                             else "first observed clock reading (estimate)"
                         )
                         print(
