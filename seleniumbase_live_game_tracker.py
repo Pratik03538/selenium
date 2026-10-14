@@ -2978,6 +2978,7 @@ def main() -> int:
     last_seen_clock_by_side = {"white": None, "black": None}
     clock_source_reported = False
     low_clock_trigger_seconds = random.uniform(7.0, 10.0)
+    short_control_fast_mode = False
     print(
         f"[LOW CLOCK] Random late-clock threshold for this game: <= {low_clock_trigger_seconds:.2f}s.",
         flush=True,
@@ -3152,7 +3153,7 @@ def main() -> int:
                         own_clock_for_poll = None
                     low_clock_polling_active = (
                         own_clock_for_poll is not None
-                        and own_clock_for_poll <= low_clock_trigger_seconds
+                        and (short_control_fast_mode or own_clock_for_poll <= low_clock_trigger_seconds)
                         and (args.clock_management or args.low_clock_extra_premoves)
                     )
                     if low_clock_polling_active != last_fast_polling_state:
@@ -3207,6 +3208,7 @@ def main() -> int:
                     if is_new_game_snapshot or is_initial_start_snapshot:
                         last_seen_clock_by_side = {"white": None, "black": None}
                         clock_increment_samples = []
+                        short_control_fast_mode = False
                         if not clock_increment_is_configured:
                             clock_increment_seconds = 0.0
                     if is_new_game_snapshot:
@@ -3243,6 +3245,17 @@ def main() -> int:
                             initial_game_clock_seconds = max(observed_clocks)
                         else:
                             initial_game_clock_seconds = configured_time_control_seconds
+                    # In a 10-second control, fast mode must start at the first
+                    # move instead of waiting for a random 7-10s threshold.
+                    if initial_game_clock_seconds is not None and not clock_source_reported:
+                        short_control_fast_mode = initial_game_clock_seconds <= 10.0
+                        if short_control_fast_mode:
+                            low_clock_trigger_seconds = 10.0
+                            print(
+                                "[CLOCK MODE] Short time control detected (<=10s): "
+                                "fast move handling and extra-premove attempts enabled from the start.",
+                                flush=True,
+                            )
                     if not is_new_game_snapshot:
                         for side_name, current_clock in (
                             ("white", white_clock_seconds),
@@ -3558,7 +3571,7 @@ def main() -> int:
                                     low_clock_mode = (
                                         args.clock_management
                                         and remaining_clock_seconds is not None
-                                        and remaining_clock_seconds <= low_clock_trigger_seconds
+                                        and (short_control_fast_mode or remaining_clock_seconds <= low_clock_trigger_seconds)
                                     )
                                     low_clock_total_budget_seconds = (
                                         random.choice((0.100, 0.125, 0.150))
@@ -3797,7 +3810,7 @@ def main() -> int:
                                 low_clock_premove_mode = (
                                     args.low_clock_extra_premoves
                                     and bot_clock_for_premove is not None
-                                    and bot_clock_for_premove <= low_clock_trigger_seconds
+                                    and (short_control_fast_mode or bot_clock_for_premove <= low_clock_trigger_seconds)
                                 )
                                 low_clock_premove_budget_seconds = (
                                     random.choice((0.100, 0.125, 0.150))
