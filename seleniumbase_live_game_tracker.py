@@ -4413,8 +4413,7 @@ def main() -> int:
                                         else white_clock_seconds
                                     )
                                     low_clock_mode = (
-                                        args.clock_management
-                                        and remaining_clock_seconds is not None
+                                        remaining_clock_seconds is not None
                                         and (short_control_fast_mode or remaining_clock_seconds <= low_clock_trigger_seconds)
                                     )
                                     low_clock_total_budget_seconds = (
@@ -4459,7 +4458,7 @@ def main() -> int:
                                                 increment_seconds=clock_increment_seconds,
                                                 board=engine_board,
                                             )
-                                            if args.clock_management
+                                            if remaining_clock_seconds is not None
                                             else max(0.005, min(float(args.engine_time), 5.0))
                                         )
                                         if remaining_clock_seconds is None:
@@ -4585,15 +4584,15 @@ def main() -> int:
                                         selection_meta=selection_meta,
                                         thinking_enabled=strategy_module.BOT_THINKING_ENABLED_DEFAULT,
                                         previous_eval_white_cp=previous_eval_white_cp,
-                                        initial_time_seconds=(initial_game_clock_seconds if args.clock_management else None),
-                                        remaining_time_seconds=(remaining_clock_seconds if args.clock_management else None),
-                                        opponent_time_seconds=(opponent_clock_seconds if args.clock_management else None),
-                                        increment_seconds=(clock_increment_seconds if args.clock_management else 0.0),
+                                        initial_time_seconds=initial_game_clock_seconds,
+                                        remaining_time_seconds=remaining_clock_seconds,
+                                        opponent_time_seconds=opponent_clock_seconds,
+                                        increment_seconds=clock_increment_seconds,
                                         is_opening_book_move=(
                                             isinstance(selection_meta, dict)
                                             and selection_meta.get("source") == "GM_BOOK"
                                         ),
-                                        low_clock_trigger_seconds=(low_clock_trigger_seconds if args.clock_management else 0.0),
+                                        low_clock_trigger_seconds=low_clock_trigger_seconds,
                                         low_clock_total_budget_seconds=low_clock_total_budget_seconds,
                                         elapsed_seconds_before_delay=time.monotonic() - move_cycle_started_at,
                                         submission_reserve_seconds=(
