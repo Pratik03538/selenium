@@ -1361,9 +1361,9 @@ def perform_cursor_drag(
     """Drag a legal move on the configured local/test board.
 
     Each move chooses new points inside the source and destination squares.
-    Pointer travel follows a short quadratic curve with an 8-90 ms travel
-    budget and a separate 0-25 ms pre-delay. Premove gestures are best-effort:
-    they are only considered queued when the site exposes an explicit signal.
+    Normal mode uses varied pointer travel and pre-delay; low-clock mode collapses
+    the gesture to a single 5-12 ms segment with no intentional pre-delay.
+    Premove gestures are best-effort and use explicit queue signals when exposed.
     """
     try:
         target = driver.execute_script(
@@ -1465,8 +1465,8 @@ def perform_cursor_drag(
     hover_ms = 0 if low_clock_mode else rng.randint(8, 25)
 
     try:
-        # Use W3C pointer actions so each curve segment can receive its own
-        # duration. Travel is 8-90 ms, plus short source positioning and hover.
+        # Use W3C pointer actions with per-segment timing. Low-clock mode
+        # removes optional positioning/hover waits and shortens the drag.
         if pre_delay_ms:
             time.sleep(pre_delay_ms / 1000.0)
 
@@ -1508,7 +1508,7 @@ def perform_cursor_drag(
 
     # Confirm the UI accepted this drag before reporting success.
     deadline = time.monotonic() + (
-        0.12 if low_clock_mode else (0.45 if allow_premove else 0.90)
+        0.04 if low_clock_mode else (0.45 if allow_premove else 0.90)
     )
     while time.monotonic() < deadline:
         try:
