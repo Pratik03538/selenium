@@ -1994,7 +1994,8 @@ def choose_stockfish_move(
         )
 
     if (
-        reference_cp is not None
+        not low_clock_mode
+        and reference_cp is not None
         and reference_cp >= FORCE_BEST_MIN_CP
         and not (
             best["mate"] is not None
