@@ -3624,6 +3624,21 @@ def main() -> int:
                             if last_move:
                                 last_move["game_ply"] = str(len(reconstructed_history) + 1)
                                 reconstructed_history.append(last_move)
+                                if settings_window is not None:
+                                    try:
+                                        observed_ply = (
+                                            chess.Board(fen).ply()
+                                            if chess is not None and fen
+                                            else len(reconstructed_history)
+                                        )
+                                        settings_window.record_observed_move(
+                                            game_number,
+                                            observed_ply,
+                                            last_move,
+                                            eval_white_cp=settings_window.last_eval_white_cp,
+                                        )
+                                    except Exception:
+                                        pass
                                 note = "Move reconstructed from consecutive FEN states"
                             elif is_start_position(fen) and not is_start_position(previous_fen):
                                 game_number += 1
@@ -3695,6 +3710,15 @@ def main() -> int:
                         except (ValueError, IndexError):
                             strategy_board = None
                             strategy_board_fen = ""
+
+                    if settings_window is not None and chess is not None and fen:
+                        try:
+                            dashboard_board = chess.Board(fen)
+                            settings_window.update_game_status(
+                                game_number, dashboard_board, bot_color=active_bot_color
+                            )
+                        except (ValueError, IndexError):
+                            pass
 
                     history_copy = [dict(item) for item in reconstructed_history]
                     writer.writerow({
@@ -3969,6 +3993,18 @@ def main() -> int:
                                         if not isinstance(engine_result, list):
                                             engine_result = [engine_result]
                                         best_info = engine_result[0] if engine_result else None
+                                        if settings_window is not None and best_info is not None:
+                                            try:
+                                                best_score = best_info.get("score")
+                                                if best_score is not None:
+                                                    current_eval_white_cp = strategy_module.score_to_cp(
+                                                        best_score.pov(chess.WHITE)
+                                                    )
+                                                    settings_window.update_evaluation(
+                                                        current_eval_white_cp, source="Stockfish"
+                                                    )
+                                            except Exception:
+                                                pass
 
                                         opponent_accuracy, opponent_sample_count = strategy_module.opponent_recent_accuracy(
                                             opponent_match_history
@@ -3998,6 +4034,49 @@ def main() -> int:
                                     rank = selection_meta.get("rank") if isinstance(selection_meta, dict) else None
                                     rank_text = f"#{int(rank) + 1}" if rank is not None else "FREE"
                                     reason = str(selection_meta.get("reason", "strategy selection")) if isinstance(selection_meta, dict) else "strategy selection"
+                                    pending_ply = engine_board.ply() + 1
+                                    selected_side = "white" if engine_board.turn == chess.WHITE else "black"
+                                    selected_eval_white_cp = None
+                                    selection_source = (
+                                        str(selection_meta.get("source", ""))
+                                        if isinstance(selection_meta, dict) else ""
+                                    )
+                                    if selection_source != "GM_BOOK" and isinstance(selected_info, dict):
+                                        try:
+                                            selected_score = selected_info.get("score")
+                                            if selected_score is not None:
+                                                selected_eval_white_cp = strategy_module.score_to_cp(
+                                                    selected_score.pov(chess.WHITE)
+                                                )
+                                        except Exception:
+                                            selected_eval_white_cp = None
+                                    if (
+                                        selected_eval_white_cp is None
+                                        and selection_source != "GM_BOOK"
+                                        and isinstance(selection_meta, dict)
+                                    ):
+                                        try:
+                                            selected_cp = selection_meta.get("selected_cp")
+                                            if selected_cp is not None:
+                                                selected_eval_white_cp = (
+                                                    int(selected_cp)
+                                                    if engine_board.turn == chess.WHITE
+                                                    else -int(selected_cp)
+                                                )
+                                        except (TypeError, ValueError):
+                                            pass
+                                    dashboard_rank = (
+                                        f"BOOK #{int(rank) + 1}"
+                                        if selection_source == "GM_BOOK" and rank is not None
+                                        else rank_text
+                                    )
+                                    if settings_window is not None:
+                                        settings_window.record_selected_move(
+                                            game_number, pending_ply, selected_side,
+                                            chosen_san, dashboard_rank,
+                                            eval_white_cp=selected_eval_white_cp,
+                                            status="Selected",
+                                        )
                                     print(f"[STRATEGY] selected={chosen_san} | rank={rank_text} | {reason}", flush=True)
 
                                     if low_clock_mode:
@@ -4065,6 +4144,10 @@ def main() -> int:
                                         if args.move_input == "cursor":
                                             print(f"[CURSOR] Drag accepted | travel={int(submit.get('drag_ms', 0))} ms | pre-delay={int(submit.get('pre_delay_ms', 0))} ms | waypoints={int(submit.get('waypoints', 0))}.", flush=True)
                                         print(f"[AUTO] Submitted selected move: {chosen_san} ({chosen_move.uci()}).", flush=True)
+                                        if settings_window is not None:
+                                            settings_window.update_move_status(
+                                                game_number, pending_ply, "Submitted"
+                                            )
 
                                         after_board = engine_board.copy(stack=True)
                                         after_board.push(chosen_move)
@@ -4088,6 +4171,11 @@ def main() -> int:
 
                                         if analysis_state:
                                             previous_eval_white_cp = analysis_state.get("eval_cp")
+                                            if settings_window is not None:
+                                                settings_window.update_evaluation(
+                                                    previous_eval_white_cp,
+                                                    source="After-move analysis",
+                                                )
                                             predicted = analysis_state.get("best_move")
                                             next_human_best_uci = predicted if predicted and predicted != "-" else None
                                         else:
@@ -4104,6 +4192,11 @@ def main() -> int:
                                                 f" | pre-delay={int(submit.get('pre_delay_ms', 0))} ms"
                                             )
                                         print(f"[AUTO] Move was not submitted ({reason}){detail}.", flush=True)
+                                        if settings_window is not None:
+                                            settings_window.update_move_status(
+                                                game_number, pending_ply,
+                                                f"Failed: {str(reason)[:28]}",
+                                            )
                                 except (chess.engine.EngineError, ValueError, WebDriverException, RuntimeError):
                                     print("[AUTO] Strategy calculation/submission failed; waiting for the next position.", flush=True)
                             elif (
