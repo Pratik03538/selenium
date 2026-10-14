@@ -11,7 +11,9 @@ from seleniumbase_live_game_tracker import (
     PREMOVE_OPENING_FULLMOVE_MIN,
     PREMOVE_OPENING_FULLMOVE_MAX,
     PlayerSideResolver,
+    MoveAttemptRetryGate,
     normalize_api_bot_color,
+    is_low_clock_mode,
     calculate_engine_search_limit,
     _DeadlineBoundEngine,
     _PremoveDeadlineExceeded,
@@ -70,7 +72,77 @@ class PlayerSideResolverTests(unittest.TestCase):
         self.assertEqual(normalize_api_bot_color(None, "black"), ("black", False))
 
 
+class MoveRetryGateTests(unittest.TestCase):
+    def test_retry_same_fen_only_after_backoff_and_with_bounded_attempts(self):
+        gate = MoveAttemptRetryGate()
+        self.assertTrue(gate.should_attempt("fen-A", now=0.0))
+        self.assertTrue(gate.begin("fen-A", now=0.0))
+        gate.finish({"ok": False, "reason": "temporary-submit-failure"})
+        self.assertFalse(gate.should_attempt("fen-A", now=0.19))
+        self.assertTrue(gate.should_attempt("fen-A", now=0.20))
+        self.assertTrue(gate.begin("fen-A", now=0.20))
+        gate.finish({"ok": False, "reason": "temporary-submit-failure"})
+        self.assertFalse(gate.should_attempt("fen-A", now=0.69))
+        self.assertTrue(gate.should_attempt("fen-A", now=0.70))
+        self.assertTrue(gate.begin("fen-A", now=0.70))
+        gate.finish({"ok": False, "reason": "temporary-submit-failure"})
+        self.assertFalse(gate.should_attempt("fen-A", now=10.0))
+
+    def test_accepted_but_unconfirmed_move_is_not_blindly_resubmitted(self):
+        gate = MoveAttemptRetryGate()
+        self.assertTrue(gate.begin("fen-A", now=0.0))
+        gate.finish({"ok": False, "api_accepted": True, "reason": "api-move-not-confirmed"})
+        self.assertFalse(gate.should_attempt("fen-A", now=100.0))
+
+    def test_confirmed_success_does_not_retry_same_fen(self):
+        gate = MoveAttemptRetryGate()
+        self.assertTrue(gate.begin("fen-A", now=0.0))
+        gate.finish({"ok": True, "confirmed": True})
+        self.assertFalse(gate.should_attempt("fen-A", now=100.0))
+
+    def test_new_fen_resets_retry_budget(self):
+        gate = MoveAttemptRetryGate()
+        self.assertTrue(gate.begin("fen-A", now=0.0))
+        gate.finish({"ok": False})
+        self.assertTrue(gate.begin("fen-B", now=0.1))
+        self.assertEqual(gate.attempts, 1)
+
+
 class LateClockAndPremoveSafetyTests(unittest.TestCase):
+    def test_clock_mode_uses_the_same_sampled_boundary_everywhere(self):
+        self.assertFalse(is_low_clock_mode(8.5, 7.5))
+        self.assertTrue(is_low_clock_mode(7.5, 7.5))
+        self.assertTrue(is_low_clock_mode(8.5, 7.5, force_fast_mode=True))
+        self.assertFalse(is_low_clock_mode(None, 7.5, force_fast_mode=True))
+
+    def test_missing_clock_uses_conservative_engine_budget(self):
+        limit = calculate_engine_search_limit(
+            base_seconds=0.75, remaining_seconds=None, initial_seconds=None,
+            increment_seconds=0.0, board=chess.Board(),
+        )
+        self.assertEqual(limit, 0.05)
+
+    def test_engine_search_uses_sampled_clock_boundary_not_fixed_ten(self):
+        board = chess.Board()
+        common = dict(
+            base_seconds=5.0, remaining_seconds=8.5, initial_seconds=60.0,
+            increment_seconds=0.0, board=board,
+        )
+        with patch("seleniumbase_live_game_tracker.random.uniform", return_value=0.28):
+            normal_path = calculate_engine_search_limit(
+                **common, low_clock_trigger_seconds=7.5
+            )
+            low_clock_path = calculate_engine_search_limit(
+                **common, low_clock_trigger_seconds=9.0
+            )
+            forced_short_control = calculate_engine_search_limit(
+                **{**common, "remaining_seconds": 11.0},
+                low_clock_trigger_seconds=7.5, force_fast_mode=True,
+            )
+        self.assertGreater(normal_path, 0.035)
+        self.assertLessEqual(low_clock_path, 0.035)
+        self.assertLessEqual(forced_short_control, 0.035)
+
     def test_engine_search_is_capped_at_35_ms_with_7_to_10_seconds_left(self):
         board = chess.Board()
         for remaining in (7.0, 8.0, 9.0, 10.0):
@@ -100,6 +172,19 @@ class LateClockAndPremoveSafetyTests(unittest.TestCase):
         with patch("seleniumbase_live_game_tracker.random.uniform", return_value=0.28):
             level = calculate_engine_search_limit(**common, opponent_seconds=45.0)
         self.assertLess(behind, level)
+
+    def test_premove_deadline_reserves_cleanup_window_before_engine_call(self):
+        class FakeEngine:
+            called = False
+            def analyse(self, *_args, **_kwargs):
+                self.called = True
+                return {}
+
+        engine = FakeEngine()
+        proxy = _DeadlineBoundEngine(engine, time.monotonic() + 0.005)
+        with self.assertRaises(_PremoveDeadlineExceeded):
+            proxy.analyse(chess.Board(), chess.engine.Limit(time=0.1, depth=8))
+        self.assertFalse(engine.called)
 
     def test_expired_premove_deadline_never_calls_engine(self):
         class FakeEngine:
