@@ -3092,7 +3092,7 @@ def main() -> int:
                                         low_clock_total_budget_seconds=low_clock_total_budget_seconds,
                                         elapsed_seconds_before_delay=time.monotonic() - move_cycle_started_at,
                                         submission_reserve_seconds=(
-                                            0.045 if args.move_input == "cursor" else 0.020
+                                            0.075 if args.move_input == "cursor" else 0.035
                                         ),
                                     )
                                     if natural_delay > 0:
@@ -3117,6 +3117,14 @@ def main() -> int:
                                             chosen_move.uci(), fen,
                                         )
                                     if isinstance(submit, dict) and submit.get("ok"):
+                                        if low_clock_mode:
+                                            move_elapsed = time.monotonic() - move_cycle_started_at
+                                            print(
+                                                f"[MOVE BUDGET] target={low_clock_total_budget_seconds:.3f}s "
+                                                f"end-to-end={move_elapsed:.3f}s "
+                                                f"overrun={max(0.0, move_elapsed - low_clock_total_budget_seconds):.3f}s.",
+                                                flush=True,
+                                            )
                                         if args.move_input == "cursor":
                                             print(f"[CURSOR] Drag accepted | travel={int(submit.get('drag_ms', 0))} ms | pre-delay={int(submit.get('pre_delay_ms', 0))} ms | waypoints={int(submit.get('waypoints', 0))}.", flush=True)
                                         print(f"[AUTO] Submitted selected move: {chosen_san} ({chosen_move.uci()}).", flush=True)
@@ -3222,7 +3230,7 @@ def main() -> int:
                                         chosen_premove_uci = premove_move.uci()
                                         wait_for_manual_verification(driver, allowed_host, cfg)
                                         if low_clock_premove_mode:
-                                            reserve = 0.045 if args.move_input == "cursor" else 0.020
+                                            reserve = 0.075 if args.move_input == "cursor" else 0.035
                                             elapsed = time.monotonic() - premove_cycle_started_at
                                             wait_remaining = max(
                                                 0.0,
@@ -3253,6 +3261,14 @@ def main() -> int:
                                                 active_bot_color,
                                             )
                                         if isinstance(premove_submit, dict) and premove_submit.get("ok"):
+                                            if low_clock_premove_mode:
+                                                premove_elapsed = time.monotonic() - premove_cycle_started_at
+                                                print(
+                                                    f"[PREMOVE BUDGET] target={low_clock_premove_budget_seconds:.3f}s "
+                                                    f"end-to-end={premove_elapsed:.3f}s "
+                                                    f"overrun={max(0.0, premove_elapsed - low_clock_premove_budget_seconds):.3f}s.",
+                                                    flush=True,
+                                                )
                                             if premove_submit.get("premove_confirmed"):
                                                 confirmation = f"confirmed via {premove_submit.get('premove_source', 'site status')}"
                                             elif premove_submit.get("confirmed"):
