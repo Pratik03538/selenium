@@ -79,5 +79,35 @@ class RankOneStreakTests(unittest.TestCase):
         self.assertEqual(strategy._rank1_selection_streak, 0)
 
 
+class LosingPositionIntegrationTests(unittest.TestCase):
+    def test_selector_can_choose_near_best_alternative_after_rank_one_streak(self):
+        board = chess.Board()
+        board.push_san("e4")
+        board.push_san("e5")
+        moves = [
+            chess.Move.from_uci("g1f3"),
+            chess.Move.from_uci("d2d4"),
+            chess.Move.from_uci("f1c4"),
+            chess.Move.from_uci("b1c3"),
+        ]
+        scores_cp = [-500, -520, -540, -565]
+        multipv_infos = [
+            {
+                "pv": [move],
+                "score": chess.engine.PovScore(chess.engine.Cp(cp), board.turn),
+            }
+            for move, cp in zip(moves, scores_cp)
+        ]
+
+        strategy._rank1_selection_streak = 2
+        selected_move, _selected_info, meta = strategy.choose_stockfish_move(
+            board, multipv_infos, bot_color=board.turn
+        )
+
+        self.assertIn(selected_move, moves)
+        self.assertGreater(meta["rank"], 0)
+        self.assertLessEqual(meta["current_cp"] - meta["selected_cp"], 70)
+
+
 if __name__ == "__main__":
     unittest.main()
