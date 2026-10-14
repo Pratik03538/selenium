@@ -184,6 +184,262 @@ def load_optional_txt_setting(setting_key: str) -> str:
     return ""
 
 
+
+class RuntimeSettingsWindow:
+    """Live Tk settings for the current run; callbacks run on the reader thread."""
+
+    LABELS = {
+        "auto_play": "BOT",
+        "auto_next_game": "NEW MATCH",
+        "auto_rematch": "REMATCH",
+        "premove_enabled": "NORMAL PREMOVES",
+        "low_clock_extra_premoves": "LAST 7–10s EXTRA PREMOVES",
+        "clock_management": "CLOCK-BASED TIME MANAGEMENT",
+    }
+
+    def __init__(self, args, driver, allowed_host, cfg, chosen_handle):
+        import tkinter as tk
+        from tkinter import messagebox
+
+        self.tk = tk
+        self.messagebox = messagebox
+        self.args = args
+        self.driver = driver
+        self.allowed_host = allowed_host
+        self.cfg = cfg
+        self.chosen_handle = chosen_handle
+        self.stop_requested = False
+        self.buttons = {}
+        self.settings = {
+            key: bool(getattr(args, key))
+            for key in self.LABELS
+        }
+
+        self.root = tk.Tk()
+        self.root.title("Live Chess Bot — Runtime Controls")
+        self.root.geometry("470x470")
+        self.root.minsize(430, 430)
+        self.root.configure(padx=14, pady=12)
+        self.root.protocol("WM_DELETE_WINDOW", self.request_close)
+
+        tk.Label(
+            self.root, text="LIVE SETTINGS",
+            font=("Segoe UI", 16, "bold"), anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            self.root, text="Switch controls while the reader keeps running.",
+            font=("Segoe UI", 9), anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+
+        controls = tk.Frame(self.root)
+        controls.pack(fill="x", expand=False)
+        for key in self.LABELS:
+            button = tk.Button(
+                controls,
+                text="",
+                font=("Segoe UI", 10, "bold"),
+                anchor="w",
+                padx=10,
+                pady=7,
+                command=lambda setting=key: self.toggle(setting),
+            )
+            button.pack(fill="x", pady=3)
+            self.buttons[key] = button
+            self.refresh_button(key)
+
+        tk.Label(
+            self.root,
+            text="If both game actions are ON, Rematch is preferred when available; "
+                 "otherwise New Match may be used.",
+            font=("Segoe UI", 8), justify="left",
+            wraplength=435, anchor="w",
+        ).pack(fill="x", pady=(7, 5))
+
+        self.clock_status = tk.StringVar(
+            value="Clock: waiting for a valid board/clock reading..."
+        )
+        tk.Label(
+            self.root, textvariable=self.clock_status,
+            font=("Consolas", 9), justify="left",
+            anchor="w", wraplength=435,
+        ).pack(fill="x", pady=(3, 5))
+
+        self.status = tk.StringVar(
+            value="Public competitive hosts remain blocked by blocked_platforms.txt."
+        )
+        tk.Label(
+            self.root, textvariable=self.status,
+            font=("Segoe UI", 8), justify="left",
+            anchor="w", wraplength=435,
+        ).pack(fill="x", pady=(2, 0))
+
+        tk.Label(
+            self.root,
+            text="Closing this window asks whether to stop the reader. Toggles apply to this run.",
+            font=("Segoe UI", 8, "italic"),
+            anchor="w", wraplength=435, justify="left",
+        ).pack(fill="x", pady=(7, 0))
+
+    def enabled(self, key):
+        return bool(self.settings.get(key, False))
+
+    def refresh_button(self, key):
+        enabled = self.enabled(key)
+        self.buttons[key].configure(
+            text=f"{self.LABELS[key]}: {'ON' if enabled else 'OFF'}",
+            bg="#16794b" if enabled else "#5b6472",
+            fg="white",
+            activebackground="#12613d" if enabled else "#434b57",
+            activeforeground="white",
+        )
+
+    def toggle(self, key):
+        self.settings[key] = not self.settings[key]
+        setattr(self.args, key, self.settings[key])
+        self.refresh_button(key)
+        state = "ON" if self.settings[key] else "OFF"
+        print(f"[SETTINGS] {self.LABELS[key]} -> {state}.", flush=True)
+        if key in {"auto_next_game", "auto_rematch"}:
+            self.sync_game_actions()
+        if key == "auto_play" and self.settings[key]:
+            self.status.set("Bot enabled. It will start after required engine checks pass.")
+        elif key == "auto_play":
+            self.status.set("Bot is OFF; the read-only tracker remains active.")
+
+    def set_enabled(self, key, value):
+        self.settings[key] = bool(value)
+        setattr(self.args, key, bool(value))
+        self.refresh_button(key)
+
+    def sync_game_actions(self):
+        try:
+            if self.chosen_handle not in self.driver.window_handles:
+                self.status.set("Selected browser tab is unavailable; game actions were not changed.")
+                return
+            self.driver.switch_to.window(self.chosen_handle)
+            check_target(self.driver.current_url, self.allowed_host)
+            result = self.driver.execute_script(
+                "return window.__ownedSiteGameActions "
+                "? window.__ownedSiteGameActions.setConfig(arguments[0]) "
+                ": {installed:false};",
+                {
+                    "autoNextGame": self.enabled("auto_next_game"),
+                    "autoRematch": self.enabled("auto_rematch"),
+                },
+            )
+            if isinstance(result, dict) and result.get("installed"):
+                self.status.set("Game-action toggles applied to the selected allowed site.")
+            else:
+                self.status.set("Game-action handler is not ready; check the console log.")
+        except Exception:
+            self.status.set("Could not update game-action handler; site details were not logged.")
+
+    def update_clock_status(
+        self, white_clock, black_clock, base_seconds, increment_seconds,
+        low_clock_threshold, bot_color=None
+    ):
+        def fmt(value):
+            if value is None:
+                return "?"
+            seconds = max(0, int(float(value)))
+            return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+        base = "?" if base_seconds is None else f"{float(base_seconds):.0f}s"
+        increment = f"{float(increment_seconds or 0.0):.2f}s"
+        side = (bot_color or "?").capitalize()
+        own = white_clock if bot_color == "white" else black_clock if bot_color == "black" else None
+        self.clock_status.set(
+            f"White {fmt(white_clock)}  |  Black {fmt(black_clock)}\n"
+            f"Your side: {side}  |  Your clock: {fmt(own)}\n"
+            f"Base time (estimated/configured): {base}  |  Increment: {increment}\n"
+            f"Extra low-clock threshold: {float(low_clock_threshold):.1f}s"
+        )
+
+    def request_close(self):
+        if self.messagebox.askyesno(
+            "Stop reader?",
+            "Close this window and stop the live reader/bot? Select No to keep controls open.",
+            parent=self.root,
+        ):
+            self.stop_requested = True
+            try:
+                self.root.destroy()
+            except self.tk.TclError:
+                pass
+
+    def pump(self):
+        if self.stop_requested:
+            return
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except self.tk.TclError:
+            self.stop_requested = True
+
+    def responsive_sleep(self, seconds):
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while not self.stop_requested:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.pump()
+            time.sleep(min(0.025, max(0.001, remaining)))
+
+
+def prepare_bot_components(args, allowed_host, installed):
+    """Initialize the optional bot only for the configured, non-blocked site."""
+    if chess is None:
+        raise RuntimeError(
+            "Autoplay requires python-chess. Install with: python -m pip install python-chess"
+        )
+    if is_public_competitive_host(allowed_host):
+        raise RuntimeError("Autoplay is disabled for public competitive chess platforms.")
+    if not installed.get("boardFound") or not installed.get("gameApiFound"):
+        raise RuntimeError("Autoplay needs the site's exposed board game API.")
+    try:
+        import chesskida_strategy as strategy_module
+        from gm_book import GMBook
+    except ImportError as exc:
+        raise RuntimeError(
+            "ChessKida strategy files are missing. Pull the current working branch and install requirements."
+        ) from exc
+
+    configured_engine_path = (
+        args.stockfish_path.strip()
+        or load_optional_txt_setting("stockfish_path")
+        or "stockfish.exe"
+    )
+    engine_path = Path(configured_engine_path).expanduser()
+    if not engine_path.is_absolute():
+        engine_path = (BASE_DIR / engine_path).resolve()
+    if not engine_path.is_file():
+        raise RuntimeError(
+            "Stockfish executable was not found. Set stockfish_path in the TXT settings or use --stockfish-path."
+        )
+    try:
+        engine = chess.engine.SimpleEngine.popen_uci(str(engine_path))
+        engine.configure({"Threads": 2, "Hash": 128})
+    except Exception as exc:
+        raise RuntimeError("Stockfish could not be started or configured. Check the configured executable.") from exc
+
+    book = GMBook(BASE_DIR / "Ultimate_GM_Bullet.bin")
+    if book.load():
+        print("[BOOK] Opening book loaded.", flush=True)
+    else:
+        print("[BOOK] Opening book unavailable; using Stockfish strategy.", flush=True)
+    print("[AUTO] ChessKida move-selection behavior enabled for the configured, non-blocked test site.", flush=True)
+    if args.move_input == "cursor":
+        print("[INPUT] Cursor drag mode enabled for the configured test board; public competitive hosts remain blocked.", flush=True)
+    else:
+        print("[INPUT] Direct game API mode enabled.", flush=True)
+    print(
+        f"[ENGINE] Threads=2 | Hash=128 MB | depth=12 | "
+        f"MultiPV=15 | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s.",
+        flush=True,
+    )
+    return engine, book, strategy_module
+
+
 def host_for(url: str | None) -> str:
     if not isinstance(url, str) or not url.strip():
         return ""
@@ -1226,10 +1482,14 @@ def is_start_position(fen: str) -> bool:
 
 
 JS_INSTALL_AUTO_NEXT_GAME = r"""
-const cfg = arguments[0] || {};
+const initial = arguments[0] || {};
 return (() => {
-  try { window.__ownedSiteAutoNextGame?.observer?.disconnect?.(); } catch (_) {}
+  try { window.__ownedSiteGameActions?.observer?.disconnect?.(); } catch (_) {}
   let handled = null, timer = null;
+  const settings = {
+    autoNextGame: !!initial.autoNextGame,
+    autoRematch: !!initial.autoRematch
+  };
   const visible = e => !!e && e.isConnected && e.getClientRects().length > 0 &&
     getComputedStyle(e).display !== "none" && getComputedStyle(e).visibility !== "hidden" &&
     Number(getComputedStyle(e).opacity || 1) > 0;
@@ -1237,9 +1497,11 @@ return (() => {
     .replace(/\s+/g, " ").trim();
   const terminalText = /game\s*over|checkmate|stalemate|draw|wins?|won|resign(?:ed|ation)?|timeout|time\s*out|flag\s*fall|1-0|0-1|1\/2-1\/2/i;
   const buttonSelector = "button,[role='button'],input[type='button'],input[type='submit']";
-  const isUsableNewButton = e => visible(e) && !e.disabled &&
-    e.getAttribute("aria-disabled") !== "true" &&
+  const usable = e => visible(e) && !e.disabled &&
+    e.getAttribute("aria-disabled") !== "true";
+  const isUsableNewButton = e => usable(e) &&
     /^New(?:\s|$)/i.test(label(e)) && !/\bRematch\b/i.test(label(e));
+  const isUsableRematchButton = e => usable(e) && /\bRematch\b/i.test(label(e));
   function findGameOverRoot() {
     const explicitSelectors = [
       ".game-over-modal-shell-container",
@@ -1259,7 +1521,7 @@ return (() => {
       } catch (_) {}
     }
     try {
-      const resultSelector = String(cfg.resultSelector || "#game-result, [data-result]");
+      const resultSelector = String(initial.resultSelector || "#game-result, [data-result]");
       for (const el of document.querySelectorAll(resultSelector)) {
         if (visible(el) && !roots.includes(el)) roots.push(el);
       }
@@ -1271,13 +1533,36 @@ return (() => {
       });
       if (!explicitGameOver && !terminalText.test(txt)) continue;
       if (root.querySelectorAll(buttonSelector).length > 0) return root;
-      if (terminalText.test(txt) && [...document.querySelectorAll(buttonSelector)].some(isUsableNewButton)) {
-        return document.body;
-      }
+      if (terminalText.test(txt) && [...document.querySelectorAll(buttonSelector)].some(
+        e => isUsableNewButton(e) || isUsableRematchButton(e)
+      )) return document.body;
+    }
+    return null;
+  }
+  function findActionButton(root) {
+    if (!root || (!settings.autoNextGame && !settings.autoRematch)) return null;
+    const localButtons = [...root.querySelectorAll(buttonSelector)];
+    const globalButtons = [...document.querySelectorAll(buttonSelector)];
+    const pool = localButtons.length ? localButtons : globalButtons;
+    const rematch = pool.filter(isUsableRematchButton);
+    const newGame = pool.filter(isUsableNewButton);
+    if (settings.autoRematch && rematch.length) return rematch[0];
+    if (settings.autoNextGame && newGame.length) {
+      return newGame.find(e => /^New\s+1\s+min$/i.test(label(e))) || newGame[0];
+    }
+    if (settings.autoNextGame) {
+      const fallback = globalButtons.filter(isUsableNewButton);
+      return fallback.find(e => /^New\s+1\s+min$/i.test(label(e))) || fallback[0] || null;
     }
     return null;
   }
   function check() {
+    if (!settings.autoNextGame && !settings.autoRematch) {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      handled = null;
+      return;
+    }
     const root = findGameOverRoot();
     if (!root) {
       handled = null;
@@ -1286,22 +1571,21 @@ return (() => {
       return;
     }
     if (handled === root || timer !== null) return;
+    if (!findActionButton(root)) return;
     handled = root;
     const delay = 2000 + Math.floor(Math.random() * 3001);
-    console.info("[AUTO NEXT GAME] Scheduled in " + (delay / 1000).toFixed(2) + "s.");
+    console.info("[AUTO GAME] Action scheduled in " + (delay / 1000).toFixed(2) + "s.");
     timer = setTimeout(() => {
       timer = null;
       if (findGameOverRoot() !== root || !visible(root)) return;
-      const localButtons = [...root.querySelectorAll(buttonSelector)];
-      const buttons = localButtons.some(isUsableNewButton)
-        ? localButtons.filter(isUsableNewButton)
-        : [...document.querySelectorAll(buttonSelector)].filter(isUsableNewButton);
-      const button = buttons.find(e => /^New\s+1\s+min$/i.test(label(e))) || buttons[0];
+      const button = findActionButton(root);
       if (!button) {
-        console.warn("[AUTO NEXT GAME] No enabled New/New Game button found; Rematch will not be clicked.");
+        handled = null;
+        console.warn("[AUTO GAME] No enabled action matching current toggles; no click performed.");
         return;
       }
-      console.info("[AUTO NEXT GAME] Clicking New-game button.");
+      const action = isUsableRematchButton(button) ? "Rematch" : "New Match";
+      console.info("[AUTO GAME] Clicking enabled " + action + " button.");
       button.click();
     }, delay);
   }
@@ -1309,14 +1593,34 @@ return (() => {
   observer.observe(document.documentElement || document.body, {
     childList: true, subtree: true, characterData: true, attributes: true
   });
-  window.__ownedSiteAutoNextGame = {
+  window.__ownedSiteGameActions = {
     observer,
-    stop() { try { observer.disconnect(); } catch (_) {} if (timer !== null) clearTimeout(timer); timer = null; handled = null; }
+    setConfig(next) {
+      if (next && typeof next === "object") {
+        settings.autoNextGame = !!next.autoNextGame;
+        settings.autoRematch = !!next.autoRematch;
+      }
+      handled = null;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      check();
+      return {
+        installed: true,
+        autoNextGame: settings.autoNextGame,
+        autoRematch: settings.autoRematch
+      };
+    },
+    stop() {
+      try { observer.disconnect(); } catch (_) {}
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      handled = null;
+    }
   };
   check();
-  return {installed: true};
+  return {installed: true, autoNextGame: settings.autoNextGame, autoRematch: settings.autoRematch};
 })();
-"""
+""";
 
 _CLOCK_MMSS_RE = re.compile(r"^(\d+):([0-5]?\d)(?:\.(\d+))?$")
 _CLOCK_HHMMSS_RE = re.compile(r"^(\d+):([0-5]?\d):([0-5]?\d)(?:\.(\d+))?$")
@@ -2465,7 +2769,22 @@ def main() -> int:
             next_setting in {"1", "true", "yes", "on", "enabled"}
             if next_setting else True
         )
-    print(f"[CONFIG] Automatic next game: {'enabled' if args.auto_next_game else 'disabled'}.", flush=True)
+    print(f"[CONFIG] Automatic new match: {'enabled' if args.auto_next_game else 'disabled'}.", flush=True)
+    raw_rematch_setting = load_optional_txt_setting("auto_rematch").strip().lower()
+    args.auto_rematch = raw_rematch_setting in {"1", "true", "yes", "on", "enabled"}
+    raw_extra_premove_setting = load_optional_txt_setting("low_clock_extra_premoves").strip().lower()
+    args.low_clock_extra_premoves = (
+        raw_extra_premove_setting in {"1", "true", "yes", "on", "enabled"}
+        if raw_extra_premove_setting else True
+    )
+    raw_clock_management_setting = load_optional_txt_setting("clock_management").strip().lower()
+    args.clock_management = (
+        raw_clock_management_setting in {"1", "true", "yes", "on", "enabled"}
+        if raw_clock_management_setting else True
+    )
+    print(f"[CONFIG] Automatic rematch: {'enabled' if args.auto_rematch else 'disabled'}.", flush=True)
+    print(f"[CONFIG] Low-clock extra premoves: {'enabled' if args.low_clock_extra_premoves else 'disabled'}.", flush=True)
+    print(f"[CONFIG] Clock-based time management: {'enabled' if args.clock_management else 'disabled'}.", flush=True)
     if args.allowed_domain.strip():
         allowed_host = normalize_host(args.allowed_domain)
         settings_source = "command-line settings"
@@ -2629,12 +2948,14 @@ def main() -> int:
     except ValueError:
         configured_time_control_seconds = None
     initial_game_clock_seconds = configured_time_control_seconds
+    raw_increment_setting = load_optional_txt_setting("clock_increment_seconds").strip()
+    clock_increment_is_configured = bool(raw_increment_setting)
     try:
-        clock_increment_seconds = max(
-            0.0, float(load_optional_txt_setting("clock_increment_seconds") or 0.0)
-        )
+        clock_increment_seconds = max(0.0, float(raw_increment_setting or 0.0))
     except ValueError:
         clock_increment_seconds = 0.0
+    clock_increment_samples = []
+    last_seen_clock_by_side = {"white": None, "black": None}
     clock_source_reported = False
     low_clock_trigger_seconds = random.uniform(7.0, 10.0)
     print(
@@ -2672,11 +2993,17 @@ def main() -> int:
         driver.switch_to.window(chosen_handle)
         check_target(driver.current_url, allowed_host)
         installed = driver.execute_script(JS_INSTALL_OBSERVER, cfg)
-        if args.auto_next_game:
-            next_state = driver.execute_script(JS_INSTALL_AUTO_NEXT_GAME, cfg)
-            if not isinstance(next_state, dict) or not next_state.get("installed"):
-                raise RuntimeError("Could not install the next-game handler.")
-            print("[AUTO NEXT GAME] Installed: 2-5 second delay; clicks New only, never Rematch.", flush=True)
+        next_state = driver.execute_script(
+            JS_INSTALL_AUTO_NEXT_GAME,
+            {
+                **cfg,
+                "autoNextGame": args.auto_next_game,
+                "autoRematch": args.auto_rematch,
+            },
+        )
+        if not isinstance(next_state, dict) or not next_state.get("installed"):
+            raise RuntimeError("Could not install the game-action handler.")
+        print("[AUTO GAME] Live action handler installed; New Match and Rematch can be toggled in the settings window.", flush=True)
         print("[CONNECTED] Selected browser tab.", flush=True)
         print(
             f"[BOARD] found={installed.get('boardFound')} | "
@@ -2697,43 +3024,7 @@ def main() -> int:
             print("[NOTE] Board found, but the game API methods are not accessible.", flush=True)
 
         if args.auto_play:
-            if chess is None:
-                raise RuntimeError("Autoplay requires python-chess. Install with: python -m pip install python-chess")
-            if is_public_competitive_host(allowed_host):
-                raise RuntimeError("Autoplay is disabled for public competitive chess platforms.")
-            if not installed.get("boardFound") or not installed.get("gameApiFound"):
-                raise RuntimeError("Autoplay needs the site's exposed board game API.")
-            try:
-                import chesskida_strategy as strategy_module
-                from gm_book import GMBook
-            except ImportError as exc:
-                raise RuntimeError("ChessKida strategy files are missing. Pull the current working branch and install requirements.") from exc
-
-            configured_engine_path = args.stockfish_path.strip() or load_optional_txt_setting("stockfish_path") or "stockfish.exe"
-            engine_path = Path(configured_engine_path).expanduser()
-            if not engine_path.is_absolute():
-                engine_path = (BASE_DIR / engine_path).resolve()
-            if not engine_path.is_file():
-                raise RuntimeError("Stockfish executable was not found. Set stockfish_path in the TXT settings or use --stockfish-path.")
-            try:
-                engine = chess.engine.SimpleEngine.popen_uci(str(engine_path))
-                engine.configure({"Threads": 2, "Hash": 128})
-            except Exception as exc:
-                raise RuntimeError("Stockfish could not be started or configured. Check the configured executable.") from exc
-
-            # The opening book stays local-only; .gitignore keeps the binary out of GitHub.
-            book = GMBook(BASE_DIR / "Ultimate_GM_Bullet.bin")
-            if book.load():
-                print("[BOOK] Opening book loaded.", flush=True)
-            else:
-                print("[BOOK] Opening book unavailable; using Stockfish strategy.", flush=True)
-
-            print("[AUTO] ChessKida move-selection behavior enabled for the configured, non-blocked test site.", flush=True)
-            if args.move_input == "cursor":
-                print("[INPUT] Cursor drag mode enabled for the configured test board; public competitive hosts remain blocked.", flush=True)
-            else:
-                print("[INPUT] Direct game API mode enabled.", flush=True)
-            print(f"[ENGINE] Threads=2 | Hash=128 MB | depth=12 | MultiPV=15 | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s.", flush=True)
+            engine, book, strategy_module = prepare_bot_components(args, allowed_host, installed)
 
         csv_path = Path(args.csv).expanduser().resolve()
         csv_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2754,7 +3045,43 @@ def main() -> int:
             last_clock_signature = None
             last_fast_polling_state = None
             low_clock_polling_active = False
+            settings_window = None
+            try:
+                settings_window = RuntimeSettingsWindow(
+                    args, driver, allowed_host, cfg, chosen_handle
+                )
+                print("[GUI] Live settings window opened. Switches apply without restarting.", flush=True)
+            except Exception:
+                print("[GUI] Runtime settings window could not be opened; continuing with TXT/CLI settings.", flush=True)
+
             while True:
+                if settings_window is not None:
+                    settings_window.pump()
+                    if settings_window.stop_requested:
+                        print("[STOP] Stop requested from runtime settings window.", flush=True)
+                        break
+                # If Bot was OFF at startup, initialize the engine only when it is switched ON.
+                if args.auto_play and engine is None:
+                    try:
+                        if chosen_handle not in driver.window_handles:
+                            raise RuntimeError("Selected browser tab is unavailable.")
+                        driver.switch_to.window(chosen_handle)
+                        check_target(driver.current_url, allowed_host)
+                        current_install = driver.execute_script(
+                            "return window.__liveGameApiReader ? window.__liveGameApiReader.current() : {};"
+                        ) or {}
+                        engine, book, strategy_module = prepare_bot_components(
+                            args, allowed_host,
+                            {
+                                "boardFound": bool(current_install.get("boardFound")),
+                                "gameApiFound": bool(current_install.get("gameApiFound")),
+                            },
+                        )
+                    except (RuntimeError, WebDriverException):
+                        print("[AUTO] Bot could not be enabled; check Stockfish, strategy files, and the allowed-site board API.", flush=True)
+                        args.auto_play = False
+                        if settings_window is not None:
+                            settings_window.set_enabled("auto_play", False)
                 # Closing the chosen tab often yields current_url=None in ChromeDriver.
                 if chosen_handle not in driver.window_handles:
                     print("[STOP] Selected browser tab was closed. No URL was logged.", flush=True)
@@ -2801,6 +3128,7 @@ def main() -> int:
                     low_clock_polling_active = (
                         own_clock_for_poll is not None
                         and own_clock_for_poll <= low_clock_trigger_seconds
+                        and (args.clock_management or args.low_clock_extra_premoves)
                     )
                     if low_clock_polling_active != last_fast_polling_state:
                         try:
@@ -2849,6 +3177,10 @@ def main() -> int:
                         and not is_start_position(previous_fen)
                     )
                     if is_new_game_snapshot:
+                        last_seen_clock_by_side = {"white": None, "black": None}
+                        clock_increment_samples = []
+                        if not clock_increment_is_configured:
+                            clock_increment_seconds = 0.0
                         low_clock_trigger_seconds = random.uniform(7.0, 10.0)
                         print(
                             f"[LOW CLOCK] New game threshold sampled: <= {low_clock_trigger_seconds:.2f}s.",
@@ -2857,8 +3189,45 @@ def main() -> int:
                     if is_new_game_snapshot and configured_time_control_seconds is None:
                         initial_game_clock_seconds = None
                         clock_source_reported = False
+                    if not clock_increment_is_configured and not is_new_game_snapshot:
+                        for side_name, current_clock in (
+                            ("white", white_clock_seconds),
+                            ("black", black_clock_seconds),
+                        ):
+                            previous_clock = last_seen_clock_by_side.get(side_name)
+                            if previous_clock is not None and current_clock is not None:
+                                clock_gain = float(current_clock) - float(previous_clock)
+                                if 0.35 <= clock_gain <= 10.0:
+                                    clock_increment_samples.append(clock_gain)
+                                    clock_increment_samples = clock_increment_samples[-9:]
+                                    ordered_samples = sorted(clock_increment_samples)
+                                    middle = len(ordered_samples) // 2
+                                    if len(ordered_samples) % 2:
+                                        clock_increment_seconds = ordered_samples[middle]
+                                    else:
+                                        clock_increment_seconds = (
+                                            ordered_samples[middle - 1] + ordered_samples[middle]
+                                        ) / 2.0
+                            if current_clock is not None:
+                                last_seen_clock_by_side[side_name] = float(current_clock)
                     if initial_game_clock_seconds is None and observed_clocks:
                         initial_game_clock_seconds = max(observed_clocks)
+                    if not is_new_game_snapshot:
+                        for side_name, current_clock in (
+                            ("white", white_clock_seconds),
+                            ("black", black_clock_seconds),
+                        ):
+                            if current_clock is not None and last_seen_clock_by_side.get(side_name) is None:
+                                last_seen_clock_by_side[side_name] = float(current_clock)
+                    if settings_window is not None:
+                        settings_window.update_clock_status(
+                            white_clock_seconds,
+                            black_clock_seconds,
+                            initial_game_clock_seconds,
+                            clock_increment_seconds,
+                            low_clock_trigger_seconds,
+                            bot_color=active_bot_color,
+                        )
                     if observed_clocks and not clock_source_reported:
                         source_note = (
                             "configured time-control value"
@@ -3151,7 +3520,8 @@ def main() -> int:
                                         else black_clock_seconds
                                     )
                                     low_clock_mode = (
-                                        remaining_clock_seconds is not None
+                                        args.clock_management
+                                        and remaining_clock_seconds is not None
                                         and remaining_clock_seconds <= low_clock_trigger_seconds
                                     )
                                     low_clock_total_budget_seconds = (
@@ -3180,12 +3550,16 @@ def main() -> int:
                                             "book_weight": float(book_choice.get("weight", 0.0)),
                                         }
                                     else:
-                                        limit_seconds = calculate_engine_search_limit(
-                                            base_seconds=args.engine_time,
-                                            remaining_seconds=remaining_clock_seconds,
-                                            initial_seconds=initial_game_clock_seconds,
-                                            increment_seconds=clock_increment_seconds,
-                                            board=engine_board,
+                                        limit_seconds = (
+                                            calculate_engine_search_limit(
+                                                base_seconds=args.engine_time,
+                                                remaining_seconds=remaining_clock_seconds,
+                                                initial_seconds=initial_game_clock_seconds,
+                                                increment_seconds=clock_increment_seconds,
+                                                board=engine_board,
+                                            )
+                                            if args.clock_management
+                                            else max(0.005, min(float(args.engine_time), 5.0))
                                         )
                                         if remaining_clock_seconds is None:
                                             print(
@@ -3248,14 +3622,14 @@ def main() -> int:
                                         selection_meta=selection_meta,
                                         thinking_enabled=strategy_module.BOT_THINKING_ENABLED_DEFAULT,
                                         previous_eval_white_cp=previous_eval_white_cp,
-                                        initial_time_seconds=initial_game_clock_seconds,
-                                        remaining_time_seconds=remaining_clock_seconds,
-                                        increment_seconds=clock_increment_seconds,
+                                        initial_time_seconds=(initial_game_clock_seconds if args.clock_management else None),
+                                        remaining_time_seconds=(remaining_clock_seconds if args.clock_management else None),
+                                        increment_seconds=(clock_increment_seconds if args.clock_management else 0.0),
                                         is_opening_book_move=(
                                             isinstance(selection_meta, dict)
                                             and selection_meta.get("source") == "GM_BOOK"
                                         ),
-                                        low_clock_trigger_seconds=low_clock_trigger_seconds,
+                                        low_clock_trigger_seconds=(low_clock_trigger_seconds if args.clock_management else 0.0),
                                         low_clock_total_budget_seconds=low_clock_total_budget_seconds,
                                         elapsed_seconds_before_delay=time.monotonic() - move_cycle_started_at,
                                         submission_reserve_seconds=(
@@ -3269,11 +3643,18 @@ def main() -> int:
                                             f" | own_clock={remaining_clock_seconds if remaining_clock_seconds is not None else 'unknown'}s.",
                                             flush=True,
                                         )
-                                        time.sleep(natural_delay)
+                                        if settings_window is not None:
+                                            settings_window.responsive_sleep(natural_delay)
+                                        else:
+                                            time.sleep(natural_delay)
 
                                     if not low_clock_mode:
                                         wait_for_manual_verification(driver, allowed_host, cfg)
-                                    if args.move_input == "cursor":
+                                    if settings_window is not None:
+                                        settings_window.pump()
+                                    if not args.auto_play:
+                                        submit = {"ok": False, "reason": "bot-disabled-in-settings"}
+                                    elif args.move_input == "cursor":
                                         submit = perform_cursor_drag(
                                             driver, chosen_move.uci(), fen, active_bot_color,
                                             low_clock_mode=low_clock_mode,
@@ -3337,7 +3718,8 @@ def main() -> int:
                                 except (chess.engine.EngineError, ValueError, WebDriverException, RuntimeError):
                                     print("[AUTO] Strategy calculation/submission failed; waiting for the next position.", flush=True)
                             elif (
-                                args.premove_enabled
+                                args.auto_play
+                                and args.premove_enabled
                                 and active_bot_color in {"white", "black"}
                                 and not side_matches_bot
                                 and not color_conflict
@@ -3364,7 +3746,8 @@ def main() -> int:
                                     else black_clock_seconds
                                 )
                                 low_clock_premove_mode = (
-                                    bot_clock_for_premove is not None
+                                    args.low_clock_extra_premoves
+                                    and bot_clock_for_premove is not None
                                     and bot_clock_for_premove <= low_clock_trigger_seconds
                                 )
                                 low_clock_premove_budget_seconds = (
@@ -3420,8 +3803,17 @@ def main() -> int:
                                                 flush=True,
                                             )
                                             if wait_remaining > 0:
-                                                time.sleep(wait_remaining)
-                                        if args.move_input == "cursor":
+                                                if settings_window is not None:
+                                                    settings_window.responsive_sleep(wait_remaining)
+                                                else:
+                                                    time.sleep(wait_remaining)
+                                        if settings_window is not None:
+                                            settings_window.pump()
+                                        if not args.auto_play or (
+                                            low_clock_premove_mode and not args.low_clock_extra_premoves
+                                        ):
+                                            premove_submit = {"ok": False, "reason": "bot-or-extra-premove-disabled-in-settings"}
+                                        elif args.move_input == "cursor":
                                             premove_submit = perform_cursor_drag(
                                                 driver,
                                                 chosen_premove_uci,
@@ -3469,9 +3861,15 @@ def main() -> int:
                                 except (chess.engine.EngineError, ValueError, WebDriverException, RuntimeError, TypeError):
                                     print("[PREMOVE] Candidate calculation/submission failed; normal turn handling remains enabled.", flush=True)
                 if low_clock_polling_active:
-                    time.sleep(0.005)
+                    if settings_window is not None:
+                        settings_window.responsive_sleep(0.005)
+                    else:
+                        time.sleep(0.005)
                 else:
-                    time.sleep(max(0.05, args.queue_read_interval))
+                    if settings_window is not None:
+                        settings_window.responsive_sleep(max(0.05, args.queue_read_interval))
+                    else:
+                        time.sleep(max(0.05, args.queue_read_interval))
 
     except KeyboardInterrupt:
         print("\n[STOP] Reader stopped.", flush=True)
@@ -3492,7 +3890,7 @@ def main() -> int:
         try:
             if driver and chosen_handle and chosen_handle in driver.window_handles:
                 driver.switch_to.window(chosen_handle)
-                driver.execute_script("window.__liveGameApiReader?.stop?.(); window.__ownedSiteAutoNextGame?.stop?.()")
+                driver.execute_script("window.__liveGameApiReader?.stop?.(); window.__ownedSiteGameActions?.stop?.(); window.__ownedSiteAutoNextGame?.stop?.()")
         except Exception:
             pass
         if args.browser_mode == "uc" and driver is not None:
