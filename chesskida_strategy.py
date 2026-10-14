@@ -395,6 +395,7 @@ def natural_bot_move_delay(
     remaining_time_seconds=None,
     increment_seconds=0.0,
     is_opening_book_move=False,
+    low_clock_trigger_seconds=10.0,
 ):
     """Return a small move delay plus clock-bounded optional pauses.
 
@@ -443,17 +444,18 @@ def natural_bot_move_delay(
     except (TypeError, ValueError):
         pass
 
-    # Under ten seconds on OUR clock: skip discretionary waiting.
-    # This mode intentionally ignores the opponent's clock completely.
-    if own_clock is not None and own_clock <= 10.0:
-        quick_delay = random.choice((
-            random.uniform(0.010, 0.025),
-            random.uniform(0.018, 0.045),
-            random.uniform(0.030, 0.065),
-        ))
+    # Late-clock threshold is sampled once per game by the caller.
+    # Only the final 5-10s window changes; all regular-clock timing stays intact.
+    try:
+        low_clock_threshold = min(10.0, max(5.0, float(low_clock_trigger_seconds)))
+    except (TypeError, ValueError):
+        low_clock_threshold = 10.0
+    if own_clock is not None and own_clock <= low_clock_threshold:
+        quick_delay = random.choice((0.100, 0.150, 0.200))
         _last_bot_natural_delay = quick_delay
         print(
-            f"[CLOCK MODE] own-clock fast path own={own_clock:.2f}s",
+            f"[CLOCK MODE] randomized low-clock path own={own_clock:.2f}s "
+            f"threshold={low_clock_threshold:.2f}s delay={quick_delay:.3f}s",
             flush=True,
         )
         return quick_delay
@@ -1824,6 +1826,23 @@ def candidate_hangs_own_piece(
         # the existing engine score and physical verification remain in force.
         return False
 
+def _movable_piece_count_for_color(board, color) -> int:
+    """Count the side's pieces with at least one legal move in a position copy."""
+    try:
+        probe = board.copy(stack=False)
+        probe.turn = color
+        return len({
+            move.from_square
+            for move in probe.legal_moves
+            if (
+                (piece := probe.piece_at(move.from_square)) is not None
+                and piece.color == color
+            )
+        })
+    except Exception:
+        return 99
+
+
 def choose_stockfish_move(
     board,
     multipv_infos,
@@ -1832,7 +1851,8 @@ def choose_stockfish_move(
     opponent_sample_count=0,
     opponent_pressure=False,
     engine=None,
-    bot_color=None
+    bot_color=None,
+    low_clock_mode=False
 ):
     # Reset the historical fuzzy state at a fresh match/new game.
     # This is retained from the fast-main-match-controls branch so a previous
@@ -2018,9 +2038,60 @@ def choose_stockfish_move(
                 }
             )
 
+    # Low-clock decisions use only the MultiPV already in memory: take an
+    # available shortest mate immediately (randomizing ties), without the
+    # normal M5-M15 mate-sustain hold. No extra mate-search pass is launched.
+    low_clock_conversion_priority = False
+    if low_clock_mode:
+        mate_candidates_fast = [
+            candidate for candidate in candidates
+            if candidate["mate"] is not None and candidate["mate"] > 0
+        ]
+        if mate_candidates_fast:
+            shortest_mate = min(candidate["mate"] for candidate in mate_candidates_fast)
+            fastest_choices = [
+                candidate for candidate in mate_candidates_fast
+                if candidate["mate"] == shortest_mate
+            ]
+            selected = random.choice(fastest_choices)
+            return (
+                selected["move"],
+                selected["info"],
+                {
+                    "rank": selected["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": selected["cp"],
+                    "source": "LOW_CLOCK_FAST_MATE",
+                    "reason": (
+                        f"LOW CLOCK FAST MATE | M{selected['mate']} "
+                        f"RANK=#{selected['rank'] + 1} | randomized equal-mate tie"
+                    ),
+                },
+            )
+
+        # Only suppress the regular mate progression if the material is
+        # winning and the opponent has at most three pieces with legal moves.
+        try:
+            opponent_color = not mover
+            opponent_movable_count = _movable_piece_count_for_color(board, opponent_color)
+            low_clock_conversion_priority = (
+                best_cp >= HUMAN_STRONG_WINNING_CP
+                and side_material(board, mover) > side_material(board, opponent_color)
+                and 1 <= opponent_movable_count <= 3
+            )
+            if low_clock_conversion_priority:
+                print(
+                    f"[LOW CLOCK] Winning conversion mode: opponent movable pieces={opponent_movable_count}; "
+                    "using existing safe promotion/capture priorities instead of mate-sustain.",
+                    flush=True,
+                )
+        except Exception:
+            low_clock_conversion_priority = False
+
     if (
         best["mate"] is not None
         and best["mate"] > 0
+        and not low_clock_conversion_priority
     ):
         # During the human-like mating window, clear genuinely free
         # material first. This is intentionally before the M4 force rule:
