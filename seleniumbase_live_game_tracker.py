@@ -186,7 +186,7 @@ def load_optional_txt_setting(setting_key: str) -> str:
 
 
 class RuntimeSettingsWindow:
-    """Live Tk settings for the current run; callbacks run on the reader thread."""
+    """Compact live dashboard and runtime controls for the current run."""
 
     LABELS = {
         "auto_play": "BOT",
@@ -196,12 +196,21 @@ class RuntimeSettingsWindow:
         "low_clock_extra_premoves": "LAST 7–10s EXTRA PREMOVES",
         "clock_management": "CLOCK-BASED TIME MANAGEMENT",
     }
+    BUTTON_LABELS = {
+        "auto_play": "BOT",
+        "auto_next_game": "NEW MATCH",
+        "auto_rematch": "REMATCH",
+        "premove_enabled": "PREMOVES",
+        "low_clock_extra_premoves": "EXTRA PREMOVES · 7–10s",
+        "clock_management": "CLOCK MANAGEMENT",
+    }
 
     def __init__(self, args, driver, allowed_host, cfg, chosen_handle):
         import tkinter as tk
-        from tkinter import messagebox
+        from tkinter import messagebox, ttk
 
         self.tk = tk
+        self.ttk = ttk
         self.messagebox = messagebox
         self.args = args
         self.driver = driver
@@ -214,71 +223,168 @@ class RuntimeSettingsWindow:
             key: bool(getattr(args, key))
             for key in self.LABELS
         }
+        self.move_rows = {}
+        self.move_order = []
+        self.last_eval_white_cp = None
+        self.latest_game_number = 1
 
         self.root = tk.Tk()
-        self.root.title("Live Chess Bot — Runtime Controls")
-        self.root.geometry("470x470")
-        self.root.minsize(430, 430)
-        self.root.configure(padx=14, pady=12)
+        self.root.title("Live Chess Dashboard — Runtime Controls")
+        self.root.geometry("970x700")
+        self.root.minsize(840, 600)
+        self.root.resizable(True, True)
+        self.root.configure(padx=10, pady=8, background="#f3f5f8")
         self.root.protocol("WM_DELETE_WINDOW", self.request_close)
+        self.root.option_add("*Font", ("Segoe UI", 9))
 
+        header = tk.Frame(self.root, bg="#f3f5f8")
+        header.pack(fill="x", pady=(0, 5))
         tk.Label(
-            self.root, text="LIVE SETTINGS",
-            font=("Segoe UI", 16, "bold"), anchor="w",
+            header, text="LIVE CHESS DASHBOARD",
+            font=("Segoe UI", 15, "bold"), anchor="w",
+            bg="#f3f5f8", fg="#172033",
         ).pack(fill="x")
         tk.Label(
-            self.root, text="Switch controls while the reader keeps running.",
+            header,
+            text="Compact runtime switches · live moves · evaluation · game stats",
             font=("Segoe UI", 9), anchor="w",
-        ).pack(fill="x", pady=(0, 8))
+            bg="#f3f5f8", fg="#5b6472",
+        ).pack(fill="x")
 
-        controls = tk.Frame(self.root)
-        controls.pack(fill="x", expand=False)
-        for key in self.LABELS:
+        controls = tk.LabelFrame(
+            self.root, text="Runtime switches",
+            padx=5, pady=4, bg="#f3f5f8", fg="#283548",
+        )
+        controls.pack(fill="x", pady=(0, 6))
+        for column in range(3):
+            controls.grid_columnconfigure(column, weight=1, uniform="switches")
+        for index, key in enumerate(self.LABELS):
             button = tk.Button(
                 controls,
                 text="",
-                font=("Segoe UI", 10, "bold"),
-                anchor="w",
-                padx=10,
-                pady=7,
+                font=("Segoe UI", 8, "bold"),
+                anchor="center",
+                padx=5,
+                pady=3,
+                bd=1,
+                relief="raised",
                 command=lambda setting=key: self.toggle(setting),
             )
-            button.pack(fill="x", pady=3)
+            button.grid(
+                row=index // 3, column=index % 3,
+                sticky="ew", padx=3, pady=2,
+            )
             self.buttons[key] = button
             self.refresh_button(key)
 
-        tk.Label(
-            self.root,
-            text="If both game actions are ON, Rematch is preferred when available; "
-                 "otherwise New Match may be used.",
-            font=("Segoe UI", 8), justify="left",
-            wraplength=435, anchor="w",
-        ).pack(fill="x", pady=(7, 5))
+        overview = tk.LabelFrame(
+            self.root, text="Live match overview",
+            padx=8, pady=5, bg="#f3f5f8", fg="#283548",
+        )
+        overview.pack(fill="x", pady=(0, 6))
 
-        self.clock_status = tk.StringVar(
-            value="Clock: waiting for a valid board/clock reading..."
+        self.game_stats = tk.StringVar(
+            value="Game 1 | Moves: waiting | Turn: ? | Bot side: ? | Status: waiting"
         )
         tk.Label(
-            self.root, textvariable=self.clock_status,
+            overview, textvariable=self.game_stats,
+            font=("Consolas", 9, "bold"), anchor="w",
+            justify="left", bg="#f3f5f8", fg="#263248",
+        ).pack(fill="x", pady=(0, 3))
+
+        self.material_stats = tk.StringVar(
+            value="Pieces: White ? / Black ?    Material: White ? / Black ?    Legal moves: ?"
+        )
+        tk.Label(
+            overview, textvariable=self.material_stats,
+            font=("Segoe UI", 9), anchor="w",
+            justify="left", bg="#f3f5f8", fg="#5b6472",
+        ).pack(fill="x", pady=(0, 3))
+
+        self.clock_status = tk.StringVar(
+            value="White --:--  |  Black --:--  |  Your clock: --:--"
+        )
+        tk.Label(
+            overview, textvariable=self.clock_status,
             font=("Consolas", 9), justify="left",
-            anchor="w", wraplength=435,
-        ).pack(fill="x", pady=(3, 5))
+            anchor="w", bg="#f3f5f8", fg="#263248",
+        ).pack(fill="x", pady=(0, 4))
+
+        self.evaluation_status = tk.StringVar(
+            value="Evaluation: waiting for Stockfish analysis"
+        )
+        tk.Label(
+            overview, textvariable=self.evaluation_status,
+            font=("Segoe UI", 10, "bold"), anchor="w",
+            bg="#f3f5f8", fg="#263248",
+        ).pack(fill="x")
+        self.eval_canvas = tk.Canvas(
+            overview, height=25, bg="#e4e8ee",
+            highlightthickness=1, highlightbackground="#c5ccd6",
+        )
+        self.eval_canvas.pack(fill="x", pady=(3, 1))
+        self.eval_canvas.bind("<Configure>", lambda _event: self._draw_eval_bar())
+        self._draw_eval_bar()
+
+        move_frame = tk.LabelFrame(
+            self.root, text="Live move history — latest 30 moves",
+            padx=5, pady=4, bg="#f3f5f8", fg="#283548",
+        )
+        move_frame.pack(fill="both", expand=True, pady=(0, 5))
+
+        columns = ("ply", "side", "move", "rank", "evaluation", "status")
+        self.moves_tree = ttk.Treeview(
+            move_frame, columns=columns, show="headings",
+            height=10, selectmode="browse",
+        )
+        headings = {
+            "ply": "Ply",
+            "side": "Side",
+            "move": "Move",
+            "rank": "Move reference",
+            "evaluation": "Eval (White POV)",
+            "status": "Status",
+        }
+        widths = {
+            "ply": 55, "side": 58, "move": 92,
+            "rank": 115, "evaluation": 125, "status": 150,
+        }
+        for column in columns:
+            self.moves_tree.heading(column, text=headings[column])
+            self.moves_tree.column(
+                column, width=widths[column],
+                minwidth=48, anchor="center",
+                stretch=column in {"move", "rank", "status"},
+            )
+        style = ttk.Style(self.root)
+        try:
+            style.configure("Treeview", rowheight=21, font=("Segoe UI", 9))
+            style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+        except Exception:
+            pass
+        scrollbar = ttk.Scrollbar(
+            move_frame, orient="vertical", command=self.moves_tree.yview
+        )
+        self.moves_tree.configure(yscrollcommand=scrollbar.set)
+        self.moves_tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        tk.Label(
+            self.root,
+            text="Rank is Stockfish MultiPV reference; opening-book choices show BOOK #. Opponent moves have no engine rank.",
+            font=("Segoe UI", 8), anchor="w",
+            bg="#f3f5f8", fg="#5b6472",
+        ).pack(fill="x", pady=(0, 3))
 
         self.status = tk.StringVar(
-            value="Public competitive hosts remain blocked by blocked_platforms.txt."
+            value="Ready. Public competitive hosts remain blocked by blocked_platforms.txt."
         )
         tk.Label(
             self.root, textvariable=self.status,
             font=("Segoe UI", 8), justify="left",
-            anchor="w", wraplength=435,
-        ).pack(fill="x", pady=(2, 0))
-
-        tk.Label(
-            self.root,
-            text="Closing this window asks whether to stop the reader. Toggles apply to this run.",
-            font=("Segoe UI", 8, "italic"),
-            anchor="w", wraplength=435, justify="left",
-        ).pack(fill="x", pady=(7, 0))
+            anchor="w", wraplength=930,
+            bg="#f3f5f8", fg="#475569",
+        ).pack(fill="x")
 
     def enabled(self, key):
         return bool(self.settings.get(key, False))
@@ -286,7 +392,7 @@ class RuntimeSettingsWindow:
     def refresh_button(self, key):
         enabled = self.enabled(key)
         self.buttons[key].configure(
-            text=f"{self.LABELS[key]}: {'ON' if enabled else 'OFF'}",
+            text=f"{self.BUTTON_LABELS[key]}: {'ON' if enabled else 'OFF'}",
             bg="#16794b" if enabled else "#5b6472",
             fg="white",
             activebackground="#12613d" if enabled else "#434b57",
@@ -304,7 +410,7 @@ class RuntimeSettingsWindow:
         if key == "auto_play" and self.settings[key]:
             self.status.set("Bot enabled. It will start after required engine checks pass.")
         elif key == "auto_play":
-            self.status.set("Bot is OFF; the read-only tracker remains active.")
+            self.status.set("Bot is OFF; the live reader and dashboard remain active.")
 
     def set_enabled(self, key, value):
         self.settings[key] = bool(value)
@@ -334,26 +440,251 @@ class RuntimeSettingsWindow:
         except Exception:
             self.status.set("Could not update game-action handler; site details were not logged.")
 
+    @staticmethod
+    def _format_clock(value):
+        if value is None:
+            return "--:--"
+        try:
+            seconds = max(0, int(float(value)))
+        except (TypeError, ValueError):
+            return "--:--"
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+    @staticmethod
+    def _format_eval(cp):
+        if cp is None:
+            return "—"
+        try:
+            value = float(cp)
+        except (TypeError, ValueError):
+            return "—"
+        if value >= 99000:
+            return "White mate"
+        if value <= -99000:
+            return "Black mate"
+        if abs(value) <= 15:
+            return "Equal 0.00"
+        return f"White +{value / 100.0:.2f}" if value > 0 else f"Black +{abs(value) / 100.0:.2f}"
+
+    @staticmethod
+    def _format_eval_cell(cp):
+        if cp is None:
+            return "—"
+        try:
+            value = float(cp)
+        except (TypeError, ValueError):
+            return "—"
+        if value >= 99000:
+            return "W MATE"
+        if value <= -99000:
+            return "B MATE"
+        if abs(value) <= 15:
+            return "0.00 (equal)"
+        return f"W {value / 100.0:+.2f}" if value > 0 else f"B +{abs(value) / 100.0:.2f}"
+
     def update_clock_status(
         self, white_clock, black_clock, base_seconds, increment_seconds,
         low_clock_threshold, bot_color=None
     ):
-        def fmt(value):
-            if value is None:
-                return "?"
-            seconds = max(0, int(float(value)))
-            return f"{seconds // 60:02d}:{seconds % 60:02d}"
-
         base = "?" if base_seconds is None else f"{float(base_seconds):.0f}s"
         increment = f"{float(increment_seconds or 0.0):.2f}s"
         side = (bot_color or "?").capitalize()
         own = white_clock if bot_color == "white" else black_clock if bot_color == "black" else None
         self.clock_status.set(
-            f"White {fmt(white_clock)}  |  Black {fmt(black_clock)}\n"
-            f"Your side: {side}  |  Your clock: {fmt(own)}\n"
-            f"Base time (estimated/configured): {base}  |  Increment: {increment}\n"
-            f"Extra low-clock threshold: {float(low_clock_threshold):.1f}s"
+            f"White {self._format_clock(white_clock)}  |  "
+            f"Black {self._format_clock(black_clock)}  |  "
+            f"Your clock ({side}): {self._format_clock(own)}\n"
+            f"Base time: {base}  |  Increment: {increment}  |  "
+            f"Low-clock threshold: {float(low_clock_threshold):.1f}s"
         )
+
+    def update_game_status(self, game_number, board, bot_color=None):
+        """Refresh turn, progress, material and terminal-state summary."""
+        if board is None:
+            return
+        try:
+            self.latest_game_number = int(game_number)
+            white_pieces = [p for p in board.piece_map().values() if p.color]
+            black_pieces = [p for p in board.piece_map().values() if not p.color]
+            values = {
+                1: 1, 2: 3, 3: 3, 4: 5, 5: 9, 6: 0
+            }
+            white_material = sum(values.get(p.piece_type, 0) for p in white_pieces)
+            black_material = sum(values.get(p.piece_type, 0) for p in black_pieces)
+            try:
+                legal_count = board.legal_moves.count()
+            except Exception:
+                legal_count = "?"
+            if board.is_checkmate():
+                state = "CHECKMATE"
+            elif board.is_stalemate():
+                state = "DRAW · STALEMATE"
+            elif board.is_insufficient_material():
+                state = "DRAW · MATERIAL"
+            elif board.is_game_over(claim_draw=False):
+                state = "GAME OVER"
+            else:
+                state = "LIVE"
+
+            turn = "White" if board.turn else "Black"
+            bot_side = (bot_color or "?").capitalize()
+            self.game_stats.set(
+                f"Game {game_number}  |  Plies: {board.ply()}  |  "
+                f"Move: {board.fullmove_number}  |  Turn: {turn}  |  "
+                f"Bot side: {bot_side}  |  {state}"
+            )
+            self.material_stats.set(
+                f"Pieces W/B: {len(white_pieces)}/{len(black_pieces)}  |  "
+                f"Material W/B: {white_material}/{black_material} points  |  "
+                f"Legal moves now: {legal_count}"
+            )
+        except Exception:
+            pass
+
+    def update_evaluation(self, eval_white_cp, source="Stockfish"):
+        try:
+            self.last_eval_white_cp = (
+                None if eval_white_cp is None else float(eval_white_cp)
+            )
+            if self.last_eval_white_cp is None:
+                self.evaluation_status.set("Evaluation: waiting for Stockfish analysis")
+            else:
+                self.evaluation_status.set(
+                    f"{self._format_eval(self.last_eval_white_cp)}  ·  Source: {source}"
+                )
+            self._draw_eval_bar()
+        except Exception:
+            pass
+
+    def _draw_eval_bar(self):
+        canvas = getattr(self, "eval_canvas", None)
+        if canvas is None:
+            return
+        try:
+            canvas.delete("all")
+            width = max(60, int(canvas.winfo_width()))
+            height = max(22, int(canvas.winfo_height()))
+            middle = width / 2.0
+            canvas.create_rectangle(
+                1, 2, width - 1, height - 2,
+                fill="#e4e8ee", outline="#c5ccd6",
+            )
+            cp = self.last_eval_white_cp
+            if cp is not None:
+                if abs(cp) <= 15:
+                    span = 7
+                    color = "#718096"
+                    canvas.create_rectangle(
+                        middle - span, 4, middle + span, height - 4,
+                        fill=color, outline=color,
+                    )
+                else:
+                    scale = min(1.0, abs(cp) / 800.0)
+                    span = max(3.0, scale * max(3.0, middle - 5.0))
+                    color = "#2563eb" if cp > 0 else "#d97706"
+                    left = middle if cp > 0 else middle - span
+                    right = middle + span if cp > 0 else middle
+                    canvas.create_rectangle(
+                        left, 4, right, height - 4,
+                        fill=color, outline=color,
+                    )
+            canvas.create_line(
+                middle, 2, middle, height - 2,
+                fill="#344054", width=2,
+            )
+            canvas.create_text(
+                8, height / 2, text="BLACK",
+                anchor="w", fill="#344054",
+                font=("Segoe UI", 8, "bold"),
+            )
+            canvas.create_text(
+                width - 8, height / 2, text="WHITE",
+                anchor="e", fill="#344054",
+                font=("Segoe UI", 8, "bold"),
+            )
+        except Exception:
+            pass
+
+    def _put_move(self, game_number, ply, side, san, rank=None,
+                  eval_white_cp=None, status="Observed"):
+        try:
+            game_number = int(game_number)
+            ply = int(ply)
+        except (TypeError, ValueError):
+            return
+        key = (game_number, ply)
+        row = self.move_rows.get(key)
+        is_new = row is None
+        if is_new:
+            row = {
+                "iid": f"game{game_number}_ply{ply}",
+                "game": game_number,
+                "ply": ply,
+                "side": side or "?",
+                "move": san or "?",
+                "rank": rank or "—",
+                "eval": eval_white_cp,
+                "status": status or "Observed",
+            }
+            self.move_rows[key] = row
+            self.move_order.insert(0, key)
+        else:
+            if side:
+                row["side"] = side
+            if san:
+                row["move"] = san
+            if rank not in (None, "", "—"):
+                row["rank"] = rank
+            if eval_white_cp is not None:
+                row["eval"] = eval_white_cp
+            if status:
+                row["status"] = status
+
+        values = (
+            row["ply"],
+            str(row["side"]).upper(),
+            row["move"],
+            row["rank"],
+            self._format_eval_cell(row["eval"]),
+            row["status"],
+        )
+        iid = row["iid"]
+        if self.moves_tree.exists(iid):
+            self.moves_tree.item(iid, values=values)
+        else:
+            self.moves_tree.insert("", "end", iid=iid, values=values)
+        if is_new:
+            self.moves_tree.move(iid, "", 0)
+
+        while len(self.move_order) > 40:
+            old_key = self.move_order.pop()
+            old = self.move_rows.pop(old_key, None)
+            if old and self.moves_tree.exists(old["iid"]):
+                self.moves_tree.delete(old["iid"])
+
+    def record_selected_move(
+        self, game_number, ply, side, san, rank, eval_white_cp=None, status="Selected"
+    ):
+        self._put_move(
+            game_number, ply, side, san, rank=rank,
+            eval_white_cp=eval_white_cp, status=status,
+        )
+
+    def record_observed_move(self, game_number, ply, move, eval_white_cp=None):
+        if not isinstance(move, dict):
+            return
+        self._put_move(
+            game_number, ply, move.get("side"), move.get("san"),
+            rank=None, eval_white_cp=eval_white_cp, status="On board",
+        )
+
+    def update_move_status(self, game_number, ply, status):
+        key = (int(game_number), int(ply))
+        row = self.move_rows.get(key)
+        if row is not None:
+            row["status"] = str(status)
+            if self.moves_tree.exists(row["iid"]):
+                self.moves_tree.set(row["iid"], "status", row["status"])
 
     def request_close(self):
         if self.messagebox.askyesno(
