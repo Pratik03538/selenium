@@ -516,7 +516,8 @@ class RuntimeSettingsWindow:
             except Exception:
                 legal_count = "?"
             if board.is_checkmate():
-                state = "CHECKMATE"
+                winner = "Black wins" if board.turn else "White wins"
+                state = f"CHECKMATE · {winner}"
             elif board.is_stalemate():
                 state = "DRAW · STALEMATE"
             elif board.is_insufficient_material():
@@ -656,7 +657,7 @@ class RuntimeSettingsWindow:
         if is_new:
             self.moves_tree.move(iid, "", 0)
 
-        while len(self.move_order) > 40:
+        while len(self.move_order) > 30:
             old_key = self.move_order.pop()
             old = self.move_rows.pop(old_key, None)
             if old and self.moves_tree.exists(old["iid"]):
@@ -3774,6 +3775,13 @@ def main() -> int:
                                                     quick_eval_white_cp,
                                                     source="Live position quick eval",
                                                 )
+                                                if last_move is not None:
+                                                    settings_window.record_observed_move(
+                                                        game_number,
+                                                        dashboard_board.ply(),
+                                                        last_move,
+                                                        eval_white_cp=quick_eval_white_cp,
+                                                    )
                                     except Exception:
                                         pass
                                 last_dashboard_eval_fen = fen
