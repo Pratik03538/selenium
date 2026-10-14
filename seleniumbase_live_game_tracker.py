@@ -1490,6 +1490,12 @@ return (() => {
     autoNextGame: !!initial.autoNextGame,
     autoRematch: !!initial.autoRematch
   };
+  const allowedHost = String(initial.allowedHost || "").toLowerCase().replace(/^www\./, "");
+  function allowedPage() {
+    const currentHost = String(location.hostname || "").toLowerCase().replace(/^www\./, "");
+    return !!allowedHost && (location.protocol === "http:" || location.protocol === "https:") &&
+      (currentHost === allowedHost || currentHost.endsWith("." + allowedHost));
+  }
   const visible = e => !!e && e.isConnected && e.getClientRects().length > 0 &&
     getComputedStyle(e).display !== "none" && getComputedStyle(e).visibility !== "hidden" &&
     Number(getComputedStyle(e).opacity || 1) > 0;
@@ -1557,6 +1563,12 @@ return (() => {
     return null;
   }
   function check() {
+    if (!allowedPage()) {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      handled = null;
+      return;
+    }
     if (!settings.autoNextGame && !settings.autoRematch) {
       if (timer !== null) clearTimeout(timer);
       timer = null;
@@ -1577,7 +1589,7 @@ return (() => {
     console.info("[AUTO GAME] Action scheduled in " + (delay / 1000).toFixed(2) + "s.");
     timer = setTimeout(() => {
       timer = null;
-      if (findGameOverRoot() !== root || !visible(root)) return;
+      if (!allowedPage() || findGameOverRoot() !== root || !visible(root)) return;
       const button = findActionButton(root);
       if (!button) {
         handled = null;
@@ -2999,6 +3011,7 @@ def main() -> int:
                 **cfg,
                 "autoNextGame": args.auto_next_game,
                 "autoRematch": args.auto_rematch,
+                "allowedHost": allowed_host,
             },
         )
         if not isinstance(next_state, dict) or not next_state.get("installed"):
@@ -3106,6 +3119,10 @@ def main() -> int:
                     break
 
                 for event in events or []:
+                    if settings_window is not None:
+                        settings_window.pump()
+                        if settings_window.stop_requested:
+                            break
                     fen = str(event.get("fen") or "").strip()
                     dom_moves = event.get("moves") or []
                     api_bot_color = (
@@ -3519,18 +3536,31 @@ def main() -> int:
                                         if engine_board.turn == chess.WHITE
                                         else black_clock_seconds
                                     )
+                                    opponent_clock_seconds = (
+                                        black_clock_seconds
+                                        if engine_board.turn == chess.WHITE
+                                        else white_clock_seconds
+                                    )
                                     low_clock_mode = (
                                         args.clock_management
                                         and remaining_clock_seconds is not None
                                         and remaining_clock_seconds <= low_clock_trigger_seconds
                                     )
                                     low_clock_total_budget_seconds = (
-                                        random.choice((0.100, 0.150, 0.200))
+                                        random.choice((0.100, 0.125, 0.150))
+                                        if (
+                                            low_clock_mode
+                                            and remaining_clock_seconds is not None
+                                            and opponent_clock_seconds is not None
+                                            and remaining_clock_seconds <= opponent_clock_seconds
+                                        )
+                                        else random.choice((0.100, 0.150, 0.200))
                                         if low_clock_mode else None
                                     )
                                     if low_clock_mode:
                                         print(
                                             f"[LOW CLOCK] Active | own={remaining_clock_seconds:.2f}s "
+                                            f"| opponent={opponent_clock_seconds if opponent_clock_seconds is not None else 'unknown'}s "
                                             f"| threshold={low_clock_trigger_seconds:.2f}s "
                                             f"| total move budget={low_clock_total_budget_seconds:.3f}s.",
                                             flush=True,
@@ -3745,13 +3775,24 @@ def main() -> int:
                                     white_clock_seconds if active_bot_color == "white"
                                     else black_clock_seconds
                                 )
+                                opponent_clock_for_premove = (
+                                    black_clock_seconds if active_bot_color == "white"
+                                    else white_clock_seconds
+                                )
                                 low_clock_premove_mode = (
                                     args.low_clock_extra_premoves
                                     and bot_clock_for_premove is not None
                                     and bot_clock_for_premove <= low_clock_trigger_seconds
                                 )
                                 low_clock_premove_budget_seconds = (
-                                    random.choice((0.100, 0.150, 0.200))
+                                    random.choice((0.100, 0.125, 0.150))
+                                    if (
+                                        low_clock_premove_mode
+                                        and bot_clock_for_premove is not None
+                                        and opponent_clock_for_premove is not None
+                                        and bot_clock_for_premove <= opponent_clock_for_premove
+                                    )
+                                    else random.choice((0.100, 0.150, 0.200))
                                     if low_clock_premove_mode else None
                                 )
                                 if low_clock_premove_mode:
@@ -3759,6 +3800,7 @@ def main() -> int:
                                     print(
                                         f"[PREMOVE] Random-threshold low-clock priority active "
                                         f"({bot_clock_for_premove:.2f}s <= {low_clock_trigger_seconds:.2f}s); "
+                                        f"opponent={opponent_clock_for_premove if opponent_clock_for_premove is not None else 'unknown'}s; "
                                         f"one total budget={low_clock_premove_budget_seconds:.3f}s, "
                                         "checking safe capture/promotion conversion first.",
                                         flush=True,
