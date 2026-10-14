@@ -1226,38 +1226,82 @@ def is_start_position(fen: str) -> bool:
 
 
 JS_INSTALL_AUTO_NEXT_GAME = r"""
+const cfg = arguments[0] || {};
 return (() => {
   try { window.__ownedSiteAutoNextGame?.observer?.disconnect?.(); } catch (_) {}
   let handled = null, timer = null;
   const visible = e => !!e && e.isConnected && e.getClientRects().length > 0 &&
-    getComputedStyle(e).display !== "none" && getComputedStyle(e).visibility !== "hidden";
+    getComputedStyle(e).display !== "none" && getComputedStyle(e).visibility !== "hidden" &&
+    Number(getComputedStyle(e).opacity || 1) > 0;
   const label = e => String(e?.innerText || e?.textContent || e?.getAttribute?.("aria-label") || "")
     .replace(/\s+/g, " ").trim();
+  const terminalText = /game\s*over|checkmate|stalemate|draw|wins?|won|resign(?:ed|ation)?|timeout|time\s*out|flag\s*fall|1-0|0-1|1\/2-1\/2/i;
+  const buttonSelector = "button,[role='button'],input[type='button'],input[type='submit']";
+  const isUsableNewButton = e => visible(e) && !e.disabled &&
+    e.getAttribute("aria-disabled") !== "true" &&
+    /^New(?:\s|$)/i.test(label(e)) && !/\bRematch\b/i.test(label(e));
+  function findGameOverRoot() {
+    const explicitSelectors = [
+      ".game-over-modal-shell-container",
+      "[data-game-over='true']",
+      "[aria-label*='game over' i]",
+      "[class*='game-over' i]",
+      "[class*='gameover' i]",
+      "[class*='result-modal' i]"
+    ];
+    const genericSelectors = ["[role='dialog']", "[aria-modal='true']"];
+    const roots = [];
+    for (const selector of [...explicitSelectors, ...genericSelectors]) {
+      try {
+        for (const el of document.querySelectorAll(selector)) {
+          if (visible(el) && !roots.includes(el)) roots.push(el);
+        }
+      } catch (_) {}
+    }
+    try {
+      const resultSelector = String(cfg.resultSelector || "#game-result, [data-result]");
+      for (const el of document.querySelectorAll(resultSelector)) {
+        if (visible(el) && !roots.includes(el)) roots.push(el);
+      }
+    } catch (_) {}
+    for (const root of roots) {
+      const txt = label(root);
+      const explicitGameOver = explicitSelectors.some(selector => {
+        try { return root.matches(selector); } catch (_) { return false; }
+      });
+      if (!explicitGameOver && !terminalText.test(txt)) continue;
+      if (root.querySelectorAll(buttonSelector).length > 0) return root;
+      if (terminalText.test(txt) && [...document.querySelectorAll(buttonSelector)].some(isUsableNewButton)) {
+        return document.body;
+      }
+    }
+    return null;
+  }
   function check() {
-    const modal = document.querySelector(".game-over-modal-shell-container");
-    if (!visible(modal)) {
+    const root = findGameOverRoot();
+    if (!root) {
       handled = null;
       if (timer !== null) clearTimeout(timer);
       timer = null;
       return;
     }
-    if (handled === modal || timer !== null) return;
-    handled = modal;
+    if (handled === root || timer !== null) return;
+    handled = root;
     const delay = 2000 + Math.floor(Math.random() * 3001);
     console.info("[AUTO NEXT GAME] Scheduled in " + (delay / 1000).toFixed(2) + "s.");
     timer = setTimeout(() => {
       timer = null;
-      if (document.querySelector(".game-over-modal-shell-container") !== modal || !visible(modal)) return;
-      const buttons = [...modal.querySelectorAll("button,[role='button']")].filter(
-        e => visible(e) && !e.disabled && e.getAttribute("aria-disabled") !== "true"
-      );
-      const button = buttons.find(e => /^New\s+1\s+min$/i.test(label(e))) ||
-        buttons.find(e => /^New(?:\s|$)/i.test(label(e)) && !/\bRematch\b/i.test(label(e)));
+      if (findGameOverRoot() !== root || !visible(root)) return;
+      const localButtons = [...root.querySelectorAll(buttonSelector)];
+      const buttons = localButtons.some(isUsableNewButton)
+        ? localButtons.filter(isUsableNewButton)
+        : [...document.querySelectorAll(buttonSelector)].filter(isUsableNewButton);
+      const button = buttons.find(e => /^New\s+1\s+min$/i.test(label(e))) || buttons[0];
       if (!button) {
-        console.warn("[AUTO NEXT GAME] No enabled New button found; Rematch will not be clicked.");
+        console.warn("[AUTO NEXT GAME] No enabled New/New Game button found; Rematch will not be clicked.");
         return;
       }
-      console.info("[AUTO NEXT GAME] Clicking: " + label(button));
+      console.info("[AUTO NEXT GAME] Clicking New-game button.");
       button.click();
     }, delay);
   }
@@ -2382,8 +2426,7 @@ def main() -> int:
         args.premove_enabled = raw_premove in {"1", "true", "yes", "on", "enabled"} if raw_premove else True
     print(f"[CONFIG] Premove attempts: {'enabled' if args.premove_enabled else 'disabled'}.", flush=True)
     if args.auto_next_game is None:
-        next_setting = load_optional_txt_setting("auto_next_game").strip().lower()
-        args.auto_next_game = next_setting in {"1", "true", "yes", "on", "enabled"}
+        args.auto_next_game = True
     if args.auto_next_game and not args.auto_play:
         print("[CONFIG ERROR] auto_next_game requires auto_play=true on an authorized test site.", file=sys.stderr, flush=True)
         return 2
@@ -2595,7 +2638,7 @@ def main() -> int:
         check_target(driver.current_url, allowed_host)
         installed = driver.execute_script(JS_INSTALL_OBSERVER, cfg)
         if args.auto_next_game:
-            next_state = driver.execute_script(JS_INSTALL_AUTO_NEXT_GAME)
+            next_state = driver.execute_script(JS_INSTALL_AUTO_NEXT_GAME, cfg)
             if not isinstance(next_state, dict) or not next_state.get("installed"):
                 raise RuntimeError("Could not install the next-game handler.")
             print("[AUTO NEXT GAME] Installed: 2-5 second delay; clicks New only, never Rematch.", flush=True)
