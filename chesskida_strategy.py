@@ -60,9 +60,9 @@ HUMAN_WINNING_GUARD_MAX_DROP_CP = 45
 # Keep the baseline weighted picker, but allow a few more safe ranks
 # to remain eligible in winning positions. CP and hanging-piece guards below
 # still decide whether a lower-ranked move is actually acceptable.
-HUMAN_WINNING_GUARD_RANK_CAP = 5
+HUMAN_WINNING_GUARD_RANK_CAP = 9
 HUMAN_STRONG_WINNING_CP = 300
-HUMAN_STRONG_WINNING_RANK_CAP = 3
+HUMAN_STRONG_WINNING_RANK_CAP = 7
 HUMAN_WINNING_NON_BEST_CHANCE = 0.45
 HUMAN_STRONG_WINNING_NON_BEST_CHANCE = 0.25
 FREE_CAPTURE_MIN_VALUE = 3
@@ -79,7 +79,7 @@ MATE_SLOWER_LINE_CHANCE = 0.35
 HUMAN_SELECTION_EXTRA_DROP_CP = 70
 HUMAN_SELECTION_DISTANCE_CP = 80.0
 HUMAN_SELECTION_NON_BEST_CHANCE = 0.88
-HUMAN_SELECTION_TOP12_MAX_CHANCE = 0.10
+HUMAN_SELECTION_TOP12_MAX_CHANCE = 0.05
 MATE_CLEANUP_MAX_REMAINING_PIECES = 1
 MATE_CLEANUP_MIN_VALUE = 1
 MIN_POSITIVE_CP = 5
@@ -2926,41 +2926,41 @@ def choose_stockfish_move(
             # of making #3 the default. Growth remains protected by the CP
             # preference above.
             rank_factors = {
-                0: 0.50,
-                1: 0.62,
-                2: 0.82,
-                3: 1.06,
-                4: 1.15,
-                5: 1.16,
-                6: 1.14,
-                7: 1.11,
-                8: 1.08,
+                0: 0.43,
+                1: 0.58,
+                2: 0.78,
+                3: 1.02,
+                4: 1.12,
+                5: 1.18,
+                6: 1.16,
+                7: 1.13,
+                8: 1.09,
                 9: 1.05,
-                10: 1.02,
-                11: 1.00,
-                12: 0.98,
-                13: 0.96,
-                14: 0.94,
+                10: 1.01,
+                11: 0.98,
+                12: 0.95,
+                13: 0.92,
+                14: 0.90,
             }
         else:
             # Spread the lower-rank preference across #3-#8 so #3 does not
             # become the default answer when several safe choices exist.
             rank_factors = {
-                0: 0.55,
-                1: 0.68,
-                2: 0.82,
-                3: 1.06,
-                4: 1.15,
-                5: 1.16,
-                6: 1.14,
-                7: 1.11,
-                8: 1.08,
+                0: 0.43,
+                1: 0.58,
+                2: 0.78,
+                3: 1.02,
+                4: 1.12,
+                5: 1.18,
+                6: 1.16,
+                7: 1.13,
+                8: 1.09,
                 9: 1.05,
-                10: 1.02,
-                11: 1.00,
-                12: 0.98,
-                13: 0.96,
-                14: 0.94,
+                10: 1.01,
+                11: 0.98,
+                12: 0.95,
+                13: 0.92,
+                14: 0.90,
             }
 
         lower_rank_pool = [
@@ -3134,8 +3134,8 @@ def choose_stockfish_move(
         safe = [best]
 
     rank_weights = {
-        0: 0.85,
-        1: 0.90,
+        0: 0.75,
+        1: 0.84,
         2: 0.98,
         3: 1.04,
         4: 1.08,
