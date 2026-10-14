@@ -4,6 +4,7 @@ import unittest
 import chess
 from seleniumbase_live_game_tracker import (
     PlayerSideResolver,
+    infer_move_between_fens,
     reconstruct_history_from_dom_moves,
     uci_move_reaches_fen,
 )
@@ -43,6 +44,11 @@ class MoveConfirmationTests(unittest.TestCase):
         after = self.before.copy()
         after.push_uci("e2e4")
         self.assertTrue(uci_move_reaches_fen(self.before_fen, after.fen(), "e2e4"))
+
+    def test_reconstructs_double_pawn_push_when_fen_omits_inert_ep_square(self):
+        after = self.before.copy()
+        after.push_uci("e2e4")
+        self.assertEqual(infer_move_between_fens(self.before_fen, after.fen())["san"], "e4")
 
     def test_confirms_move_after_fast_opponent_reply(self):
         after = self.before.copy()
