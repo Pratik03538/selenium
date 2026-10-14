@@ -3494,18 +3494,16 @@ def main() -> int:
     print(f"[CONFIG] Automatic new match: {'enabled' if args.auto_next_game else 'disabled'}.", flush=True)
     raw_rematch_setting = load_optional_txt_setting("auto_rematch").strip().lower()
     args.auto_rematch = raw_rematch_setting in {"1", "true", "yes", "on", "enabled"}
-    raw_extra_premove_setting = load_optional_txt_setting("low_clock_extra_premoves").strip().lower()
-    args.low_clock_extra_premoves = (
-        raw_extra_premove_setting in {"1", "true", "yes", "on", "enabled"}
-        if raw_extra_premove_setting else True
-    )
+    # Keep the requested 7–10s premove priority active by default. The master
+    # premove_enabled switch still controls whether any premove may be submitted.
+    args.low_clock_extra_premoves = True
     raw_clock_management_setting = load_optional_txt_setting("clock_management").strip().lower()
     args.clock_management = (
         raw_clock_management_setting in {"1", "true", "yes", "on", "enabled"}
         if raw_clock_management_setting else True
     )
     print(f"[CONFIG] Automatic rematch: {'enabled' if args.auto_rematch else 'disabled'}.", flush=True)
-    print(f"[CONFIG] Low-clock extra premoves: {'enabled' if args.low_clock_extra_premoves else 'disabled'}.", flush=True)
+    print("[CONFIG] Low-clock extra premoves: automatic in the sampled 7–10s window.", flush=True)
     print(f"[CONFIG] Clock-based time management: {'enabled' if args.clock_management else 'disabled'}.", flush=True)
     if args.allowed_domain.strip():
         allowed_host = normalize_host(args.allowed_domain)
