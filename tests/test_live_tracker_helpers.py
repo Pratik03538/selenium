@@ -35,6 +35,49 @@ class PlayerSideResolverTests(unittest.TestCase):
         self.assertIsNone(resolver.resolve(None, "black"))
 
 
+class PremovePhaseTests(unittest.TestCase):
+    def test_opening_premove_window_extends_through_move_ten(self):
+        opening = chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 10")
+        self.assertEqual(premove_phase_allowed(opening), (True, "opening"))
+
+    def test_mate_phase_premove_uses_forced_mate_continuation(self):
+        board = chess.Board()
+        board.push_san("e4")
+        reply = chess.Move.from_uci("e7e5")
+        mate_move = chess.Move.from_uci("d1h5")
+
+        class FakeEngine:
+            def __init__(self):
+                self.calls = 0
+
+            def analyse(self, _board, _limit, multipv=1, root_moves=None):
+                self.calls += 1
+                if self.calls == 1:
+                    return [{
+                        "pv": [reply],
+                        "score": chess.engine.PovScore(
+                            chess.engine.Mate(5), chess.WHITE
+                        ),
+                    }]
+                return [{
+                    "pv": [mate_move],
+                    "score": chess.engine.PovScore(
+                        chess.engine.Mate(3), chess.WHITE
+                    ),
+                }]
+
+        class Args:
+            engine_time = 0.02
+            move_input = "api"
+
+        selected, predicted_reply, reason = choose_mate_phase_premove(
+            FakeEngine(), board, "white", Args()
+        )
+        self.assertEqual(predicted_reply, reply)
+        self.assertEqual(selected, mate_move)
+        self.assertIn("mate-phase-premove", reason)
+
+
 class MoveConfirmationTests(unittest.TestCase):
     def setUp(self):
         self.before = chess.Board()
