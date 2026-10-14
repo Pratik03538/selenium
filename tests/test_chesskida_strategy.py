@@ -189,8 +189,9 @@ class MaterialSafetyAndPriorityTests(unittest.TestCase):
 
 
 class FastClockProtectionTests(unittest.TestCase):
-    def test_discretionary_endgame_pauses_are_disabled(self):
-        self.assertEqual(strategy.BOT_ENDGAME_PAUSE_CHANCE, 0.0)
+    def test_endgame_pauses_are_available_but_bounded(self):
+        self.assertGreater(strategy.BOT_ENDGAME_PAUSE_CHANCE, 0.0)
+        self.assertLessEqual(strategy.BOT_ENDGAME_PAUSE_CHANCE, 0.25)
 
     def test_low_clock_delay_budget_is_capped_at_60ms(self):
         board = chess.Board()
@@ -207,6 +208,26 @@ class FastClockProtectionTests(unittest.TestCase):
         )
         self.assertGreaterEqual(delay, 0.0)
         self.assertLessEqual(delay, 0.060)
+
+
+class RandomizedTimingTests(unittest.TestCase):
+    def test_base_move_delay_uses_continuous_samples(self):
+        board = chess.Board()
+        move = chess.Move.from_uci("e2e4")
+        samples = [
+            round(strategy._sample_base_move_delay(board, move), 4)
+            for _ in range(50)
+        ]
+        self.assertGreater(len(set(samples)), 35)
+        self.assertTrue(all(strategy.BOT_EVERY_MOVE_DELAY_MIN <= x <= strategy.BOT_EVERY_MOVE_DELAY_MAX for x in samples))
+
+    def test_thinking_pause_uses_continuous_samples(self):
+        samples = [
+            round(strategy._sample_thinking_pause(2.5, complexity=0.55), 4)
+            for _ in range(50)
+        ]
+        self.assertGreater(len(set(samples)), 35)
+        self.assertTrue(all(0.0 <= x <= 2.5 for x in samples))
 
 
 class BotSideGuardTests(unittest.TestCase):
