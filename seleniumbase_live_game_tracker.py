@@ -2802,8 +2802,8 @@ def choose_middle_game_premove(
                 ordered.append(move)
                 seen.add(move.uci())
 
-        # Keep the latency bounded. If the strongest common recapture is unsafe,
-        # skip this square rather than trying a long list of speculative moves.
+        # Test a small ranked set of recaptures; an unsafe top candidate should
+        # not prevent another candidate from passing the material/eval guards.
         for candidate in ordered[:3]:
             if any(
                 strategy_module.candidate_hangs_own_piece(after_capture, candidate)
@@ -2820,8 +2820,8 @@ def choose_middle_game_premove(
                     outcomes[0][0],
                     f"midgame-safe-recapture target={target_name} worst={worst_eval / 100:+.2f}",
                 )
-            # A failed safety proof means this target is not a suitable premove.
-            break
+            # This candidate failed; test the next ranked recapture for the same target.
+            continue
 
     # 2) Universal-safe move: the exact same move must be legal after every
     # possible opponent move, then pass engine checks in every resulting position.
@@ -2836,7 +2836,10 @@ def choose_middle_game_premove(
     own_lines = engine.analyse(
         predicted_board,
         chess.engine.Limit(depth=8, time=search_time),
-        multipv=5,
+        multipv=min(
+            int(getattr(strategy_module, "TRAINING_MULTI_PV", 15)),
+            max(1, predicted_board.legal_moves.count()),
+        ),
     )
     if not isinstance(own_lines, list):
         own_lines = [own_lines]
@@ -3346,7 +3349,7 @@ def choose_premove_candidate(
         own_lines = engine.analyse(
             hypothetical,
             chess.engine.Limit(depth=10, time=search_time),
-            multipv=min(5, max(1, int(getattr(strategy_module, "TRAINING_MULTI_PV", 5)))),
+            multipv=min(15, max(1, int(getattr(strategy_module, "TRAINING_MULTI_PV", 15)))),
         )
         if not isinstance(own_lines, list):
             own_lines = [own_lines]
