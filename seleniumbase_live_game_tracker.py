@@ -1158,7 +1158,7 @@ JS_INSTALL_AUTO_NEXT_GAME = r"""
   const visible = e => !!e && e.isConnected && e.getClientRects().length > 0 &&
     getComputedStyle(e).display !== "none" && getComputedStyle(e).visibility !== "hidden";
   const label = e => String(e?.innerText || e?.textContent || e?.getAttribute?.("aria-label") || "")
-    .replace(/\\s+/g, " ").trim();
+    .replace(/\s+/g, " ").trim();
   function check() {
     const modal = document.querySelector(".game-over-modal-shell-container");
     if (!visible(modal)) {
@@ -1177,8 +1177,8 @@ JS_INSTALL_AUTO_NEXT_GAME = r"""
       const buttons = [...modal.querySelectorAll("button,[role='button']")].filter(
         e => visible(e) && !e.disabled && e.getAttribute("aria-disabled") !== "true"
       );
-      const button = buttons.find(e => /^New\\s+1\\s+min$/i.test(label(e))) ||
-        buttons.find(e => /^New(?:\\s|$)/i.test(label(e)) && !/\\bRematch\\b/i.test(label(e)));
+      const button = buttons.find(e => /^New\s+1\s+min$/i.test(label(e))) ||
+        buttons.find(e => /^New(?:\s|$)/i.test(label(e)) && !/\bRematch\b/i.test(label(e)));
       if (!button) {
         console.warn("[AUTO NEXT GAME] No enabled New button found; Rematch will not be clicked.");
         return;
@@ -2906,7 +2906,7 @@ def main() -> int:
         try:
             if driver and chosen_handle and chosen_handle in driver.window_handles:
                 driver.switch_to.window(chosen_handle)
-                driver.execute_script("window.__liveGameApiReader?.stop?.()")
+                driver.execute_script("window.__liveGameApiReader?.stop?.(); window.__ownedSiteAutoNextGame?.stop?.()")
         except Exception:
             pass
         if args.browser_mode == "uc" and driver is not None:
