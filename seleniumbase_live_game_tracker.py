@@ -1152,7 +1152,7 @@ def is_start_position(fen: str) -> bool:
 
 
 JS_INSTALL_AUTO_NEXT_GAME = r"""
-(() => {
+return (() => {
   try { window.__ownedSiteAutoNextGame?.observer?.disconnect?.(); } catch (_) {}
   let handled = null, timer = null;
   const visible = e => !!e && e.isConnected && e.getClientRects().length > 0 &&
