@@ -42,7 +42,7 @@ BOT_THINK_UNCERTAINTY_CP = 75
 BOT_THINK_SHARP_EVAL_CP = 80
 BOT_THINK_STRATEGIC_LEGAL_MOVES = 24
 HUMAN_SELECTION_DIVERSITY_EXTRA_DROP = 0.04
-TRAINING_MULTI_PV = 100
+TRAINING_MULTI_PV = 15
 FORCE_BEST_MIN_CP = 200
 FORCE_BEST_IMPROVEMENT_FRACTION = 0.65
 HUMAN_ADVANTAGE_START_CP = 400
@@ -60,9 +60,9 @@ HUMAN_WINNING_GUARD_MAX_DROP_CP = 45
 # Keep the baseline weighted picker, but allow a few more safe ranks
 # to remain eligible in winning positions. CP and hanging-piece guards below
 # still decide whether a lower-ranked move is actually acceptable.
-HUMAN_WINNING_GUARD_RANK_CAP = 99
+HUMAN_WINNING_GUARD_RANK_CAP = 5
 HUMAN_STRONG_WINNING_CP = 300
-HUMAN_STRONG_WINNING_RANK_CAP = 99
+HUMAN_STRONG_WINNING_RANK_CAP = 3
 HUMAN_WINNING_NON_BEST_CHANCE = 0.45
 HUMAN_STRONG_WINNING_NON_BEST_CHANCE = 0.25
 FREE_CAPTURE_MIN_VALUE = 3
@@ -79,10 +79,13 @@ MATE_SLOWER_LINE_CHANCE = 0.35
 HUMAN_SELECTION_EXTRA_DROP_CP = 70
 HUMAN_SELECTION_DISTANCE_CP = 80.0
 HUMAN_SELECTION_NON_BEST_CHANCE = 0.88
-HUMAN_SELECTION_TOP12_MAX_CHANCE = 0.05
+HUMAN_SELECTION_TOP12_MAX_CHANCE = 0.10
 MATE_CLEANUP_MAX_REMAINING_PIECES = 1
 MATE_CLEANUP_MIN_VALUE = 1
 MIN_POSITIVE_CP = 5
+# Controlled eval tolerance for non-winning positions.
+LOSING_POSITION_MAX_DROP_CP = 70
+MAX_CONSECUTIVE_RANK1_SELECTIONS = 2
 OPPONENT_ACCURACY_WINDOW = 12
 OPPONENT_MIN_SAMPLES = 5
 ADAPTIVE_MIN_TARGET = 80.0
@@ -111,6 +114,32 @@ _thinking_budget_remaining = None
 _thinking_budget_total = None
 _thinking_move_cooldown_remaining = 0
 _mate_pause_used = False
+_rank1_selection_streak = 0
+
+
+def _near_equal_selection_pool(candidates, best_cp, rank_cap):
+    """Build a bounded evaluation pool for the non-winning fallback."""
+    drop_cap = LOSING_POSITION_MAX_DROP_CP if best_cp < HUMAN_ADVANTAGE_START_CP else 20
+    floor_cp = best_cp - drop_cap
+    pool = [candidate for candidate in candidates if candidate["cp"] >= floor_cp and candidate["rank"] <= rank_cap]
+    return pool, floor_cp, drop_cap
+
+
+def _limit_rank1_streak_pool(candidates, consecutive_rank1):
+    """After two #1 choices, prefer an eligible alternative when available."""
+    pool = list(candidates)
+    if consecutive_rank1 < MAX_CONSECUTIVE_RANK1_SELECTIONS:
+        return pool, False
+    alternatives = [candidate for candidate in pool if int(candidate["rank"]) > 0]
+    if alternatives and any(int(candidate["rank"]) == 0 for candidate in pool):
+        return alternatives, True
+    return pool, False
+
+
+def _record_rank_selection(rank):
+    global _rank1_selection_streak
+    _rank1_selection_streak = _rank1_selection_streak + 1 if int(rank) == 0 else 0
+
 
 def score_to_cp(score):
     if score.is_mate():
@@ -2034,6 +2063,7 @@ def choose_stockfish_move(
     global _mate_progress_target_mate
     global _mate_progress_hold_moves
     global _mate_progress_hold_limit
+    global _rank1_selection_streak
 
     if len(board.move_stack) <= 1:
         _advantage_target_cp = None
@@ -2051,6 +2081,7 @@ def choose_stockfish_move(
             MATE_SUSTAIN_MIN_MOVES,
             MATE_SUSTAIN_MAX_MOVES
         )
+        _rank1_selection_streak = 0
     if not multipv_infos:
         return (
             None,
@@ -2926,41 +2957,41 @@ def choose_stockfish_move(
             # of making #3 the default. Growth remains protected by the CP
             # preference above.
             rank_factors = {
-                0: 0.43,
-                1: 0.58,
-                2: 0.78,
-                3: 1.02,
-                4: 1.12,
-                5: 1.18,
-                6: 1.16,
-                7: 1.13,
-                8: 1.09,
+                0: 0.50,
+                1: 0.62,
+                2: 0.82,
+                3: 1.06,
+                4: 1.15,
+                5: 1.16,
+                6: 1.14,
+                7: 1.11,
+                8: 1.08,
                 9: 1.05,
-                10: 1.01,
-                11: 0.98,
-                12: 0.95,
-                13: 0.92,
-                14: 0.90,
+                10: 1.02,
+                11: 1.00,
+                12: 0.98,
+                13: 0.96,
+                14: 0.94,
             }
         else:
             # Spread the lower-rank preference across #3-#8 so #3 does not
             # become the default answer when several safe choices exist.
             rank_factors = {
-                0: 0.43,
-                1: 0.58,
-                2: 0.78,
-                3: 1.02,
-                4: 1.12,
-                5: 1.18,
-                6: 1.16,
-                7: 1.13,
-                8: 1.09,
+                0: 0.55,
+                1: 0.68,
+                2: 0.82,
+                3: 1.06,
+                4: 1.15,
+                5: 1.16,
+                6: 1.14,
+                7: 1.11,
+                8: 1.08,
                 9: 1.05,
-                10: 1.01,
-                11: 0.98,
-                12: 0.95,
-                13: 0.92,
-                14: 0.90,
+                10: 1.02,
+                11: 1.00,
+                12: 0.98,
+                13: 0.96,
+                14: 0.94,
             }
 
         lower_rank_pool = [
@@ -3027,6 +3058,10 @@ def choose_stockfish_move(
                 )
                 else pool
             )
+        selection_pool, rank1_streak_broken = _limit_rank1_streak_pool(
+            selection_pool,
+            _rank1_selection_streak
+        )
 
         weighted = []
 
@@ -3092,6 +3127,7 @@ def choose_stockfish_move(
                 selected = candidate
                 break
 
+        _record_rank_selection(selected["rank"])
         return (
             selected["move"],
             selected["info"],
@@ -3125,25 +3161,18 @@ def choose_stockfish_move(
             }
         )
 
-    near_equal_floor = (
-        best_cp - 20
+    safe, near_equal_floor, selection_drop_cp = _near_equal_selection_pool(
+        candidates,
+        best_cp,
+        adaptive_max_rank
     )
-
-    safe = [
-        c
-        for c in candidates
-        if (
-            c["cp"] >= near_equal_floor
-            and c["rank"] <= adaptive_max_rank
-        )
-    ]
 
     if not safe:
         safe = [best]
 
     rank_weights = {
-        0: 0.75,
-        1: 0.84,
+        0: 0.85,
+        1: 0.90,
         2: 0.98,
         3: 1.04,
         4: 1.08,
@@ -3173,6 +3202,10 @@ def choose_stockfish_move(
         )
         else safe
     )
+    selection_safe, rank1_streak_broken = _limit_rank1_streak_pool(
+        selection_safe,
+        _rank1_selection_streak
+    )
 
     weighted = []
 
@@ -3182,10 +3215,7 @@ def choose_stockfish_move(
                 candidate,
                 rank_weights.get(
                     candidate["rank"],
-                    max(
-                        0.35,
-                        0.92 - max(0, int(candidate["rank"]) - 14) * 0.006
-                    )
+                    0.3
                 )
             )
         )
@@ -3211,6 +3241,7 @@ def choose_stockfish_move(
             selected = candidate
             break
 
+    _record_rank_selection(selected["rank"])
     return (
         selected["move"],
         selected["info"],
@@ -3219,13 +3250,16 @@ def choose_stockfish_move(
             "current_cp": best_cp,
             "selected_cp": selected["cp"],
             "reason": (
-                f"near-equal shuffle | "
-                f"BEST="
-                f"{best_cp/100:+.2f} "
-                f"SELECTED="
-                f"{selected['cp']/100:+.2f} "
-                f"RANK=#"
-                f"{selected['rank'] + 1}"
+                (
+                    "near-equal recovery shuffle | "
+                    if selection_drop_cp > 20
+                    else "near-equal shuffle | "
+                )
+                + f"BEST={best_cp/100:+.2f} "
+                + f"SELECTED={selected['cp']/100:+.2f} "
+                + f"RANK=#{selected['rank'] + 1} "
+                + f"DROP_CAP={selection_drop_cp/100:.2f} "
+                + ("RANK1_STREAK_BREAK" if rank1_streak_broken else "RANK1_STREAK_OK")
             )
         }
     )
