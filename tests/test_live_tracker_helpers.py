@@ -3,7 +3,11 @@ import unittest
 
 import chess
 from seleniumbase_live_game_tracker import (
+    PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP,
+    PREMOVE_OPENING_MAX_EVAL_DROP_CP,
+    PREMOVE_OPENING_MIN_BOT_EVAL_CP,
     PlayerSideResolver,
+    calculate_engine_search_limit,
     choose_mate_phase_premove,
     infer_move_between_fens,
     premove_phase_allowed,
@@ -35,6 +39,27 @@ class PlayerSideResolverTests(unittest.TestCase):
         self.assertEqual(resolver.resolve(None, "black"), "black")
         resolver.reset_for_new_game()
         self.assertIsNone(resolver.resolve(None, "black"))
+
+
+class LateClockAndPremoveSafetyTests(unittest.TestCase):
+    def test_engine_search_is_capped_at_four_ms_with_7_to_10_seconds_left(self):
+        board = chess.Board()
+        for remaining in (7.0, 8.0, 9.0, 10.0):
+            with self.subTest(remaining=remaining):
+                limit = calculate_engine_search_limit(
+                    base_seconds=5.0,
+                    remaining_seconds=remaining,
+                    initial_seconds=60.0,
+                    increment_seconds=0.0,
+                    board=board,
+                )
+                self.assertGreater(limit, 0.0)
+                self.assertLessEqual(limit, 0.004)
+
+    def test_premove_evaluation_guards_reject_large_drops(self):
+        self.assertEqual(PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP, 50)
+        self.assertEqual(PREMOVE_OPENING_MAX_EVAL_DROP_CP, 50)
+        self.assertEqual(PREMOVE_OPENING_MIN_BOT_EVAL_CP, -50)
 
 
 class PremovePhaseTests(unittest.TestCase):
