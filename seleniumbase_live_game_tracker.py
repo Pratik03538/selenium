@@ -3723,6 +3723,7 @@ def main() -> int:
     last_auto_attempt_fen = ""
     last_premove_attempt_fen = ""
     last_low_clock_premove_fen = ""
+    last_premove_gate_report_fen = ""
     strategy_board = None
     strategy_board_fen = ""
     active_bot_color = configured_bot_color
@@ -4176,6 +4177,7 @@ def main() -> int:
                                     last_auto_attempt_fen = ""
                                     last_premove_attempt_fen = ""
                                     last_low_clock_premove_fen = ""
+                                    last_premove_gate_report_fen = ""
                                     side_resolver.reset_for_new_game()
                                     active_bot_color = side_resolver.resolve(api_bot_color, player_name_color)
                                 elif strategy_transition is not None:
@@ -4800,7 +4802,7 @@ def main() -> int:
                                 and not side_matches_bot
                                 and not color_conflict
                                 and not turn_conflict
-                                and api_my_turn is not True
+                                and (api_my_turn is not True or api_turn_color == side_to_move)
                                 and (
                                     fen != last_premove_attempt_fen
                                     or (
@@ -4948,6 +4950,31 @@ def main() -> int:
                                             )
                                 except (chess.engine.EngineError, ValueError, WebDriverException, RuntimeError, TypeError):
                                     print("[PREMOVE] Candidate calculation/submission failed; normal turn handling remains enabled.", flush=True)
+                            else:
+                                if fen and fen != last_premove_gate_report_fen:
+                                    last_premove_gate_report_fen = fen
+                                    if not args.auto_play:
+                                        gate_reason = "autoplay-disabled"
+                                    elif not args.premove_enabled:
+                                        gate_reason = "premove-disabled"
+                                    elif active_bot_color not in {"white", "black"}:
+                                        gate_reason = "bot-side-unverified"
+                                    elif side_matches_bot:
+                                        gate_reason = "it-is-the-bot-turn"
+                                    elif color_conflict:
+                                        gate_reason = "player-side-conflict"
+                                    elif turn_conflict:
+                                        gate_reason = "FEN-turn-conflict"
+                                    elif api_my_turn is True and api_turn_color != side_to_move:
+                                        gate_reason = "API-my-turn-signal-does-not-match-FEN-turn"
+                                    elif engine_board.is_game_over(claim_draw=True):
+                                        gate_reason = "game-over"
+                                    elif fen == last_premove_attempt_fen:
+                                        gate_reason = "already-attempted-this-position"
+                                    else:
+                                        gate_reason = "premove-trigger-conditions-not-met"
+                                    print("[PREMOVE GATE] Not attempted: " + gate_reason + ".", flush=True)
+
                 if low_clock_polling_active:
                     if settings_window is not None:
                         settings_window.responsive_sleep(0.005)
