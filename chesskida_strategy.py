@@ -117,6 +117,7 @@ _rank1_selection_streak = 0
 _thinking_warmup_moves = None
 _book_fast_move_limit = None
 _thinking_clock_reserve_fraction = None
+_quick_only_clock_threshold = None
 
 
 def _near_equal_selection_pool(candidates, best_cp, rank_cap):
@@ -357,7 +358,7 @@ def _sample_base_move_delay(
     forced=False,
     opening_book=False,
 ) -> float:
-    """Sample visibly broad timing bands without clustering around one tenth."""
+    """Continuously sample a varied delay scaled by current position complexity."""
     complexity = _timing_position_complexity(
         board, move, engine_result=engine_result, selection_meta=selection_meta
     )
@@ -383,7 +384,7 @@ def _sample_base_move_delay(
     )
 
 def _sample_thinking_pause(pause_max: float, complexity: float = 0.0) -> float:
-    """Use a varied short/medium/long mixture instead of a repeated uniform 2-5s wait."""
+    """Sample a continuous thinking pause, bounded by available clock and budget."""
     high = max(0.0, float(pause_max))
     if high <= 0.0:
         return 0.0
@@ -515,6 +516,7 @@ def natural_bot_move_delay(
     global _thinking_warmup_moves
     global _book_fast_move_limit
     global _thinking_clock_reserve_fraction
+    global _quick_only_clock_threshold
 
     if _thinking_budget_remaining is None or len(board.move_stack) <= 1:
         _bot_timing_move_count = 0
@@ -523,6 +525,9 @@ def natural_bot_move_delay(
         _thinking_clock_reserve_fraction = random.uniform(0.30, 0.43)
         if initial_time_seconds is not None and float(initial_time_seconds) > 0:
             initial_clock = float(initial_time_seconds)
+            _quick_only_clock_threshold = min(
+                25.0, max(5.0, initial_clock * random.uniform(0.14, 0.32))
+            )
             # Sample a fresh game budget while protecting time for later turns.
             expected = _estimate_remaining_decisions(board)
             increment = max(0.0, float(increment_seconds or 0.0))
@@ -534,6 +539,7 @@ def natural_bot_move_delay(
                 initial_clock * think_fraction + increment * expected * increment_share,
             )
         else:
+            _quick_only_clock_threshold = random.uniform(8.0, 25.0)
             _thinking_budget_total = random.uniform(
                 BOT_THINK_BUDGET_MIN, BOT_THINK_BUDGET_MAX
             )
@@ -691,7 +697,10 @@ def natural_bot_move_delay(
         return max(0.0, float(delay))
 
     # Under 25s on our own clock, use quick moves and avoid discretionary pauses.
-    if own_clock is not None and own_clock <= 25.0:
+    if (
+        own_clock is not None
+        and own_clock <= float(_quick_only_clock_threshold or 25.0)
+    ):
         return max(0.0, float(delay))
 
     # Late/endgame positions use occasional short pauses rather than the
