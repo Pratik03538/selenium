@@ -188,5 +188,26 @@ class MaterialSafetyAndPriorityTests(unittest.TestCase):
         self.assertEqual(meta.get("source"), "QUEEN_PROMOTION")
 
 
+class FastClockProtectionTests(unittest.TestCase):
+    def test_discretionary_endgame_pauses_are_disabled(self):
+        self.assertEqual(strategy.BOT_ENDGAME_PAUSE_CHANCE, 0.0)
+
+    def test_low_clock_delay_budget_is_capped_at_150ms(self):
+        board = chess.Board()
+        move = chess.Move.from_uci("e2e4")
+        delay = strategy.natural_bot_move_delay(
+            board,
+            move,
+            thinking_enabled=True,
+            remaining_time_seconds=8.0,
+            low_clock_trigger_seconds=9.0,
+            low_clock_total_budget_seconds=0.200,
+            elapsed_seconds_before_delay=0.0,
+            submission_reserve_seconds=0.0,
+        )
+        self.assertGreaterEqual(delay, 0.0)
+        self.assertLessEqual(delay, 0.150)
+
+
 if __name__ == "__main__":
     unittest.main()
