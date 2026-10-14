@@ -1151,6 +1151,55 @@ def is_start_position(fen: str) -> bool:
 
 
 
+JS_INSTALL_AUTO_NEXT_GAME = r"""
+(() => {
+  try { window.__ownedSiteAutoNextGame?.observer?.disconnect?.(); } catch (_) {}
+  let handled = null, timer = null;
+  const visible = e => !!e && e.isConnected && e.getClientRects().length > 0 &&
+    getComputedStyle(e).display !== "none" && getComputedStyle(e).visibility !== "hidden";
+  const label = e => String(e?.innerText || e?.textContent || e?.getAttribute?.("aria-label") || "")
+    .replace(/\\s+/g, " ").trim();
+  function check() {
+    const modal = document.querySelector(".game-over-modal-shell-container");
+    if (!visible(modal)) {
+      handled = null;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      return;
+    }
+    if (handled === modal || timer !== null) return;
+    handled = modal;
+    const delay = 2000 + Math.floor(Math.random() * 3001);
+    console.info("[AUTO NEXT GAME] Scheduled in " + (delay / 1000).toFixed(2) + "s.");
+    timer = setTimeout(() => {
+      timer = null;
+      if (document.querySelector(".game-over-modal-shell-container") !== modal || !visible(modal)) return;
+      const buttons = [...modal.querySelectorAll("button,[role='button']")].filter(
+        e => visible(e) && !e.disabled && e.getAttribute("aria-disabled") !== "true"
+      );
+      const button = buttons.find(e => /^New\\s+1\\s+min$/i.test(label(e))) ||
+        buttons.find(e => /^New(?:\\s|$)/i.test(label(e)) && !/\\bRematch\\b/i.test(label(e)));
+      if (!button) {
+        console.warn("[AUTO NEXT GAME] No enabled New button found; Rematch will not be clicked.");
+        return;
+      }
+      console.info("[AUTO NEXT GAME] Clicking: " + label(button));
+      button.click();
+    }, delay);
+  }
+  const observer = new MutationObserver(check);
+  observer.observe(document.documentElement || document.body, {
+    childList: true, subtree: true, characterData: true, attributes: true
+  });
+  window.__ownedSiteAutoNextGame = {
+    observer,
+    stop() { try { observer.disconnect(); } catch (_) {} if (timer !== null) clearTimeout(timer); timer = null; handled = null; }
+  };
+  check();
+  return {installed: true};
+})();
+"""
+
 _CLOCK_MMSS_RE = re.compile(r"^(\d+):([0-5]?\d)(?:\.(\d+))?$")
 _CLOCK_HHMMSS_RE = re.compile(r"^(\d+):([0-5]?\d):([0-5]?\d)(?:\.(\d+))?$")
 
@@ -1940,6 +1989,16 @@ def parse_args() -> argparse.Namespace:
     premove_group.add_argument("--premove", dest="premove_enabled", action="store_true", help="Try best-effort premoves on the configured authorized site.")
     premove_group.add_argument("--no-premove", dest="premove_enabled", action="store_false", help="Disable premove attempts.")
     parser.set_defaults(premove_enabled=None)
+    next_game_group = parser.add_mutually_exclusive_group()
+    next_game_group.add_argument(
+        "--auto-next-game", dest="auto_next_game", action="store_true",
+        help="On the configured authorized test site, click a New-game button 2-5 seconds after game over.",
+    )
+    next_game_group.add_argument(
+        "--no-auto-next-game", dest="auto_next_game", action="store_false",
+        help="Disable automatic next-game clicks.",
+    )
+    parser.set_defaults(auto_next_game=None)
     return parser.parse_args()
 
 
@@ -1972,6 +2031,13 @@ def main() -> int:
         raw_premove = load_optional_txt_setting("premove_enabled").strip().lower()
         args.premove_enabled = raw_premove in {"1", "true", "yes", "on", "enabled"} if raw_premove else True
     print(f"[CONFIG] Premove attempts: {'enabled' if args.premove_enabled else 'disabled'}.", flush=True)
+    if args.auto_next_game is None:
+        next_setting = load_optional_txt_setting("auto_next_game").strip().lower()
+        args.auto_next_game = next_setting in {"1", "true", "yes", "on", "enabled"}
+    if args.auto_next_game and not args.auto_play:
+        print("[CONFIG ERROR] auto_next_game requires auto_play=true on an authorized test site.", file=sys.stderr, flush=True)
+        return 2
+    print(f"[CONFIG] Automatic next game: {'enabled' if args.auto_next_game else 'disabled'}.", flush=True)
     if args.allowed_domain.strip():
         allowed_host = normalize_host(args.allowed_domain)
         settings_source = "command-line settings"
@@ -2168,6 +2234,11 @@ def main() -> int:
         driver.switch_to.window(chosen_handle)
         check_target(driver.current_url, allowed_host)
         installed = driver.execute_script(JS_INSTALL_OBSERVER, cfg)
+        if args.auto_next_game:
+            next_state = driver.execute_script(JS_INSTALL_AUTO_NEXT_GAME)
+            if not isinstance(next_state, dict) or not next_state.get("installed"):
+                raise RuntimeError("Could not install the next-game handler.")
+            print("[AUTO NEXT GAME] Installed: 2-5 second delay; clicks New only, never Rematch.", flush=True)
         print("[CONNECTED] Selected browser tab.", flush=True)
         print(
             f"[BOARD] found={installed.get('boardFound')} | "
