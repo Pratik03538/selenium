@@ -19,7 +19,7 @@ BOT_EVERY_MOVE_DELAY_MIN = 0.035
 BOT_EVERY_MOVE_DELAY_MAX = 2.100
 BOT_THINKING_ENABLED_DEFAULT = True
 BOT_THINKING_START_AFTER_MOVE = 5
-BOT_BOOK_INSTANT_MOVES = 8
+BOT_BOOK_INSTANT_MOVES = 5
 BOT_ENDGAME_PAUSE_MIN = 0.25
 BOT_ENDGAME_PAUSE_MAX = 2.400
 BOT_ENDGAME_PAUSE_CHANCE = 0.20
@@ -508,7 +508,7 @@ def natural_bot_move_delay(
       * book/tactical moves stay relatively quick but are not always zero-delay
       * thinking pauses use a skewed short/medium/long distribution
       * optional pauses remain clock-bounded and consume a finite game budget
-      * the first eight moves avoid multi-second pauses
+      * the sampled opening warm-up avoids multi-second pauses
     """
     global _last_bot_natural_delay
     global _bot_timing_move_count
@@ -701,7 +701,7 @@ def natural_bot_move_delay(
     except Exception:
         pass
 
-    # First eight bot moves: no long pause.
+    # Sampled opening warm-up moves: no long pause.
     if _bot_timing_move_count <= int(_thinking_warmup_moves or BOT_THINKING_START_AFTER_MOVE):
         return max(0.0, float(delay))
 
@@ -913,7 +913,7 @@ def natural_bot_move_delay(
     # Position-dependent random eligibility.
     #
     # Important: there is NO target like "pause again at move 8/10/12".
-    # The 5-8 block above is only a hard minimum. Once it expires, this
+    # The sampled opening block above is only a hard minimum. Once it expires, this
     # stochastic position gate is evaluated independently on each move.
     # Weak/quiet positions tend to wait longer; genuinely rich positions
     # can pause soon after the minimum block.
