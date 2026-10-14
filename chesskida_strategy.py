@@ -590,12 +590,12 @@ def natural_bot_move_delay(
     if own_clock is not None and own_clock <= low_clock_threshold:
         try:
             total_budget = (
-                random.choice((0.100, 0.125, 0.150))
+                random.choice((0.030, 0.040, 0.050))
                 if low_clock_total_budget_seconds is None
-                else min(0.150, max(0.075, float(low_clock_total_budget_seconds)))
+                else min(0.060, max(0.020, float(low_clock_total_budget_seconds)))
             )
         except (TypeError, ValueError):
-            total_budget = random.choice((0.100, 0.125, 0.150))
+            total_budget = random.choice((0.030, 0.040, 0.050))
         try:
             elapsed_before = max(0.0, float(elapsed_seconds_before_delay))
         except (TypeError, ValueError):
