@@ -3383,6 +3383,7 @@ def main() -> int:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         new_file = not csv_path.exists() or csv_path.stat().st_size == 0
         previous_fen = ""
+        last_dashboard_eval_fen = ""
         reconstructed_history: list[dict[str, str]] = []
         game_number = 1
         if chess is None:
@@ -3717,6 +3718,65 @@ def main() -> int:
                             settings_window.update_game_status(
                                 game_number, dashboard_board, bot_color=active_bot_color
                             )
+
+                            # Refresh the advantage bar after an opponent position
+                            # change too, without requesting another 100-line MultiPV.
+                            # The quick one-line probe is skipped in very low-clock
+                            # situations so the next move remains responsive.
+                            bot_color_value = (
+                                chess.WHITE if active_bot_color == "white"
+                                else chess.BLACK if active_bot_color == "black"
+                                else None
+                            )
+                            bot_to_move = (
+                                bot_color_value is not None
+                                and dashboard_board.turn == bot_color_value
+                            )
+                            if (
+                                engine is not None
+                                and fen != last_dashboard_eval_fen
+                                and not bot_to_move
+                            ):
+                                bot_clock_for_dashboard = (
+                                    white_clock_seconds if active_bot_color == "white"
+                                    else black_clock_seconds if active_bot_color == "black"
+                                    else None
+                                )
+                                safe_to_probe = (
+                                    not short_control_fast_mode
+                                    and (
+                                        bot_clock_for_dashboard is None
+                                        or bot_clock_for_dashboard > low_clock_trigger_seconds
+                                    )
+                                )
+                                if safe_to_probe:
+                                    try:
+                                        quick_limit = max(
+                                            0.008,
+                                            min(0.045, float(args.engine_time) * 0.15),
+                                        )
+                                        quick_info = engine.analyse(
+                                            dashboard_board,
+                                            chess.engine.Limit(time=quick_limit),
+                                            multipv=1,
+                                        )
+                                        if isinstance(quick_info, list):
+                                            quick_info = quick_info[0] if quick_info else None
+                                        if isinstance(quick_info, dict):
+                                            quick_score = quick_info.get("score")
+                                            if quick_score is not None:
+                                                quick_eval_white_cp = strategy_module.score_to_cp(
+                                                    quick_score.pov(chess.WHITE)
+                                                ) if strategy_module is not None else quick_score.pov(chess.WHITE).score(
+                                                    mate_score=100000
+                                                )
+                                                settings_window.update_evaluation(
+                                                    quick_eval_white_cp,
+                                                    source="Live position quick eval",
+                                                )
+                                    except Exception:
+                                        pass
+                                last_dashboard_eval_fen = fen
                         except (ValueError, IndexError):
                             pass
 
