@@ -1421,6 +1421,11 @@ def find_priority_queen_promotion(
                 "reason_tag": "QUEEN PROMOTION MATE"
             }
 
+        # A promotion is a priority only if it does not simply leave material
+        # hanging. The helper also checks captures of pieces uncovered elsewhere.
+        if candidate_hangs_own_piece(board, move):
+            continue
+
         # Never force a queen promotion when the newly promoted queen can be
         # immediately captured and the engine did not consider the move.
         if candidate is None:
@@ -1682,6 +1687,9 @@ def find_priority_capture(
 
     for move in board.legal_moves:
         if not board.is_capture(move):
+            continue
+
+        if candidate_hangs_own_piece(board, move):
             continue
 
         victim_square = move.to_square
@@ -1958,30 +1966,31 @@ def candidate_hangs_own_piece(
     board,
     move
 ):
-    """Reject obvious one-move giveaways.
+    """Reject a move that lets the opponent win material with an immediate capture.
 
-    This is intentionally conservative: a check/mate or a materially winning
-    capture can still be a deliberate sacrifice. Otherwise a moved piece that
-    can be taken next move without a recapture is rejected when that sequence
-    loses material.
+    Check all friendly pieces after the move, not just the piece that moved.
+    A capture made by this move can justify the exchange only when its material
+    value is at least as large as the piece that would otherwise be lost.
+    Checkmate is always exempt; ordinary checks still have their legal replies
+    inspected so a checking move cannot automatically excuse a free giveaway.
     """
     try:
-        if board.gives_check(move):
-            return False
+        mover_color = board.turn
+        captured_square = move.to_square
+        if board.is_en_passant(move):
+            captured_square = (
+                move.to_square - 8
+                if mover_color == chess.WHITE
+                else move.to_square + 8
+            )
 
-        before_victim = board.piece_at(move.to_square)
-        victim_value = (
-            material_value(before_victim.piece_type)
-            if before_victim is not None
-            and before_victim.color != board.turn
+        captured_piece = board.piece_at(captured_square)
+        captured_value = (
+            material_value(captured_piece.piece_type)
+            if captured_piece is not None
+            and captured_piece.color != mover_color
             else 0
         )
-
-        moved_piece = board.piece_at(move.from_square)
-        if moved_piece is None:
-            return True
-
-        moved_value = material_value(moved_piece.piece_type)
 
         after = board.copy(stack=False)
         after.push(move)
@@ -1990,36 +1999,44 @@ def candidate_hangs_own_piece(
             return False
 
         for reply in after.legal_moves:
-            if reply.to_square != move.to_square:
+            if not after.is_capture(reply):
                 continue
 
-            reply_piece = after.piece_at(reply.from_square)
-            if reply_piece is None:
+            victim_square = reply.to_square
+            if after.is_en_passant(reply):
+                victim_square = (
+                    reply.to_square - 8
+                    if after.turn == chess.WHITE
+                    else reply.to_square + 8
+                )
+
+            victim = after.piece_at(victim_square)
+            if victim is None or victim.color != mover_color:
+                continue
+
+            victim_value = material_value(victim.piece_type)
+            if victim_value <= captured_value:
                 continue
 
             after_reply = after.copy(stack=False)
             after_reply.push(reply)
 
-            recaptured = any(
+            # If we can immediately recapture the attacker on its destination,
+            # the reply is not a free material giveaway.
+            can_recapture = any(
                 response.to_square == reply.to_square
                 for response in after_reply.legal_moves
             )
-
-            if recaptured:
+            if can_recapture:
                 continue
 
-            # Net material swing after the opponent takes our moved piece.
-            # Negative means the move simply gave material away.
-            net = victim_value - moved_value
-
-            if net < 0 and moved_value >= 100:
-                return True
+            return True
 
         return False
 
     except Exception:
-        # Safety-first fallback: unknown candidates are not rejected here;
-        # the existing engine score and physical verification remain in force.
+        # Keep the existing conservative fallback: engine evaluation remains
+        # the final authority when a tactical position cannot be checked.
         return False
 
 def _movable_piece_count_for_color(board, color) -> int:
@@ -2576,59 +2593,59 @@ def choose_stockfish_move(
             }
         )
 
+    # Convert an extra pawn when a queen promotion is genuinely
+    # available. Promotion is a stronger conversion priority than
+    # wandering/shuffling in a winning position.
+    priority_promotion = find_priority_queen_promotion(
+        board,
+        candidates,
+        best_cp
+    )
+
+    if priority_promotion is not None:
+        return (
+            priority_promotion["move"],
+            priority_promotion["info"],
+            {
+                "rank": priority_promotion["rank"],
+                "current_cp": best_cp,
+                "selected_cp": priority_promotion["cp"],
+                "source": "QUEEN_PROMOTION",
+                "reason": (
+                    f"{priority_promotion['reason_tag']} | "
+                    f"TARGET={chess.square_name(priority_promotion['move'].to_square)}"
+                )
+            }
+        )
+
+    # Before normal fuzzy selection, prefer safe captures so "human-like"
+    # does not become "wander around while a free piece is hanging".
+    priority_capture = find_priority_capture(
+        board,
+        candidates,
+        best_cp,
+        engine=engine
+    )
+
+    if priority_capture is not None:
+        return (
+            priority_capture["move"],
+            priority_capture["info"],
+            {
+                "rank": priority_capture["rank"],
+                "current_cp": best_cp,
+                "selected_cp": priority_capture["cp"],
+                "source": "CAPTURE_PRIORITY",
+                "reason": (
+                    f"{priority_capture['reason_tag']} | "
+                    f"TARGET={chess.square_name(priority_capture['move'].to_square)} "
+                    f"VICTIM={priority_capture['victim_value']/100:.1f} "
+                    f"{'FREE' if priority_capture['free'] else 'LIQUIDATION'}"
+                )
+            }
+        )
+
     if best_cp > MIN_POSITIVE_CP:
-        # Convert an extra pawn when a queen promotion is genuinely
-        # available. Promotion is a stronger conversion priority than
-        # wandering/shuffling in a winning position.
-        priority_promotion = find_priority_queen_promotion(
-            board,
-            candidates,
-            best_cp
-        )
-
-        if priority_promotion is not None:
-            return (
-                priority_promotion["move"],
-                priority_promotion["info"],
-                {
-                    "rank": priority_promotion["rank"],
-                    "current_cp": best_cp,
-                    "selected_cp": priority_promotion["cp"],
-                    "source": "QUEEN_PROMOTION",
-                    "reason": (
-                        f"{priority_promotion['reason_tag']} | "
-                        f"TARGET={chess.square_name(priority_promotion['move'].to_square)}"
-                    )
-                }
-            )
-
-        # Before normal fuzzy selection, prefer safe captures so "human-like"
-        # does not become "wander around while a free piece is hanging".
-        priority_capture = find_priority_capture(
-            board,
-            candidates,
-            best_cp,
-            engine=engine
-        )
-
-        if priority_capture is not None:
-            return (
-                priority_capture["move"],
-                priority_capture["info"],
-                {
-                    "rank": priority_capture["rank"],
-                    "current_cp": best_cp,
-                    "selected_cp": priority_capture["cp"],
-                    "source": "CAPTURE_PRIORITY",
-                    "reason": (
-                        f"{priority_capture['reason_tag']} | "
-                        f"TARGET={chess.square_name(priority_capture['move'].to_square)} "
-                        f"VICTIM={priority_capture['victim_value']/100:.1f} "
-                        f"{'FREE' if priority_capture['free'] else 'LIQUIDATION'}"
-                    )
-                }
-            )
-
         normal_max_drop = safe_drop_fraction(
             best_cp
         )
@@ -2807,21 +2824,23 @@ def choose_stockfish_move(
                 c["cp"] >= selection_floor_cp
                 and c["cp"] > 0
                 and c["rank"] <= effective_rank_cap
-                and (
-                    not winning_guard
-                    or not candidate_hangs_own_piece(
-                        board,
-                        c["move"]
-                    )
+                and not candidate_hangs_own_piece(
+                    board,
+                    c["move"]
                 )
             )
         ]
 
         if not safe:
-            safe = [best]
-
-        if not safe:
-            safe = [best]
+            material_safe = [
+                c for c in candidates
+                if not candidate_hangs_own_piece(board, c["move"])
+            ]
+            safe = (
+                [max(material_safe, key=lambda c: c["cp"])]
+                if material_safe
+                else [best]
+            )
 
         non_best = [
             c
@@ -3029,12 +3048,9 @@ def choose_stockfish_move(
                 and candidate["rank"] <= effective_rank_cap
                 and candidate["cp"] >= diversity_floor_cp
                 and candidate["cp"] > 0
-                and (
-                    not winning_guard
-                    or not candidate_hangs_own_piece(
-                        board,
-                        candidate["move"]
-                    )
+                and not candidate_hangs_own_piece(
+                    board,
+                    candidate["move"]
                 )
             )
         ]
@@ -3166,8 +3182,24 @@ def choose_stockfish_move(
         adaptive_max_rank
     )
 
+    safe = [
+        candidate
+        for candidate in safe
+        if not candidate_hangs_own_piece(board, candidate["move"])
+    ]
+
     if not safe:
-        safe = [best]
+        material_safe = [
+            candidate
+            for candidate in candidates
+            if not candidate_hangs_own_piece(board, candidate["move"])
+        ]
+        if material_safe:
+            best_safe = max(material_safe, key=lambda candidate: candidate["cp"])
+            safe = [best_safe]
+            selection_drop_cp = max(0, best_cp - best_safe["cp"])
+        else:
+            safe = [best]
 
     rank_weights = {
         0: 0.85,
