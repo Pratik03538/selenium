@@ -111,7 +111,7 @@ class LosingPositionIntegrationTests(unittest.TestCase):
 
 class MaterialSafetyAndPriorityTests(unittest.TestCase):
     def test_detects_a_move_that_uncovers_a_free_rook(self):
-        board = chess.Board("4k3/8/8/8/8/5q2/4P3/4K2R w - - 0 1")
+        board = chess.Board("4k3/8/8/8/8/5q2/4P3/K2R4 w - - 0 1")
         self.assertTrue(
             strategy.candidate_hangs_own_piece(
                 board, chess.Move.from_uci("e2e3")
