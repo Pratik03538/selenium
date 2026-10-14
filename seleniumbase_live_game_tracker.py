@@ -2153,7 +2153,7 @@ def calculate_engine_search_limit(
     # At <=10s, cap engine work hard so calculation doesn't consume the
     # time needed to submit and confirm a move.
     if remaining <= 10.0:
-        return max(0.001, min(base, 0.010, remaining * 0.05))
+        return max(0.001, min(base, 0.004, remaining * 0.02))
     initial = max(1.0, float(initial_seconds or remaining or 1.0))
     increment = max(0.0, min(float(increment_seconds or 0.0), 60.0))
 
@@ -3862,7 +3862,7 @@ def main() -> int:
                     low_clock_polling_active = (
                         own_clock_for_poll is not None
                         and (short_control_fast_mode or own_clock_for_poll <= low_clock_trigger_seconds)
-                        and (args.clock_management or args.low_clock_extra_premoves)
+                        and (args.clock_management or args.premove_enabled)
                     )
                     if low_clock_polling_active != last_fast_polling_state:
                         try:
@@ -4414,14 +4414,14 @@ def main() -> int:
                                         and (short_control_fast_mode or remaining_clock_seconds <= low_clock_trigger_seconds)
                                     )
                                     low_clock_total_budget_seconds = (
-                                        random.choice((0.075, 0.100, 0.125))
+                                        random.choice((0.025, 0.035, 0.045))
                                         if (
                                             low_clock_mode
                                             and remaining_clock_seconds is not None
                                             and opponent_clock_seconds is not None
                                             and remaining_clock_seconds <= opponent_clock_seconds
                                         )
-                                        else random.choice((0.100, 0.125, 0.150))
+                                        else random.choice((0.030, 0.040, 0.050))
                                         if low_clock_mode else None
                                     )
                                     if low_clock_mode:
@@ -4472,8 +4472,15 @@ def main() -> int:
                                             )
                                         engine_result = engine.analyse(
                                             engine_board,
-                                            chess.engine.Limit(depth=12, time=limit_seconds),
-                                            multipv=strategy_module.TRAINING_MULTI_PV,
+                                            chess.engine.Limit(
+                                                depth=8 if low_clock_mode else 12,
+                                                time=limit_seconds,
+                                            ),
+                                            multipv=(
+                                                min(3, strategy_module.TRAINING_MULTI_PV)
+                                                if low_clock_mode
+                                                else strategy_module.TRAINING_MULTI_PV
+                                            ),
                                         )
                                         if not isinstance(engine_result, list):
                                             engine_result = [engine_result]
@@ -4722,19 +4729,18 @@ def main() -> int:
                                     else white_clock_seconds
                                 )
                                 low_clock_premove_mode = (
-                                    args.low_clock_extra_premoves
-                                    and bot_clock_for_premove is not None
+                                    bot_clock_for_premove is not None
                                     and (short_control_fast_mode or bot_clock_for_premove <= low_clock_trigger_seconds)
                                 )
                                 low_clock_premove_budget_seconds = (
-                                    random.choice((0.075, 0.100, 0.125))
+                                    random.choice((0.025, 0.035, 0.045))
                                     if (
                                         low_clock_premove_mode
                                         and bot_clock_for_premove is not None
                                         and opponent_clock_for_premove is not None
                                         and bot_clock_for_premove <= opponent_clock_for_premove
                                     )
-                                    else random.choice((0.100, 0.125, 0.150))
+                                    else random.choice((0.030, 0.040, 0.050))
                                     if low_clock_premove_mode else None
                                 )
                                 if low_clock_premove_mode:
@@ -4793,9 +4799,7 @@ def main() -> int:
                                                     time.sleep(wait_remaining)
                                         if settings_window is not None:
                                             settings_window.pump()
-                                        if not args.auto_play or not args.premove_enabled or (
-                                            low_clock_premove_mode and not args.low_clock_extra_premoves
-                                        ):
+                                        if not args.auto_play or not args.premove_enabled:
                                             premove_submit = {"ok": False, "reason": "bot-or-extra-premove-disabled-in-settings"}
                                         elif args.move_input == "cursor":
                                             premove_submit = perform_cursor_drag(
