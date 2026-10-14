@@ -2969,6 +2969,11 @@ def main() -> int:
         clock_increment_seconds = max(0.0, float(raw_increment_setting or 0.0))
     except ValueError:
         clock_increment_seconds = 0.0
+    # Increment is auto-detected by default so one TXT value cannot bias 3+2,
+    # 1+1, 1-minute, and 10-second games alike. Set clock_increment_fixed=true
+    # to deliberately pin clock_increment_seconds.
+    if not clock_increment_is_configured:
+        clock_increment_seconds = 0.0
     clock_increment_samples = []
     last_seen_clock_by_side = {"white": None, "black": None}
     clock_source_reported = False
