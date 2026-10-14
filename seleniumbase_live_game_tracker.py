@@ -2460,10 +2460,11 @@ def main() -> int:
         args.premove_enabled = raw_premove in {"1", "true", "yes", "on", "enabled"} if raw_premove else True
     print(f"[CONFIG] Premove attempts: {'enabled' if args.premove_enabled else 'disabled'}.", flush=True)
     if args.auto_next_game is None:
-        args.auto_next_game = True
-    if args.auto_next_game and not args.auto_play:
-        print("[CONFIG ERROR] auto_next_game requires auto_play=true on an authorized test site.", file=sys.stderr, flush=True)
-        return 2
+        next_setting = load_optional_txt_setting("auto_next_game").strip().lower()
+        args.auto_next_game = (
+            next_setting in {"1", "true", "yes", "on", "enabled"}
+            if next_setting else True
+        )
     print(f"[CONFIG] Automatic next game: {'enabled' if args.auto_next_game else 'disabled'}.", flush=True)
     if args.allowed_domain.strip():
         allowed_host = normalize_host(args.allowed_domain)
