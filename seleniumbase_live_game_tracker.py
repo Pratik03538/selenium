@@ -851,7 +851,7 @@ function snapshot() {
     result: readText(cfg.resultSelector)
   };
 }
-const state = {queue: [], lastSignature: null, observer: null, pollTimer: null, lastError: null, snapshot};
+const state = {queue: [], lastSignature: null, observer: null, pollTimer: null, pollIntervalMs: 200, lastError: null, snapshot};
 function refresh(forceRoots = false) {
   try {
     if (forceRoots) rootsDeep(document, true);
@@ -874,6 +874,17 @@ window.__liveGameApiReader = {
   status: () => ({lastError: state.lastError, pending: state.queue.length}),
   drain: () => state.queue.splice(0, state.queue.length),
   current: () => state.snapshot(),
+  setFastPolling: enabled => {
+    const nextIntervalMs = enabled ? 20 : 200;
+    if (state.pollTimer && state.pollIntervalMs === nextIntervalMs) {
+      return {changed: false, intervalMs: nextIntervalMs};
+    }
+    if (state.pollTimer) clearInterval(state.pollTimer);
+    state.pollIntervalMs = nextIntervalMs;
+    state.pollTimer = setInterval(() => refresh(false), nextIntervalMs);
+    refresh(true);
+    return {changed: true, intervalMs: nextIntervalMs};
+  },
   dragTarget: (uci, expectedFen, expectedColor, allowPremove = false) => {
     const board = getBoard();
     const game = board && board.game;
@@ -1345,7 +1356,7 @@ def calculate_engine_search_limit(
 
 def perform_cursor_drag(
     driver, uci: str, expected_fen: str, expected_color: str | None,
-    allow_premove: bool = False,
+    allow_premove: bool = False, low_clock_mode: bool = False,
 ) -> dict[str, object]:
     """Drag a legal move on the configured local/test board.
 
@@ -1417,9 +1428,9 @@ def perform_cursor_drag(
     control_x = min(max(2.0, control_x), width - 2.0)
     control_y = min(max(2.0, control_y), height - 2.0)
 
-    waypoint_count = rng.randint(2, 3)
-    total_drag_ms = rng.randint(8, 90)
-    pre_delay_ms = rng.randint(0, 25)
+    waypoint_count = 1 if low_clock_mode else rng.randint(2, 3)
+    total_drag_ms = rng.randint(5, 12) if low_clock_mode else rng.randint(8, 90)
+    pre_delay_ms = 0 if low_clock_mode else rng.randint(0, 25)
     base_duration, extra_ms = divmod(total_drag_ms, waypoint_count)
     segment_durations = [base_duration] * waypoint_count
     if extra_ms:
@@ -1451,7 +1462,7 @@ def perform_cursor_drag(
         path_points.append((px, py))
 
     source_offset = (round(sx - width / 2.0), round(sy - height / 2.0))
-    hover_ms = rng.randint(8, 25)
+    hover_ms = 0 if low_clock_mode else rng.randint(8, 25)
 
     try:
         # Use W3C pointer actions so each curve segment can receive its own
@@ -1463,7 +1474,7 @@ def perform_cursor_drag(
         pointer = actions.w3c_actions.pointer_action
         pointer.source.create_pointer_move(
             origin=board_element,
-            duration=rng.randint(15, 35),
+            duration=0 if low_clock_mode else rng.randint(15, 35),
             x=source_offset[0],
             y=source_offset[1],
         )
@@ -1496,7 +1507,9 @@ def perform_cursor_drag(
         }
 
     # Confirm the UI accepted this drag before reporting success.
-    deadline = time.monotonic() + (0.45 if allow_premove else 0.90)
+    deadline = time.monotonic() + (
+        0.12 if low_clock_mode else (0.45 if allow_premove else 0.90)
+    )
     while time.monotonic() < deadline:
         try:
             current_fen = driver.execute_script(
@@ -1529,7 +1542,7 @@ def perform_cursor_drag(
                     }
             except WebDriverException:
                 pass
-        time.sleep(0.015)
+        time.sleep(0.003 if low_clock_mode else 0.015)
 
     if allow_premove:
         return {
