@@ -2542,7 +2542,8 @@ def perform_api_premove(
     return result if isinstance(result, dict) else {"ok": False, "reason": "invalid-premove-response"}
 
 
-PREMOVE_OPENING_FULLMOVE_MAX = 5
+PREMOVE_OPENING_FULLMOVE_MIN = 3
+PREMOVE_OPENING_FULLMOVE_MAX = 6
 PREMOVE_ENDGAME_MAX_PIECES = 10
 PREMOVE_MIN_BOT_EVAL_CP = -25
 PREMOVE_MAX_EVAL_DROP_CP = 40
@@ -2556,12 +2557,22 @@ PREMOVE_LIKELY_REPLY_MAX_RANK = 4
 PREMOVE_LIKELY_REPLY_MAX_CP_GAP = 175
 
 
-def premove_phase_allowed(board) -> tuple[bool, str]:
-    """Only permit premoves in the opening or a genuine low-piece endgame."""
+def premove_phase_allowed(
+    board, opening_fullmove_max: int | None = None
+) -> tuple[bool, str]:
+    """Only permit premoves in the sampled opening window or genuine low-piece endgame."""
     if chess is None or board is None:
         return False, "board-unavailable"
     try:
-        if int(board.fullmove_number) <= PREMOVE_OPENING_FULLMOVE_MAX:
+        requested_limit = (
+            PREMOVE_OPENING_FULLMOVE_MAX
+            if opening_fullmove_max is None else int(opening_fullmove_max)
+        )
+        opening_limit = max(
+            PREMOVE_OPENING_FULLMOVE_MIN,
+            min(PREMOVE_OPENING_FULLMOVE_MAX, requested_limit),
+        )
+        if int(board.fullmove_number) <= opening_limit:
             return True, "opening"
         if len(board.piece_map()) <= PREMOVE_ENDGAME_MAX_PIECES:
             return True, "endgame"
@@ -3343,7 +3354,10 @@ def choose_premove_candidate(
     if mate_move is not None:
         return mate_move, mate_reply, mate_reason
 
-    allowed, phase = premove_phase_allowed(board)
+    allowed, phase = premove_phase_allowed(
+        board,
+        getattr(args, "opening_premove_fullmove_max", PREMOVE_OPENING_FULLMOVE_MAX),
+    )
     if not allowed:
         return choose_middle_game_premove(engine, board, strategy_module, bot_color, args)
 
@@ -3751,6 +3765,15 @@ def main() -> int:
     last_seen_clock_by_side = {"white": None, "black": None}
     clock_source_reported = False
     low_clock_trigger_seconds = random.uniform(7.0, 10.0)
+    # Sample one opening premove window per game, then hold it steady until next game.
+    args.opening_premove_fullmove_max = random.randint(
+        PREMOVE_OPENING_FULLMOVE_MIN, PREMOVE_OPENING_FULLMOVE_MAX
+    )
+    print(
+        f"[PREMOVE] Opening premove window sampled: up to "
+        f"{args.opening_premove_fullmove_max} full moves for this game.",
+        flush=True,
+    )
     short_control_fast_mode = False
     print(
         f"[LOW CLOCK] Random late-clock threshold for this game: <= {low_clock_trigger_seconds:.2f}s.",
@@ -3983,6 +4006,14 @@ def main() -> int:
                             clock_increment_seconds = 0.0
                     if is_new_game_snapshot:
                         low_clock_trigger_seconds = random.uniform(7.0, 10.0)
+                        args.opening_premove_fullmove_max = random.randint(
+                            PREMOVE_OPENING_FULLMOVE_MIN, PREMOVE_OPENING_FULLMOVE_MAX
+                        )
+                        print(
+                            f"[PREMOVE] New game opening window sampled: up to "
+                            f"{args.opening_premove_fullmove_max} full moves.",
+                            flush=True,
+                        )
                         print(
                             f"[LOW CLOCK] New game threshold sampled: <= {low_clock_trigger_seconds:.2f}s.",
                             flush=True,
