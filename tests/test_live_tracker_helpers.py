@@ -1,5 +1,7 @@
 """Regression tests for the live tracker safety and history helpers."""
+import time
 import unittest
+from unittest.mock import patch
 
 import chess
 from seleniumbase_live_game_tracker import (
@@ -11,6 +13,8 @@ from seleniumbase_live_game_tracker import (
     PlayerSideResolver,
     normalize_api_bot_color,
     calculate_engine_search_limit,
+    _DeadlineBoundEngine,
+    _PremoveDeadlineExceeded,
     choose_mate_phase_premove,
     infer_move_between_fens,
     premove_phase_allowed,
@@ -81,6 +85,34 @@ class LateClockAndPremoveSafetyTests(unittest.TestCase):
                 self.assertGreater(limit, 0.0)
                 self.assertLessEqual(limit, 0.035)
                 self.assertAlmostEqual(limit, min(0.035, remaining * 0.004))
+
+    def test_relative_clock_deficit_tightens_normal_search_budget(self):
+        board = chess.Board()
+        common = dict(
+            base_seconds=2.0,
+            remaining_seconds=45.0,
+            initial_seconds=120.0,
+            increment_seconds=0.0,
+            board=board,
+        )
+        with patch("seleniumbase_live_game_tracker.random.uniform", return_value=0.10):
+            behind = calculate_engine_search_limit(**common, opponent_seconds=60.0)
+        with patch("seleniumbase_live_game_tracker.random.uniform", return_value=0.28):
+            level = calculate_engine_search_limit(**common, opponent_seconds=45.0)
+        self.assertLess(behind, level)
+
+    def test_expired_premove_deadline_never_calls_engine(self):
+        class FakeEngine:
+            called = False
+            def analyse(self, *_args, **_kwargs):
+                self.called = True
+                return {}
+
+        engine = FakeEngine()
+        proxy = _DeadlineBoundEngine(engine, time.monotonic() - 1.0)
+        with self.assertRaises(_PremoveDeadlineExceeded):
+            proxy.analyse(chess.Board(), chess.engine.Limit(time=0.1, depth=8))
+        self.assertFalse(engine.called)
 
     def test_premove_evaluation_guards_reject_large_drops(self):
         self.assertEqual(PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP, 50)
