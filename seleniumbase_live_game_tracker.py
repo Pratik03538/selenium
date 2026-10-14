@@ -74,8 +74,17 @@ def normalize_chess_color(value: object) -> str | None:
     return None
 
 
+def normalize_api_bot_color(playing_as_color: object, playing_as: object) -> tuple[str | None, bool]:
+    """Normalize both API side fields and flag disagreement instead of picking one."""
+    primary = normalize_chess_color(playing_as_color)
+    fallback = normalize_chess_color(playing_as)
+    if primary and fallback and primary != fallback:
+        return None, True
+    return primary or fallback, False
+
+
 class PlayerSideResolver:
-    """Resolve the bot's color without acting on a transient player-name match."""
+    """Resolve the bot's side once per game; conflicting signals must pause autoplay."""
 
     def __init__(self, fixed_color: str | None = None, player_name_enabled: bool = False):
         self.fixed_color = normalize_chess_color(fixed_color)
@@ -90,24 +99,49 @@ class PlayerSideResolver:
         self.name_candidate_count = 0
 
     def resolve(self, api_color: str | None, player_name_color: str | None) -> str | None:
-        """Prefer explicit/API side. Name-only detection requires two consistent snapshots."""
+        """Lock side per game; a disagreeing source returns None rather than flipping colors."""
+        api_color = normalize_chess_color(api_color)
+        name_color = (
+            normalize_chess_color(player_name_color)
+            if self.player_name_enabled else None
+        )
+
         if self.fixed_color:
             self.active_color = self.fixed_color
+            if (
+                (api_color and api_color != self.fixed_color)
+                or (name_color and name_color != self.fixed_color)
+            ):
+                return None
             return self.active_color
-        api_color = normalize_chess_color(api_color)
+
+        # Once confirmed, a bot cannot change color until a new game is detected.
+        # This prevents one transient API/name snapshot from reversing move preference.
+        if self.active_color:
+            if (
+                (api_color and api_color != self.active_color)
+                or (name_color and name_color != self.active_color)
+            ):
+                return None
+            return self.active_color
+
+        # API evidence is preferred, but conflicting simultaneously visible name
+        # evidence must be resolved before locking the color.
         if api_color:
+            if name_color and name_color != api_color:
+                return None
             self.active_color = api_color
             self.name_candidate = api_color
             self.name_candidate_count = 2
             return self.active_color
-        if not self.player_name_enabled:
-            return self.active_color
 
-        name_color = normalize_chess_color(player_name_color)
+        if not self.player_name_enabled:
+            return None
         if not name_color:
             self.name_candidate = None
             self.name_candidate_count = 0
-            return self.active_color
+            return None
+
         if name_color == self.name_candidate:
             self.name_candidate_count += 1
         else:
@@ -117,11 +151,7 @@ class PlayerSideResolver:
         if self.name_candidate_count >= 2:
             self.active_color = name_color
             return self.active_color
-        # If a previously established name side suddenly conflicts, pause for a
-        # confirming snapshot instead of submitting for either side.
-        if self.active_color and name_color != self.active_color:
-            return None
-        return self.active_color
+        return None
 
 
 def normalize_host(value: str) -> str:
@@ -3850,9 +3880,8 @@ def main() -> int:
                             break
                     fen = str(event.get("fen") or "").strip()
                     dom_moves = event.get("moves") or []
-                    api_bot_color = (
-                        normalize_chess_color(event.get("playingAsColor"))
-                        or normalize_chess_color(event.get("playingAs"))
+                    api_bot_color, api_color_conflict = normalize_api_bot_color(
+                        event.get("playingAsColor"), event.get("playingAs")
                     )
                     player_name_color = normalize_chess_color(event.get("playerNameColor"))
                     active_bot_color = side_resolver.resolve(api_bot_color, player_name_color)
@@ -4324,16 +4353,16 @@ def main() -> int:
                     # explicit bot_color setting. Board orientation is presentation only.
                     if args.auto_play and engine is not None and strategy_module is not None and fen and strategy_board is not None:
                         api_my_turn = event.get("isMyTurn")
-                        api_bot_color = (
-                            normalize_chess_color(event.get("playingAsColor"))
-                            or normalize_chess_color(event.get("playingAs"))
+                        api_bot_color, autoplay_api_color_conflict = normalize_api_bot_color(
+                            event.get("playingAsColor"), event.get("playingAs")
                         )
                         player_name_color = normalize_chess_color(event.get("playerNameColor"))
                         # The resolver above already selected the side once for this
                         # snapshot. The explicit API is authoritative; player-name
                         # evidence is a stable two-snapshot fallback only.
                         color_conflict = bool(
-                            (
+                            autoplay_api_color_conflict
+                            or (
                                 configured_bot_color
                                 and api_bot_color
                                 and api_bot_color != configured_bot_color
@@ -4343,6 +4372,11 @@ def main() -> int:
                                 and api_bot_color
                                 and player_name_color
                                 and api_bot_color != player_name_color
+                            )
+                            or (
+                                active_bot_color
+                                and api_bot_color
+                                and api_bot_color != active_bot_color
                             )
                         )
 
