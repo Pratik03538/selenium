@@ -4,7 +4,9 @@ import unittest
 import chess
 from seleniumbase_live_game_tracker import (
     PlayerSideResolver,
+    choose_mate_phase_premove,
     infer_move_between_fens,
+    premove_phase_allowed,
     reconstruct_history_from_dom_moves,
     uci_move_reaches_fen,
 )
