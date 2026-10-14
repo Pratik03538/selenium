@@ -65,7 +65,7 @@ class PlayerSideResolverTests(unittest.TestCase):
 
 
 class LateClockAndPremoveSafetyTests(unittest.TestCase):
-    def test_engine_search_is_capped_at_four_ms_with_7_to_10_seconds_left(self):
+    def test_engine_search_is_capped_at_35_ms_with_7_to_10_seconds_left(self):
         board = chess.Board()
         for remaining in (7.0, 8.0, 9.0, 10.0):
             with self.subTest(remaining=remaining):
@@ -77,18 +77,34 @@ class LateClockAndPremoveSafetyTests(unittest.TestCase):
                     board=board,
                 )
                 self.assertGreater(limit, 0.0)
-                self.assertLessEqual(limit, 0.004)
+                self.assertLessEqual(limit, 0.035)
+                self.assertAlmostEqual(limit, min(0.035, remaining * 0.004))
 
     def test_premove_evaluation_guards_reject_large_drops(self):
         self.assertEqual(PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP, 50)
-        self.assertEqual(PREMOVE_OPENING_MAX_EVAL_DROP_CP, 50)
+        self.assertEqual(PREMOVE_OPENING_MAX_EVAL_DROP_CP, 60)
         self.assertEqual(PREMOVE_OPENING_MIN_BOT_EVAL_CP, -50)
 
 
 class PremovePhaseTests(unittest.TestCase):
-    def test_opening_premove_window_extends_through_move_ten(self):
-        opening = chess.Board("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 10")
-        self.assertEqual(premove_phase_allowed(opening), (True, "opening"))
+    def test_opening_premove_window_is_sampled_between_three_and_six_fullmoves(self):
+        self.assertEqual(PREMOVE_OPENING_FULLMOVE_MIN, 3)
+        self.assertEqual(PREMOVE_OPENING_FULLMOVE_MAX, 6)
+        for opening_limit in range(3, 7):
+            with self.subTest(opening_limit=opening_limit):
+                inside = chess.Board(
+                    f"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 {opening_limit}"
+                )
+                outside = chess.Board(
+                    f"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 {opening_limit + 1}"
+                )
+                self.assertEqual(
+                    premove_phase_allowed(inside, opening_limit), (True, "opening")
+                )
+                self.assertEqual(
+                    premove_phase_allowed(outside, opening_limit),
+                    (False, "outside-opening-endgame"),
+                )
 
     def test_mate_phase_premove_uses_forced_mate_continuation(self):
         board = chess.Board()
