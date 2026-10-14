@@ -3360,6 +3360,9 @@ def main() -> int:
                                                 active_bot_color,
                                             )
                                         if isinstance(premove_submit, dict) and premove_submit.get("ok"):
+                                            if not low_clock_premove_mode:
+                                                # A normal-mode queue already exists; avoid a duplicate retry for this FEN.
+                                                last_low_clock_premove_fen = fen
                                             if low_clock_premove_mode:
                                                 premove_elapsed = time.monotonic() - premove_cycle_started_at
                                                 print(
