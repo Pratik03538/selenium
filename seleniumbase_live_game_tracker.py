@@ -2054,9 +2054,11 @@ def choose_low_clock_conversion_premove(
             and info["pv"][0] in hypothetical.legal_moves
         ]
         if not own_lines:
-            return None, predicted_reply, "low-clock-own-candidates-unavailable"
+            # Stockfish gave no usable continuation. Continue to the legal-move
+            # fallback below rather than abandoning this low-clock opportunity.
+            own_lines = []
 
-        best_after_reply_eval = _premove_score_for_bot(own_lines[0], bot_color)
+        best_after_reply_eval = _premove_score_for_bot(own_lines[0], bot_color) if own_lines else None
         if best_after_reply_eval is None or best_after_reply_eval < PREMOVE_MIN_BOT_EVAL_CP:
             return None, predicted_reply, "low-clock-best-follow-up-not-safe"
 
@@ -2219,7 +2221,39 @@ def choose_low_clock_likely_reply_premove(
             seen.add(move.uci())
 
         if not candidates:
-            return None, predicted_reply, "low-clock-fallback-no-submittable-continuation"
+            # Last-resort low-clock coverage: choose a legal move on the
+            # hypothetical post-reply board even if Stockfish returns no usable PV.
+            # Promotions/castling are omitted for cursor input because they may
+            # require site-specific handling. The site still decides whether the
+            # speculative gesture can be queued as a premove.
+            legal_fallbacks = []
+            piece_values = {
+                chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
+                chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 20000,
+            }
+            for move in hypothetical.legal_moves:
+                if move.promotion is not None and getattr(args, "move_input", "api") == "cursor":
+                    continue
+                if hypothetical.is_castling(move) and getattr(args, "move_input", "api") == "cursor":
+                    continue
+                victim = hypothetical.piece_at(move.to_square)
+                if hypothetical.is_en_passant(move):
+                    victim_value = piece_values[chess.PAWN]
+                else:
+                    victim_value = piece_values.get(victim.piece_type, 0) if victim else 0
+                priority = (
+                    0 if move.promotion is not None
+                    else 1 if hypothetical.is_capture(move)
+                    else 2 if hypothetical.gives_check(move)
+                    else 3
+                )
+                legal_fallbacks.append((priority, -victim_value, move.uci(), move))
+            if not legal_fallbacks:
+                return None, predicted_reply, "low-clock-fallback-no-submittable-continuation"
+            legal_fallbacks.sort(key=lambda item: (item[0], item[1], item[2]))
+            selected = legal_fallbacks[0][3]
+            reply_san = board.san(predicted_reply)
+            return selected, predicted_reply, f"low-clock-legal-continuation-fallback reply={reply_san}"
 
         selected, selected_info = candidates[0]
         selected_eval = _premove_score_for_bot(selected_info, bot_color)
