@@ -2183,7 +2183,7 @@ def calculate_engine_search_limit(
     # At <=10s, cap engine work hard so calculation doesn't consume the
     # time needed to submit and confirm a move.
     if remaining <= 10.0:
-        return max(0.001, min(base, 0.004, remaining * 0.02))
+        return max(0.001, min(base, 0.035, remaining * 0.004))
     initial = max(1.0, float(initial_seconds or remaining or 1.0))
     increment = max(0.0, min(float(increment_seconds or 0.0), 60.0))
 
@@ -2214,7 +2214,8 @@ def calculate_engine_search_limit(
             factor = 0.80
     except Exception:
         pass
-    clock_cap = max(0.005, per_move_clock * 0.20 * factor)
+    search_fraction = random.uniform(0.14, 0.28)
+    clock_cap = max(0.005, per_move_clock * search_fraction * factor)
     return max(0.005, min(base, clock_cap))
 
 
@@ -2297,8 +2298,8 @@ def _perform_cursor_drag_once(
     control_x = min(max(2.0, control_x), width - 2.0)
     control_y = min(max(2.0, control_y), height - 2.0)
 
-    waypoint_count = 1 if low_clock_mode else rng.randint(2, 3)
-    total_drag_ms = rng.randint(5, 12) if low_clock_mode else rng.randint(8, 90)
+    waypoint_count = rng.randint(2, 3) if low_clock_mode else rng.randint(2, 4)
+    total_drag_ms = rng.randint(8, 18) if low_clock_mode else rng.randint(8, 95)
     pre_delay_ms = 0 if low_clock_mode else rng.randint(0, 25)
     base_duration, extra_ms = divmod(total_drag_ms, waypoint_count)
     segment_durations = [base_duration] * waypoint_count
@@ -2349,14 +2350,23 @@ def _perform_cursor_drag_once(
         )
         pointer.pause(hover_ms / 1000.0)
         pointer.pointer_down()
+        # Per-move hold after mouse-down; even fast mode samples a fresh delay.
+        pointer.pause(
+            rng.uniform(0.001, 0.0035) if low_clock_mode else rng.uniform(0.002, 0.012)
+        )
 
-        for (px, py), segment_ms in zip(path_points, segment_durations):
+        for point_index, ((px, py), segment_ms) in enumerate(zip(path_points, segment_durations)):
             pointer.source.create_pointer_move(
                 origin=board_element,
                 duration=segment_ms,
                 x=round(px - width / 2.0),
                 y=round(py - height / 2.0),
             )
+            if point_index < len(path_points) - 1:
+                pointer.pause(
+                    rng.uniform(0.0003, 0.0015)
+                    if low_clock_mode else rng.uniform(0.001, 0.008)
+                )
 
         pointer.pointer_up()
         actions.perform()
@@ -2532,12 +2542,12 @@ def perform_api_premove(
     return result if isinstance(result, dict) else {"ok": False, "reason": "invalid-premove-response"}
 
 
-PREMOVE_OPENING_FULLMOVE_MAX = 10
+PREMOVE_OPENING_FULLMOVE_MAX = 5
 PREMOVE_ENDGAME_MAX_PIECES = 10
 PREMOVE_MIN_BOT_EVAL_CP = -25
 PREMOVE_MAX_EVAL_DROP_CP = 40
 PREMOVE_OPENING_MIN_BOT_EVAL_CP = -50
-PREMOVE_OPENING_MAX_EVAL_DROP_CP = 50
+PREMOVE_OPENING_MAX_EVAL_DROP_CP = 60
 PREMOVE_MATE_REPLY_MULTIPV = 3
 PREMOVE_MATE_FOLLOWUP_MULTIPV = 8
 # Middlegame recaptures: accept a reasonably broad reply set, not every legal blunder.
@@ -3379,7 +3389,7 @@ def choose_premove_candidate(
         own_lines = engine.analyse(
             hypothetical,
             chess.engine.Limit(depth=10, time=search_time),
-            multipv=min(15, max(1, int(getattr(strategy_module, "TRAINING_MULTI_PV", 15)))),
+            multipv=min(24, max(1, len(hypothetical.legal_moves))),
         )
         if not isinstance(own_lines, list):
             own_lines = [own_lines]
@@ -3402,6 +3412,7 @@ def choose_premove_candidate(
         # Try candidate lines in Stockfish order so a poor first premove does
         # not prevent a later safe opening continuation from being queued.
         cursor_input = getattr(args, "move_input", "api") == "cursor"
+        safe_candidates = []
         for candidate_info in own_lines:
             selected = candidate_info["pv"][0]
             if selected.promotion is not None and cursor_input:
@@ -3427,9 +3438,26 @@ def choose_premove_candidate(
             if best_after_reply_eval - selected_eval > phase_max_eval_drop:
                 continue
 
-            return selected, predicted_reply, f"{phase}-safe-eval={selected_eval / 100:+.2f}"
+            safe_candidates.append((selected, selected_eval))
 
-        return None, predicted_reply, f"{phase}-no-candidate-passed-evaluation-guard"
+        if not safe_candidates:
+            return None, predicted_reply, f"{phase}-no-candidate-passed-evaluation-guard"
+
+        # Each item passed legality, hanging-piece, and evaluation guards.
+        # Weighted random choice avoids always queuing the first MultiPV line.
+        best_safe_eval = max(score for _move, score in safe_candidates)
+        candidate_weights = [
+            max(0.15, 1.0 - (best_safe_eval - score) / 150.0)
+            for _move, score in safe_candidates
+        ]
+        selected, selected_eval = random.choices(
+            safe_candidates, weights=candidate_weights, k=1
+        )[0]
+        return (
+            selected, predicted_reply,
+            f"{phase}-safe-eval={selected_eval / 100:+.2f}; "
+            f"random-safe-pool={len(safe_candidates)}",
+        )
     except (chess.engine.EngineError, ValueError, RuntimeError, TypeError):
         return None, None, "premove-analysis-failed"
 
@@ -3470,7 +3498,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(auto_play=None)
     parser.add_argument("--stockfish-path", default="", help="Stockfish executable path; can also be set as stockfish_path=... in TXT settings.")
-    parser.add_argument("--engine-time", type=float, default=0.040, help="Stockfish search time per move, seconds (ChessKida baseline default: 0.040).")
+    parser.add_argument("--engine-time", type=float, default=0.75, help="Maximum Stockfish search time per move in seconds; effective time is adapted to the remaining clock.")
     parser.add_argument("--move-input", choices=("api", "cursor"), default=None, help="Move submission method; can also be set with move_input=api|cursor in tracker_settings.txt.")
     premove_group = parser.add_mutually_exclusive_group()
     premove_group.add_argument("--premove", dest="premove_enabled", action="store_true", help="Try best-effort premoves on the configured authorized site.")
@@ -4452,14 +4480,14 @@ def main() -> int:
                                         and (short_control_fast_mode or remaining_clock_seconds <= low_clock_trigger_seconds)
                                     )
                                     low_clock_total_budget_seconds = (
-                                        random.choice((0.025, 0.035, 0.045))
+                                        random.uniform(0.025, 0.045)
                                         if (
                                             low_clock_mode
                                             and remaining_clock_seconds is not None
                                             and opponent_clock_seconds is not None
                                             and remaining_clock_seconds <= opponent_clock_seconds
                                         )
-                                        else random.choice((0.030, 0.040, 0.050))
+                                        else random.uniform(0.030, 0.055)
                                         if low_clock_mode else None
                                     )
                                     if low_clock_mode:
@@ -4771,14 +4799,14 @@ def main() -> int:
                                     and (short_control_fast_mode or bot_clock_for_premove <= low_clock_trigger_seconds)
                                 )
                                 low_clock_premove_budget_seconds = (
-                                    random.choice((0.025, 0.035, 0.045))
+                                    random.uniform(0.025, 0.045)
                                     if (
                                         low_clock_premove_mode
                                         and bot_clock_for_premove is not None
                                         and opponent_clock_for_premove is not None
                                         and bot_clock_for_premove <= opponent_clock_for_premove
                                     )
-                                    else random.choice((0.030, 0.040, 0.050))
+                                    else random.uniform(0.030, 0.055)
                                     if low_clock_premove_mode else None
                                 )
                                 if low_clock_premove_mode:
