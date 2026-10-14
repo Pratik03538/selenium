@@ -2173,6 +2173,7 @@ def calculate_engine_search_limit(
     initial_seconds: float | None,
     increment_seconds: float,
     board,
+    opponent_seconds: float | None = None,
 ) -> float:
     """Cap engine calculation time using the observed clock; never exceed the configured cap."""
     base = max(0.005, min(float(base_seconds), 5.0))
@@ -2214,7 +2215,24 @@ def calculate_engine_search_limit(
             factor = 0.80
     except Exception:
         pass
-    search_fraction = random.uniform(0.14, 0.28)
+    opponent_remaining = None
+    try:
+        if opponent_seconds is not None:
+            opponent_remaining = max(0.0, float(opponent_seconds))
+    except (TypeError, ValueError):
+        opponent_remaining = None
+
+    clock_margin = (
+        remaining - opponent_remaining
+        if opponent_remaining is not None else None
+    )
+    deficit_threshold = max(2.0, min(12.0, initial * 0.025))
+    if clock_margin is not None and clock_margin <= -deficit_threshold:
+        search_fraction = random.uniform(0.08, 0.16)
+    elif clock_margin is not None and clock_margin < 0.0:
+        search_fraction = random.uniform(0.11, 0.21)
+    else:
+        search_fraction = random.uniform(0.14, 0.28)
     clock_cap = max(0.005, per_move_clock * search_fraction * factor)
     return max(0.005, min(base, clock_cap))
 
@@ -3320,12 +3338,48 @@ def choose_mate_phase_premove(
         return None, None, "mate-premove-analysis-failed"
 
 
+class _PremoveDeadlineExceeded(RuntimeError):
+    """Raised when premove analysis would overrun its monotonic deadline."""
+
+
+class _DeadlineBoundEngine:
+    """Proxy that caps each premove engine search to the remaining time budget."""
+
+    def __init__(self, engine, deadline: float):
+        self._engine = engine
+        self._deadline = float(deadline)
+
+    def __getattr__(self, name):
+        return getattr(self._engine, name)
+
+    def analyse(self, board, limit, *args, **kwargs):
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0.012:
+            raise _PremoveDeadlineExceeded("Premove analysis deadline elapsed.")
+        # Reserve a little room for UCI response and Python/Selenium hand-off.
+        allowed_time = remaining - 0.008
+        requested_time = getattr(limit, "time", None)
+        if requested_time is not None:
+            allowed_time = min(allowed_time, max(0.0, float(requested_time)))
+        if allowed_time < 0.005:
+            raise _PremoveDeadlineExceeded("Premove analysis budget is too small.")
+        bounded_limit = chess.engine.Limit(
+            depth=getattr(limit, "depth", None),
+            time=allowed_time,
+        )
+        result = self._engine.analyse(board, bounded_limit, *args, **kwargs)
+        if time.monotonic() > self._deadline:
+            raise _PremoveDeadlineExceeded("Premove engine result arrived after deadline.")
+        return result
+
+
 def choose_premove_candidate(
     engine, board, strategy_module, bot_color: str, args, book=None,
     opponent_match_history: list[float] | None = None,
     low_clock_mode: bool = False,
+    analysis_deadline: float | None = None,
 ) -> tuple[object | None, object | None, str]:
-    """Choose an opening/endgame premove or a verified-safe middlegame candidate."""
+    """Choose a premove using existing policies, bounded by an analysis deadline."""
     if chess is None or engine is None or strategy_module is None or board is None:
         return None, None, "premove-prerequisites-unavailable"
     if board.is_game_over(claim_draw=True):
@@ -3335,15 +3389,24 @@ def choose_premove_candidate(
     if board.turn == bot_turn:
         return None, None, "bot-turn-already-active"
 
+    if analysis_deadline is not None:
+        if time.monotonic() >= float(analysis_deadline):
+            return None, None, "premove-analysis-deadline-exceeded"
+        engine = _DeadlineBoundEngine(engine, float(analysis_deadline))
+
     if low_clock_mode:
         low_clock_move, low_clock_reply, low_clock_reason = choose_low_clock_conversion_premove(
             engine, board, strategy_module, bot_color, args
         )
+        if analysis_deadline is not None and time.monotonic() >= float(analysis_deadline):
+            return None, low_clock_reply, "premove-analysis-deadline-exceeded"
         if low_clock_move is not None:
             return low_clock_move, low_clock_reply, low_clock_reason
         fallback_move, fallback_reply, fallback_reason = choose_low_clock_likely_reply_premove(
             engine, board, bot_color, args, strategy_module=strategy_module
         )
+        if analysis_deadline is not None and time.monotonic() >= float(analysis_deadline):
+            return None, fallback_reply or low_clock_reply, "premove-analysis-deadline-exceeded"
         if fallback_move is not None:
             return fallback_move, fallback_reply, fallback_reason
         return None, fallback_reply or low_clock_reply, f"{low_clock_reason}; {fallback_reason}"
@@ -3351,6 +3414,8 @@ def choose_premove_candidate(
     mate_move, mate_reply, mate_reason = choose_mate_phase_premove(
         engine, board, bot_color, args
     )
+    if analysis_deadline is not None and time.monotonic() >= float(analysis_deadline):
+        return None, mate_reply, "premove-analysis-deadline-exceeded"
     if mate_move is not None:
         return mate_move, mate_reply, mate_reason
 
@@ -3359,7 +3424,12 @@ def choose_premove_candidate(
         getattr(args, "opening_premove_fullmove_max", PREMOVE_OPENING_FULLMOVE_MAX),
     )
     if not allowed:
-        return choose_middle_game_premove(engine, board, strategy_module, bot_color, args)
+        middle_move, middle_reply, middle_reason = choose_middle_game_premove(
+            engine, board, strategy_module, bot_color, args
+        )
+        if analysis_deadline is not None and time.monotonic() >= float(analysis_deadline):
+            return None, middle_reply, "premove-analysis-deadline-exceeded"
+        return middle_move, middle_reply, middle_reason
 
     search_time = max(0.010, min(float(args.engine_time), 0.050))
     try:
@@ -3455,6 +3525,8 @@ def choose_premove_candidate(
 
             safe_candidates.append((selected, selected_eval))
 
+        if analysis_deadline is not None and time.monotonic() >= float(analysis_deadline):
+            return None, predicted_reply, "premove-analysis-deadline-exceeded"
         if not safe_candidates:
             return None, predicted_reply, f"{phase}-no-candidate-passed-evaluation-guard"
 
@@ -3474,6 +3546,8 @@ def choose_premove_candidate(
             f"random-safe-pool={len(safe_candidates)}",
         )
     except (chess.engine.EngineError, ValueError, RuntimeError, TypeError):
+        if analysis_deadline is not None and time.monotonic() >= float(analysis_deadline):
+            return None, None, "premove-analysis-deadline-exceeded"
         return None, None, "premove-analysis-failed"
 
 
@@ -3570,16 +3644,22 @@ def main() -> int:
     print(f"[CONFIG] Automatic new match: {'enabled' if args.auto_next_game else 'disabled'}.", flush=True)
     raw_rematch_setting = load_optional_txt_setting("auto_rematch").strip().lower()
     args.auto_rematch = raw_rematch_setting in {"1", "true", "yes", "on", "enabled"}
-    # Keep the requested 7–10s premove priority active by default. The master
-    # premove_enabled switch still controls whether any premove may be submitted.
-    args.low_clock_extra_premoves = True
+    raw_extra_premove_setting = load_optional_txt_setting("low_clock_extra_premoves").strip().lower()
+    args.low_clock_extra_premoves = (
+        raw_extra_premove_setting in {"1", "true", "yes", "on", "enabled"}
+        if raw_extra_premove_setting else True
+    )
     raw_clock_management_setting = load_optional_txt_setting("clock_management").strip().lower()
     args.clock_management = (
         raw_clock_management_setting in {"1", "true", "yes", "on", "enabled"}
         if raw_clock_management_setting else True
     )
     print(f"[CONFIG] Automatic rematch: {'enabled' if args.auto_rematch else 'disabled'}.", flush=True)
-    print("[CONFIG] Low-clock extra premoves: automatic in the sampled 7–10s window.", flush=True)
+    print(
+        f"[CONFIG] Low-clock extra premoves: {'enabled' if args.low_clock_extra_premoves else 'disabled'} "
+        "for the extra same-position retry in the sampled 7–10s window.",
+        flush=True,
+    )
     print(f"[CONFIG] Clock-based time management: {'enabled' if args.clock_management else 'disabled'}.", flush=True)
     if args.allowed_domain.strip():
         allowed_host = normalize_host(args.allowed_domain)
@@ -3735,6 +3815,9 @@ def main() -> int:
     last_side_warning_fen = ""
     previous_eval_white_cp = None
     next_human_best_uci = None
+    next_opponent_best_cp = None
+    pending_opponent_best_cp = None
+    pending_opponent_color = None
     opponent_match_history: list[float] = []
     opponent_pressure = False
     # If the site exposes the clock from game start, estimate the base time
@@ -4173,6 +4256,9 @@ def main() -> int:
                                     strategy_board = chess.Board(fen)
                                     opponent_match_history.clear()
                                     next_human_best_uci = None
+                                    next_opponent_best_cp = None
+                                    pending_opponent_best_cp = None
+                                    pending_opponent_color = None
                                     previous_eval_white_cp = None
                                     opponent_pressure = False
                                     last_auto_attempt_fen = ""
@@ -4189,6 +4275,9 @@ def main() -> int:
                                         strategy_board = chess.Board(fen)
                                         opponent_match_history.clear()
                                         next_human_best_uci = None
+                                        next_opponent_best_cp = None
+                                        pending_opponent_best_cp = None
+                                        pending_opponent_color = None
                                         previous_eval_white_cp = None
                                         opponent_pressure = False
                                 else:
@@ -4196,28 +4285,28 @@ def main() -> int:
                                     strategy_board = chess.Board(fen)
                                     opponent_match_history.clear()
                                     next_human_best_uci = None
+                                    next_opponent_best_cp = None
+                                    pending_opponent_best_cp = None
+                                    pending_opponent_color = None
                                     previous_eval_white_cp = None
                                     opponent_pressure = False
 
                                 strategy_board_fen = fen
 
-                                # Compare the opponent's move to the best reply predicted
-                                # from our last move, as the original ChessKida controller does.
+                                # Hold the expected score for the opponent's reply.
+                                # Quality is calculated after the resulting position is evaluated;
+                                # an equally good alternate move is not scored as zero.
                                 bot_side_for_score = active_bot_color or api_bot_color
                                 if (
                                     strategy_transition is not None
                                     and bot_side_for_score in {"white", "black"}
                                     and strategy_transition.get("side") != bot_side_for_score
-                                    and next_human_best_uci
+                                    and next_opponent_best_cp is not None
                                 ):
-                                    exact_top_match = (
-                                        100.0
-                                        if strategy_transition.get("uci") == next_human_best_uci
-                                        else 0.0
-                                    )
-                                    opponent_match_history.append(exact_top_match)
-                                    opponent_pressure = not bool(exact_top_match)
+                                    pending_opponent_best_cp = float(next_opponent_best_cp)
+                                    pending_opponent_color = strategy_transition.get("side")
                                     next_human_best_uci = None
+                                    next_opponent_best_cp = None
                         except (ValueError, IndexError):
                             strategy_board = None
                             strategy_board_fen = ""
@@ -4535,6 +4624,8 @@ def main() -> int:
                                     book_choice = book.choose(engine_board) if book is not None and not low_clock_mode else None
 
                                     if book_choice is not None:
+                                        pending_opponent_best_cp = None
+                                        pending_opponent_color = None
                                         chosen_move = book_choice["move"]
                                         best_info = None
                                         selection_meta = {
@@ -4554,6 +4645,7 @@ def main() -> int:
                                                 initial_seconds=initial_game_clock_seconds,
                                                 increment_seconds=clock_increment_seconds,
                                                 board=engine_board,
+                                                opponent_seconds=opponent_clock_seconds,
                                             )
                                             if remaining_clock_seconds is not None
                                             else max(0.005, min(float(args.engine_time), 5.0))
@@ -4585,6 +4677,41 @@ def main() -> int:
                                         if not isinstance(engine_result, list):
                                             engine_result = [engine_result]
                                         best_info = engine_result[0] if engine_result else None
+                                        if pending_opponent_best_cp is not None:
+                                            try:
+                                                score_obj = best_info.get("score") if isinstance(best_info, dict) else None
+                                                if score_obj is not None and pending_opponent_color in {"white", "black"}:
+                                                    opponent_chess_color = (
+                                                        chess.WHITE if pending_opponent_color == "white"
+                                                        else chess.BLACK
+                                                    )
+                                                    played_position_cp = strategy_module.score_to_cp(
+                                                        score_obj.pov(opponent_chess_color)
+                                                    )
+                                                    if played_position_cp is not None:
+                                                        estimated_cpl = max(
+                                                            0.0,
+                                                            min(
+                                                                400.0,
+                                                                float(pending_opponent_best_cp) - float(played_position_cp),
+                                                            ),
+                                                        )
+                                                        move_quality = strategy_module.opponent_quality_from_centipawn_loss(
+                                                            estimated_cpl
+                                                        )
+                                                        if move_quality is not None:
+                                                            opponent_match_history.append(float(move_quality))
+                                                            opponent_pressure = move_quality >= 85.0
+                                                            print(
+                                                                f"[OPPONENT QUALITY] estimated_cpl={estimated_cpl:.0f}cp "
+                                                                f"| score={move_quality:.1f}/100.",
+                                                                flush=True,
+                                                            )
+                                            except (ValueError, TypeError, AttributeError):
+                                                pass
+                                            finally:
+                                                pending_opponent_best_cp = None
+                                                pending_opponent_color = None
                                         if settings_window is not None and best_info is not None:
                                             try:
                                                 best_score = best_info.get("score")
@@ -4768,11 +4895,13 @@ def main() -> int:
                                                     previous_eval_white_cp,
                                                     source="After-move analysis",
                                                 )
-                                            predicted = analysis_state.get("best_move")
+                                            predicted = analysis_state.get("next_reply_best_move")
                                             next_human_best_uci = predicted if predicted and predicted != "-" else None
+                                            next_opponent_best_cp = analysis_state.get("next_reply_eval_cp")
                                         else:
                                             previous_eval_white_cp = None
                                             next_human_best_uci = None
+                                            next_opponent_best_cp = None
                                     else:
                                         reason = submit.get("reason", "move-submit-failed") if isinstance(submit, dict) else "move-submit-failed"
                                         detail = ""
@@ -4807,7 +4936,8 @@ def main() -> int:
                                 and (
                                     fen != last_premove_attempt_fen
                                     or (
-                                        fen != last_low_clock_premove_fen
+                                        args.low_clock_extra_premoves
+                                        and fen != last_low_clock_premove_fen
                                         and (
                                             (active_bot_color == "white" and white_clock_seconds is not None and white_clock_seconds <= low_clock_trigger_seconds)
                                             or (active_bot_color == "black" and black_clock_seconds is not None and black_clock_seconds <= low_clock_trigger_seconds)
@@ -4849,13 +4979,25 @@ def main() -> int:
                                         f"[PREMOVE] Random-threshold low-clock priority active "
                                         f"({bot_clock_for_premove:.2f}s <= {low_clock_trigger_seconds:.2f}s); "
                                         f"opponent={opponent_clock_for_premove if opponent_clock_for_premove is not None else 'unknown'}s; "
-                                        f"one total budget={low_clock_premove_budget_seconds:.3f}s, "
+                                        f"optional-wait target={low_clock_premove_budget_seconds:.3f}s, "
                                         "checking safe capture/promotion conversion first.",
                                         flush=True,
                                     )
                                 try:
                                     premove_cycle_started_at = time.monotonic()
-                                    print("[PREMOVE CHECK] Candidate analysis started", flush=True)
+                                    premove_analysis_budget_seconds = (
+                                        random.uniform(0.10, 0.18)
+                                        if low_clock_premove_mode
+                                        else random.uniform(0.45, 0.75)
+                                    )
+                                    premove_analysis_deadline = (
+                                        premove_cycle_started_at + premove_analysis_budget_seconds
+                                    )
+                                    print(
+                                        f"[PREMOVE CHECK] Candidate analysis started | "
+                                        f"deadline={premove_analysis_budget_seconds:.3f}s.",
+                                        flush=True,
+                                    )
                                     premove_move, predicted_reply, premove_source = choose_premove_candidate(
                                         engine,
                                         engine_board,
@@ -4865,6 +5007,7 @@ def main() -> int:
                                         book=book,
                                         opponent_match_history=opponent_match_history,
                                         low_clock_mode=low_clock_premove_mode,
+                                        analysis_deadline=premove_analysis_deadline,
                                     )
                                     premove_analysis_elapsed = time.monotonic() - premove_cycle_started_at
                                     print("[PREMOVE CHECK] candidate=" + (premove_move.uci() if premove_move is not None else "none") + " | reason=" + str(premove_source) + " | analysis=" + format(premove_analysis_elapsed, ".3f") + "s", flush=True)
@@ -4890,7 +5033,7 @@ def main() -> int:
                                                 low_clock_premove_budget_seconds - elapsed - reserve,
                                             )
                                             print(
-                                                f"[PREMOVE TIMING] target={low_clock_premove_budget_seconds:.3f}s "
+                                                f"[PREMOVE TIMING] optional-wait-target={low_clock_premove_budget_seconds:.3f}s "
                                                 f"elapsed={elapsed:.3f}s reserve={reserve:.3f}s "
                                                 f"wait={wait_remaining:.3f}s.",
                                                 flush=True,
@@ -4927,7 +5070,7 @@ def main() -> int:
                                             if low_clock_premove_mode:
                                                 premove_elapsed = time.monotonic() - premove_cycle_started_at
                                                 print(
-                                                    f"[PREMOVE BUDGET] target={low_clock_premove_budget_seconds:.3f}s "
+                                                    f"[PREMOVE BUDGET] optional-wait-target={low_clock_premove_budget_seconds:.3f}s "
                                                     f"end-to-end={premove_elapsed:.3f}s "
                                                     f"overrun={max(0.0, premove_elapsed - low_clock_premove_budget_seconds):.3f}s.",
                                                     flush=True,
