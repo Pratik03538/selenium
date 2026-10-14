@@ -396,8 +396,11 @@ def natural_bot_move_delay(
     increment_seconds=0.0,
     is_opening_book_move=False,
     low_clock_trigger_seconds=10.0,
+    low_clock_total_budget_seconds=None,
+    elapsed_seconds_before_delay=0.0,
+    submission_reserve_seconds=0.0,
 ):
-    """Return a small move delay plus clock-bounded optional pauses.
+    """Return a move delay; low-clock waits fit inside one total latency budget.
 
     Timing policy:
       * routine move delays vary with position complexity
@@ -451,11 +454,31 @@ def natural_bot_move_delay(
     except (TypeError, ValueError):
         low_clock_threshold = 10.0
     if own_clock is not None and own_clock <= low_clock_threshold:
-        quick_delay = random.choice((0.100, 0.150, 0.200))
+        try:
+            total_budget = (
+                random.choice((0.100, 0.150, 0.200))
+                if low_clock_total_budget_seconds is None
+                else min(0.200, max(0.100, float(low_clock_total_budget_seconds)))
+            )
+        except (TypeError, ValueError):
+            total_budget = random.choice((0.100, 0.150, 0.200))
+        try:
+            elapsed_before = max(0.0, float(elapsed_seconds_before_delay))
+        except (TypeError, ValueError):
+            elapsed_before = 0.0
+        try:
+            reserve = min(0.080, max(0.0, float(submission_reserve_seconds)))
+        except (TypeError, ValueError):
+            reserve = 0.0
+        # The engine work and any earlier handling have already consumed part
+        # of the end-to-end budget. Sleep only the unspent portion; cursor/API
+        # submission has a reserved allowance instead of adding another delay.
+        quick_delay = max(0.0, total_budget - elapsed_before - reserve)
         _last_bot_natural_delay = quick_delay
         print(
-            f"[CLOCK MODE] randomized low-clock path own={own_clock:.2f}s "
-            f"threshold={low_clock_threshold:.2f}s delay={quick_delay:.3f}s",
+            f"[CLOCK MODE] own={own_clock:.2f}s threshold={low_clock_threshold:.2f}s "
+            f"target={total_budget:.3f}s elapsed={elapsed_before:.3f}s "
+            f"reserve={reserve:.3f}s wait={quick_delay:.3f}s",
             flush=True,
         )
         return quick_delay
