@@ -3865,7 +3865,7 @@ def main() -> int:
                                                     time.sleep(wait_remaining)
                                         if settings_window is not None:
                                             settings_window.pump()
-                                        if not args.auto_play or (
+                                        if not args.auto_play or not args.premove_enabled or (
                                             low_clock_premove_mode and not args.low_clock_extra_premoves
                                         ):
                                             premove_submit = {"ok": False, "reason": "bot-or-extra-premove-disabled-in-settings"}
