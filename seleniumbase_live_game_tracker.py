@@ -2586,6 +2586,8 @@ def main() -> int:
             last_console_signature = None
             last_name_debug_signature = None
             last_clock_signature = None
+            last_fast_polling_state = None
+            low_clock_polling_active = False
             while True:
                 # Closing the chosen tab often yields current_url=None in ChromeDriver.
                 if chosen_handle not in driver.window_handles:
@@ -2624,6 +2626,32 @@ def main() -> int:
                         active_bot_color = player_name_color or api_bot_color
                     white_clock_seconds = parse_clock_seconds(event.get("whiteClock"))
                     black_clock_seconds = parse_clock_seconds(event.get("blackClock"))
+                    if active_bot_color == "white":
+                        own_clock_for_poll = white_clock_seconds
+                    elif active_bot_color == "black":
+                        own_clock_for_poll = black_clock_seconds
+                    else:
+                        own_clock_for_poll = None
+                    low_clock_polling_active = (
+                        own_clock_for_poll is not None
+                        and own_clock_for_poll <= low_clock_trigger_seconds
+                    )
+                    if low_clock_polling_active != last_fast_polling_state:
+                        try:
+                            poll_state = driver.execute_script(
+                                "return window.__liveGameApiReader ? "
+                                "window.__liveGameApiReader.setFastPolling(arguments[0]) : null;",
+                                low_clock_polling_active,
+                            )
+                            if isinstance(poll_state, dict):
+                                print(
+                                    f"[POLLING] {'fast' if low_clock_polling_active else 'normal'} "
+                                    f"clock-state polling ({poll_state.get('intervalMs', '?')} ms).",
+                                    flush=True,
+                                )
+                        except WebDriverException:
+                            pass
+                        last_fast_polling_state = low_clock_polling_active
                     clock_signature = (
                         str(event.get("whiteClock") or ""),
                         str(event.get("blackClock") or ""),
@@ -2946,6 +2974,7 @@ def main() -> int:
                             if our_turn and not engine_board.is_game_over(claim_draw=True):
                                 last_auto_attempt_fen = fen
                                 try:
+                                    move_cycle_started_at = time.monotonic()
                                     engine_result = []
                                     selected_info = None
                                     selection_meta = None
@@ -2958,10 +2987,15 @@ def main() -> int:
                                         remaining_clock_seconds is not None
                                         and remaining_clock_seconds <= low_clock_trigger_seconds
                                     )
+                                    low_clock_total_budget_seconds = (
+                                        random.choice((0.100, 0.150, 0.200))
+                                        if low_clock_mode else None
+                                    )
                                     if low_clock_mode:
                                         print(
                                             f"[LOW CLOCK] Active | own={remaining_clock_seconds:.2f}s "
-                                            f"| threshold={low_clock_trigger_seconds:.2f}s.",
+                                            f"| threshold={low_clock_trigger_seconds:.2f}s "
+                                            f"| total move budget={low_clock_total_budget_seconds:.3f}s.",
                                             flush=True,
                                         )
                                     book_choice = book.choose(engine_board) if book is not None and not low_clock_mode else None
@@ -3037,6 +3071,9 @@ def main() -> int:
                                     reason = str(selection_meta.get("reason", "strategy selection")) if isinstance(selection_meta, dict) else "strategy selection"
                                     print(f"[STRATEGY] selected={chosen_san} | rank={rank_text} | {reason}", flush=True)
 
+                                    if low_clock_mode:
+                                        wait_for_manual_verification(driver, allowed_host, cfg)
+
                                     natural_delay = strategy_module.natural_bot_move_delay(
                                         engine_board,
                                         chosen_move,
@@ -3052,6 +3089,11 @@ def main() -> int:
                                             and selection_meta.get("source") == "GM_BOOK"
                                         ),
                                         low_clock_trigger_seconds=low_clock_trigger_seconds,
+                                        low_clock_total_budget_seconds=low_clock_total_budget_seconds,
+                                        elapsed_seconds_before_delay=time.monotonic() - move_cycle_started_at,
+                                        submission_reserve_seconds=(
+                                            0.045 if args.move_input == "cursor" else 0.020
+                                        ),
                                     )
                                     if natural_delay > 0:
                                         mode_text = "LOW_CLOCK" if low_clock_mode else "OWN_CLOCK"
@@ -3062,10 +3104,12 @@ def main() -> int:
                                         )
                                         time.sleep(natural_delay)
 
-                                    wait_for_manual_verification(driver, allowed_host, cfg)
+                                    if not low_clock_mode:
+                                        wait_for_manual_verification(driver, allowed_host, cfg)
                                     if args.move_input == "cursor":
                                         submit = perform_cursor_drag(
-                                            driver, chosen_move.uci(), fen, active_bot_color
+                                            driver, chosen_move.uci(), fen, active_bot_color,
+                                            low_clock_mode=low_clock_mode,
                                         )
                                     else:
                                         submit = driver.execute_script(
@@ -3079,16 +3123,23 @@ def main() -> int:
 
                                         after_board = engine_board.copy(stack=True)
                                         after_board.push(chosen_move)
-                                        try:
-                                            analysis_state = strategy_module.build_analysis(
-                                                engine,
-                                                engine_board,
-                                                after_board,
-                                                chosen_move,
-                                                best_info=best_info,
-                                            )
-                                        except Exception:
+                                        if low_clock_mode:
                                             analysis_state = None
+                                            print(
+                                                "[LOW CLOCK] Skipped nonessential post-move analysis to keep the next event/premove responsive.",
+                                                flush=True,
+                                            )
+                                        else:
+                                            try:
+                                                analysis_state = strategy_module.build_analysis(
+                                                    engine,
+                                                    engine_board,
+                                                    after_board,
+                                                    chosen_move,
+                                                    best_info=best_info,
+                                                )
+                                            except Exception:
+                                                analysis_state = None
 
                                         if analysis_state:
                                             previous_eval_white_cp = analysis_state.get("eval_cp")
@@ -3132,14 +3183,20 @@ def main() -> int:
                                     bot_clock_for_premove is not None
                                     and bot_clock_for_premove <= low_clock_trigger_seconds
                                 )
+                                low_clock_premove_budget_seconds = (
+                                    random.choice((0.100, 0.150, 0.200))
+                                    if low_clock_premove_mode else None
+                                )
                                 if low_clock_premove_mode:
                                     print(
                                         f"[PREMOVE] Random-threshold low-clock priority active "
                                         f"({bot_clock_for_premove:.2f}s <= {low_clock_trigger_seconds:.2f}s); "
+                                        f"one total budget={low_clock_premove_budget_seconds:.3f}s, "
                                         "checking safe capture/promotion conversion first.",
                                         flush=True,
                                     )
                                 try:
+                                    premove_cycle_started_at = time.monotonic()
                                     premove_move, predicted_reply, premove_source = choose_premove_candidate(
                                         engine,
                                         engine_board,
@@ -3164,6 +3221,21 @@ def main() -> int:
                                         predicted_san = engine_board.san(predicted_reply) if predicted_reply else "unknown"
                                         chosen_premove_uci = premove_move.uci()
                                         wait_for_manual_verification(driver, allowed_host, cfg)
+                                        if low_clock_premove_mode:
+                                            reserve = 0.045 if args.move_input == "cursor" else 0.020
+                                            elapsed = time.monotonic() - premove_cycle_started_at
+                                            wait_remaining = max(
+                                                0.0,
+                                                low_clock_premove_budget_seconds - elapsed - reserve,
+                                            )
+                                            print(
+                                                f"[PREMOVE TIMING] target={low_clock_premove_budget_seconds:.3f}s "
+                                                f"elapsed={elapsed:.3f}s reserve={reserve:.3f}s "
+                                                f"wait={wait_remaining:.3f}s.",
+                                                flush=True,
+                                            )
+                                            if wait_remaining > 0:
+                                                time.sleep(wait_remaining)
                                         if args.move_input == "cursor":
                                             premove_submit = perform_cursor_drag(
                                                 driver,
@@ -3171,6 +3243,7 @@ def main() -> int:
                                                 fen,
                                                 active_bot_color,
                                                 allow_premove=True,
+                                                low_clock_mode=low_clock_premove_mode,
                                             )
                                         else:
                                             premove_submit = perform_api_premove(
@@ -3199,7 +3272,10 @@ def main() -> int:
                                             )
                                 except (chess.engine.EngineError, ValueError, WebDriverException, RuntimeError, TypeError):
                                     print("[PREMOVE] Candidate calculation/submission failed; normal turn handling remains enabled.", flush=True)
-                time.sleep(max(0.05, args.queue_read_interval))
+                if low_clock_polling_active:
+                    time.sleep(0.005)
+                else:
+                    time.sleep(max(0.05, args.queue_read_interval))
 
     except KeyboardInterrupt:
         print("\n[STOP] Reader stopped.", flush=True)
