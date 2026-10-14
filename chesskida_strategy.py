@@ -2976,6 +2976,7 @@ def choose_stockfish_move(
         # used only to create human-like choice diversity.
         diversity_floor_cp = max(
             5,
+            best_cp - HUMAN_WINNING_GUARD_MAX_DROP_CP if winning_guard else 5,
             int(
                 best_cp
                 * (
@@ -2988,6 +2989,7 @@ def choose_stockfish_move(
                 )
             )
         )
+        effective_selection_floor_cp = selection_floor_cp
 
         diversity_lower_pool = [
             candidate
@@ -3015,6 +3017,7 @@ def choose_stockfish_move(
             )
         ):
             selection_pool = diversity_lower_pool
+            effective_selection_floor_cp = diversity_floor_cp
         else:
             selection_pool = (
                 lower_rank_pool
@@ -3108,7 +3111,9 @@ def choose_stockfish_move(
                     + f"BEST={best_cp/100:+.2f} "
                     + f"SELECTED={selected['cp']/100:+.2f} "
                     + f"RANK=#{selected['rank'] + 1} "
-                    + f"FLOOR={floor_cp/100:+.2f} "
+                    + f"FLOOR={effective_selection_floor_cp/100:+.2f} "
+                    + f"BASE_FLOOR={floor_cp/100:+.2f} "
+                    + f"SAFE_FLOOR={selection_floor_cp/100:+.2f} "
                     + f"MAX_DROP={max_drop*100:.1f}% "
                     + f"OPP="
                     f"{profile['opponent_accuracy'] if profile['opponent_accuracy'] is not None else 0.0:.1f}% "

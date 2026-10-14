@@ -74,6 +74,56 @@ def normalize_chess_color(value: object) -> str | None:
     return None
 
 
+class PlayerSideResolver:
+    """Resolve the bot's color without acting on a transient player-name match."""
+
+    def __init__(self, fixed_color: str | None = None, player_name_enabled: bool = False):
+        self.fixed_color = normalize_chess_color(fixed_color)
+        self.player_name_enabled = bool(player_name_enabled)
+        self.active_color = self.fixed_color
+        self.name_candidate: str | None = None
+        self.name_candidate_count = 0
+
+    def reset_for_new_game(self) -> None:
+        self.active_color = self.fixed_color
+        self.name_candidate = None
+        self.name_candidate_count = 0
+
+    def resolve(self, api_color: str | None, player_name_color: str | None) -> str | None:
+        """Prefer explicit/API side. Name-only detection requires two consistent snapshots."""
+        if self.fixed_color:
+            self.active_color = self.fixed_color
+            return self.active_color
+        api_color = normalize_chess_color(api_color)
+        if api_color:
+            self.active_color = api_color
+            self.name_candidate = api_color
+            self.name_candidate_count = 2
+            return self.active_color
+        if not self.player_name_enabled:
+            return self.active_color
+
+        name_color = normalize_chess_color(player_name_color)
+        if not name_color:
+            self.name_candidate = None
+            self.name_candidate_count = 0
+            return self.active_color
+        if name_color == self.name_candidate:
+            self.name_candidate_count += 1
+        else:
+            self.name_candidate = name_color
+            self.name_candidate_count = 1
+
+        if self.name_candidate_count >= 2:
+            self.active_color = name_color
+            return self.active_color
+        # If a previously established name side suddenly conflicts, pause for a
+        # confirming snapshot instead of submitting for either side.
+        if self.active_color and name_color != self.active_color:
+            return None
+        return self.active_color
+
+
 def normalize_host(value: str) -> str:
     """Accept a specific hostname or URL; reject public-suffix-only values."""
     value = (value or "").strip().lower()
@@ -1154,23 +1204,28 @@ function extractSan(value) {
   return '';
 }
 function getMoves() {
-  // Adapted from the supplied userscript's move-list lookup: prefer actual
-  // SAN move nodes from the page move list before generic data-* nodes.
+  // Merge all configured move-list sources instead of stopping at the first
+  // selector; pages often render partial lists in more than one container.
   const selectors = ['.white.node, .black.node', cfg.moveListSelector, cfg.movesSelector];
-  const found = new Map();
+  const seenElements = new Set();
+  const found = [];
   for (const selector of selectors) {
     for (const el of queryAllDeep(selector)) {
+      if (seenElements.has(el)) continue;
+      seenElements.add(el);
       const san = extractSan(el.innerText || el.textContent || '');
       if (!san) continue;
-      const ply = el.getAttribute(cfg.plyAttribute) || '';
-      const key = ply ? `${ply}:${san}` : san;
-      if (!found.has(key)) {
-        found.set(key, {ply: ply || String(found.size + 1), text: san});
-      }
+      const ply = String(el.getAttribute(cfg.plyAttribute) || '').trim();
+      found.push({ply, text: san, order: found.length});
     }
-    if (found.size) break;
   }
-  return Array.from(found.values());
+  if (found.length && found.every(item => /^\d+$/.test(item.ply))) {
+    found.sort((a, b) => Number(a.ply) - Number(b.ply) || a.order - b.order);
+  }
+  return found.map((item, index) => ({
+    ply: item.ply || String(index + 1),
+    text: item.text
+  }));
 }
 function getLegalMoves(game) {
   // Read-only adaptation of the supplied userscript's getLegalMoves() use.
@@ -1446,7 +1501,7 @@ function snapshot() {
     result: readText(cfg.resultSelector)
   };
 }
-const state = {queue: [], lastSignature: null, observer: null, pollTimer: null, pollIntervalMs: 200, lastError: null, snapshot};
+const state = {queue: [], lastSignature: null, observer: null, pollTimer: null, pollIntervalMs: 50, lastError: null, snapshot};
 function refresh(forceRoots = false) {
   try {
     if (forceRoots) rootsDeep(document, true);
@@ -1470,7 +1525,7 @@ window.__liveGameApiReader = {
   drain: () => state.queue.splice(0, state.queue.length),
   current: () => state.snapshot(),
   setFastPolling: enabled => {
-    const nextIntervalMs = enabled ? 20 : 200;
+    const nextIntervalMs = enabled ? 20 : 50;
     if (state.pollTimer && state.pollIntervalMs === nextIntervalMs) {
       return {changed: false, intervalMs: nextIntervalMs};
     }
@@ -1680,7 +1735,7 @@ window.__liveGameApiReader = {
     }
     return {ok:false, reason:'premove-api-unavailable'};
   },
-  playUci: (uci, expectedFen) => {
+  playUci: (uci, expectedFen, expectedColor) => {
     // Use only the configured site's exposed legal-move/game API.
     const board = getBoard();
     const game = board && board.game;
@@ -1691,6 +1746,12 @@ window.__liveGameApiReader = {
     const currentFen = String(callMaybe(game, 'getFEN') || '').trim();
     if (!currentFen || currentFen !== String(expectedFen || '').trim()) {
       return {ok: false, reason: 'position-changed-before-submit'};
+    }
+    const wantedColor = normalizeColorToken(expectedColor);
+    const fenTurn = currentFen.split(/\s+/)[1] === 'w' ? 'white' :
+      (currentFen.split(/\s+/)[1] === 'b' ? 'black' : null);
+    if (wantedColor && fenTurn !== wantedColor) {
+      return {ok: false, reason: 'not-configured-player-turn'};
     }
     const text = String(uci || '').toLowerCase();
     if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(text)) {
@@ -1735,7 +1796,7 @@ window.__liveGameApiReader = {
 // a mutation in document/light DOM, and MutationObserver doesn't cross shadow roots.
 // Poll the exposed state at a modest interval; the queue de-duplicates unchanged snapshots.
 refresh(true);
-state.pollTimer = setInterval(() => refresh(false), 200);
+state.pollTimer = setInterval(() => refresh(false), 50);
 const first = snapshot();
 return {
   ok: true,
@@ -1785,6 +1846,76 @@ def infer_move_between_fens(previous_fen: str, current_fen: str) -> dict[str, st
                 "move_number": str(before.fullmove_number),
             }
     return None
+
+
+def _same_chess_position(left, right) -> bool:
+    """Compare board state without relying on halfmove/fullmove counters."""
+    return (
+        left.board_fen() == right.board_fen()
+        and left.turn == right.turn
+        and left.castling_rights == right.castling_rights
+        and left.ep_square == right.ep_square
+    )
+
+
+def uci_move_reaches_fen(expected_fen: str, current_fen: str, uci: str) -> bool:
+    """Confirm a move is present in the current position, allowing one fast reply."""
+    if chess is None or not expected_fen or not current_fen or not uci:
+        return False
+    try:
+        before = chess.Board(expected_fen)
+        target = chess.Board(current_fen)
+        move = chess.Move.from_uci(str(uci))
+        if move not in before.legal_moves:
+            return False
+        before.push(move)
+        if _same_chess_position(before, target):
+            return True
+        # In fast games the opponent may reply before the next verification sample.
+        for reply in list(before.legal_moves):
+            after_reply = before.copy(stack=False)
+            after_reply.push(reply)
+            if _same_chess_position(after_reply, target):
+                return True
+    except (ValueError, IndexError, TypeError):
+        return False
+    return False
+
+
+def reconstruct_history_from_dom_moves(
+    dom_moves: object, current_fen: str
+) -> list[dict[str, str]] | None:
+    """Rebuild a complete game from DOM SAN only if it validates against live FEN."""
+    if chess is None or not isinstance(dom_moves, list) or not dom_moves or not current_fen:
+        return None
+    try:
+        target = chess.Board(current_fen)
+    except (ValueError, IndexError):
+        return None
+    board = chess.Board()
+    history: list[dict[str, str]] = []
+    for item in dom_moves:
+        if not isinstance(item, dict):
+            return None
+        san_text = str(item.get("text") or item.get("san") or "").strip()
+        if not san_text:
+            return None
+        try:
+            move = board.parse_san(san_text)
+        except (ValueError, chess.InvalidMoveError, chess.IllegalMoveError, chess.AmbiguousMoveError):
+            return None
+        entry = {
+            "san": board.san(move),
+            "uci": move.uci(),
+            "side": "white" if board.turn == chess.WHITE else "black",
+            "move_number": str(board.fullmove_number),
+            "game_ply": str(board.ply() + 1),
+        }
+        history.append(entry)
+        board.push(move)
+    if board.ply() != target.ply() or not _same_chess_position(board, target):
+        return None
+    return history
 
 
 def format_move_history(history: list[dict[str, str]], limit: int = 16) -> str:
@@ -2079,7 +2210,12 @@ def perform_cursor_drag(
 
     text = str(uci or "").lower()
     if len(text) == 5:
-        return {"ok": False, "reason": "promotion-ui-needs-site-specific-selector"}
+        # Cursor promotion UI differs by site. Use only the configured site's
+        # already-exposed legal-move API as a verified fallback for promotions.
+        return perform_api_move(
+            driver, text, expected_fen, expected_color,
+            low_clock_mode=low_clock_mode, source="promotion-api-fallback",
+        )
 
     board_element = target.get("boardElement")
     try:
@@ -2207,7 +2343,7 @@ def perform_cursor_drag(
 
     # Confirm the UI accepted this drag before reporting success.
     deadline = time.monotonic() + (
-        0.04 if low_clock_mode else (0.45 if allow_premove else 0.90)
+        0.12 if low_clock_mode else (0.45 if allow_premove else 0.90)
     )
     while time.monotonic() < deadline:
         try:
@@ -2217,9 +2353,10 @@ def perform_cursor_drag(
             )
         except WebDriverException:
             current_fen = ""
-        if current_fen and str(current_fen).strip() != expected_fen.strip():
+        if current_fen and uci_move_reaches_fen(expected_fen, str(current_fen).strip(), text):
             return {
                 "ok": True,
+                "confirmed": True,
                 "uci": text,
                 "drag_ms": total_drag_ms,
                 "pre_delay_ms": pre_delay_ms,
@@ -2256,6 +2393,53 @@ def perform_cursor_drag(
         "drag_ms": total_drag_ms,
         "pre_delay_ms": pre_delay_ms,
         "waypoints": waypoint_count,
+    }
+
+
+def perform_api_move(
+    driver, uci: str, expected_fen: str, expected_color: str | None,
+    *, low_clock_mode: bool = False, source: str = "api",
+) -> dict[str, object]:
+    """Submit through the configured site's legal-move API and confirm the chosen move."""
+    try:
+        response = driver.execute_script(
+            "return window.__liveGameApiReader ? "
+            "window.__liveGameApiReader.playUci(arguments[0], arguments[1], arguments[2]) : "
+            "{ok:false, reason:'reader-not-installed'};",
+            uci, expected_fen, expected_color,
+        )
+    except WebDriverException:
+        return {"ok": False, "reason": "api-submit-unavailable", "source": source}
+    if not isinstance(response, dict) or not response.get("ok"):
+        return response if isinstance(response, dict) else {
+            "ok": False, "reason": "invalid-api-submit-response", "source": source
+        }
+
+    # API acceptance alone is not a confirmed move. Verify the selected UCI
+    # is reflected in the authoritative board, allowing one instant opponent reply.
+    deadline = time.monotonic() + (0.12 if low_clock_mode else 0.50)
+    while True:
+        try:
+            current = driver.execute_script(
+                "return window.__liveGameApiReader ? "
+                "window.__liveGameApiReader.current().fen : '';"
+            )
+        except WebDriverException:
+            current = ""
+        if current and uci_move_reaches_fen(expected_fen, str(current).strip(), uci):
+            return {
+                **response, "ok": True, "confirmed": True,
+                "uci": str(uci).lower(), "source": source,
+            }
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.003 if low_clock_mode else 0.010)
+    return {
+        "ok": False,
+        "reason": "api-move-not-confirmed",
+        "api_accepted": True,
+        "uci": str(uci).lower(),
+        "source": source,
     }
 
 
@@ -3282,6 +3466,10 @@ def main() -> int:
     strategy_board = None
     strategy_board_fen = ""
     active_bot_color = configured_bot_color
+    side_resolver = PlayerSideResolver(
+        configured_bot_color,
+        player_name_enabled=bool(configured_player_name),
+    )
     last_side_warning_fen = ""
     previous_eval_white_cp = None
     next_human_best_uci = None
@@ -3479,10 +3667,7 @@ def main() -> int:
                         or normalize_chess_color(event.get("playingAs"))
                     )
                     player_name_color = normalize_chess_color(event.get("playerNameColor"))
-                    if configured_bot_color:
-                        active_bot_color = configured_bot_color
-                    elif active_bot_color is None and (player_name_color or api_bot_color):
-                        active_bot_color = player_name_color or api_bot_color
+                    active_bot_color = side_resolver.resolve(api_bot_color, player_name_color)
                     white_clock_seconds = parse_clock_seconds(event.get("whiteClock"))
                     black_clock_seconds = parse_clock_seconds(event.get("blackClock"))
                     if active_bot_color == "white":
@@ -3581,9 +3766,10 @@ def main() -> int:
                             if current_clock is not None:
                                 last_seen_clock_by_side[side_name] = float(current_clock)
                     if initial_game_clock_seconds is None and observed_clocks:
-                        if is_start_position(fen) or configured_time_control_seconds is None:
+                        if is_start_position(fen):
                             initial_game_clock_seconds = max(observed_clocks)
-                        else:
+                        elif configured_time_control_seconds is not None:
+                            # Only trust a user-specified base time when attaching mid-game.
                             initial_game_clock_seconds = configured_time_control_seconds
                     # In a 10-second control, fast mode must start at the first
                     # move instead of waiting for a random 7-10s threshold.
@@ -3613,16 +3799,24 @@ def main() -> int:
                             bot_color=active_bot_color,
                         )
                     if observed_clocks and not clock_source_reported:
-                        source_note = (
-                            "configured fallback (game already in progress)"
-                            if configured_time_control_seconds is not None and not is_start_position(fen)
-                            else "first observed clock reading (estimate)"
-                        )
-                        print(
-                            f"[CLOCK] Base time={initial_game_clock_seconds:.2f}s via {source_note}; "
-                            f"increment={clock_increment_seconds:.2f}s.",
-                            flush=True,
-                        )
+                        if initial_game_clock_seconds is None:
+                            print(
+                                "[CLOCK] Base time=unknown (attached mid-game; set time_control_seconds in TXT "
+                                "to enable a reliable clock profile); "
+                                f"increment={clock_increment_seconds:.2f}s.",
+                                flush=True,
+                            )
+                        else:
+                            source_note = (
+                                "configured fallback (game already in progress)"
+                                if configured_time_control_seconds is not None and not is_start_position(fen)
+                                else "start-position clock reading"
+                            )
+                            print(
+                                f"[CLOCK] Base time={initial_game_clock_seconds:.2f}s via {source_note}; "
+                                f"increment={clock_increment_seconds:.2f}s.",
+                                flush=True,
+                            )
                         clock_source_reported = True
                     last_move: dict[str, str] | None = None
                     note = "DOM/API state change; identifiers omitted"
@@ -3631,7 +3825,10 @@ def main() -> int:
                         if previous_fen:
                             last_move = infer_move_between_fens(previous_fen, fen)
                             if last_move:
-                                last_move["game_ply"] = str(len(reconstructed_history) + 1)
+                                try:
+                                    last_move["game_ply"] = str(chess.Board(fen).ply())
+                                except (ValueError, IndexError):
+                                    last_move["game_ply"] = str(len(reconstructed_history) + 1)
                                 reconstructed_history.append(last_move)
                                 if settings_window is not None:
                                     try:
@@ -3657,6 +3854,31 @@ def main() -> int:
                                 note = "Position changed but transition could not be inferred as one legal move"
                         previous_fen = fen
 
+                    # Repair skipped FEN transitions when the page exposes a complete
+                    # SAN move list. A history is accepted only if replaying every move
+                    # from the initial position exactly matches the authoritative FEN.
+                    if fen and dom_moves and chess is not None:
+                        dom_history = reconstruct_history_from_dom_moves(dom_moves, fen)
+                        if dom_history and dom_history != reconstructed_history:
+                            reconstructed_history = dom_history
+                            last_move = dict(dom_history[-1])
+                            note = "Move history reconciled from legal DOM SAN list"
+                            print(
+                                f"[HISTORY SYNC] Reconciled {len(dom_history)} plies against current FEN.",
+                                flush=True,
+                            )
+                            if settings_window is not None:
+                                for history_item in dom_history:
+                                    try:
+                                        settings_window.record_observed_move(
+                                            game_number,
+                                            int(history_item["game_ply"]),
+                                            history_item,
+                                            eval_white_cp=settings_window.last_eval_white_cp,
+                                        )
+                                    except Exception:
+                                        pass
+
                     # Keep a persistent python-chess board so the ChessKida strategy
                     # sees the same move_stack/history state as the original bot.
                     if chess is not None and fen:
@@ -3678,7 +3900,8 @@ def main() -> int:
                                     last_auto_attempt_fen = ""
                                     last_premove_attempt_fen = ""
                                     last_low_clock_premove_fen = ""
-                                    active_bot_color = configured_bot_color or player_name_color or api_bot_color
+                                    side_resolver.reset_for_new_game()
+                                    active_bot_color = side_resolver.resolve(api_bot_color, player_name_color)
                                 elif strategy_transition is not None:
                                     strategy_move = chess.Move.from_uci(strategy_transition["uci"])
                                     if strategy_move in strategy_board.legal_moves:
@@ -3853,7 +4076,8 @@ def main() -> int:
                             f"player={event.get('playingAsColor') or 'unknown'} | "
                             f"nameSide={event.get('playerNameColor') or 'unknown'} "
                             f"({event.get('playerNameColorSource') or 'no-evidence'}) | "
-                            f"botSide={active_bot_color or 'unconfirmed'} | ply={len(history_copy)} | "
+                            f"botSide={active_bot_color or 'unconfirmed'} | "
+                            f"ply={(chess.Board(fen).ply() if chess is not None and fen else len(history_copy))} | "
                             f"FEN={'OK' if fen else 'missing'} | "
                             f"API={'OK' if event.get('gameApiFound') else 'missing'} | "
                             f"bottomSide={event.get('bottomSide', 'unknown')} (orientation only) | "
@@ -3917,22 +4141,13 @@ def main() -> int:
                             or normalize_chess_color(event.get("playingAs"))
                         )
                         player_name_color = normalize_chess_color(event.get("playerNameColor"))
-                        # When player_name is configured, the matched username's
-                        # panel color is per-game truth. Refresh it on each snapshot
-                        # so the previous game's color cannot stick across a game reset.
-                        if configured_player_name:
-                            active_bot_color = player_name_color
-                        elif configured_bot_color:
-                            active_bot_color = configured_bot_color
-                        elif active_bot_color is None and api_bot_color:
-                            active_bot_color = api_bot_color
-
+                        # The resolver above already selected the side once for this
+                        # snapshot. The explicit API is authoritative; player-name
+                        # evidence is a stable two-snapshot fallback only.
                         color_conflict = bool(
-                            active_bot_color
-                            and (
-                                (api_bot_color and api_bot_color != active_bot_color)
-                                or (player_name_color and player_name_color != active_bot_color)
-                            )
+                            configured_bot_color
+                            and api_bot_color
+                            and api_bot_color != configured_bot_color
                         )
 
                         if fen != last_auto_attempt_fen:
@@ -3969,7 +4184,7 @@ def main() -> int:
                                     print(
                                         "[AUTO SAFETY] Bot color is unconfirmed. "
                                         "Set bot_color=white or bot_color=black in tracker_settings.txt, "
-                                        "or expose a recognized getPlayingAs() value. No move submitted.",
+                                        "or wait for stable player-name/getPlayingAs side evidence. No move submitted.",
                                         flush=True,
                                     )
                                 elif color_conflict:
@@ -4207,9 +4422,9 @@ def main() -> int:
                                             low_clock_mode=low_clock_mode,
                                         )
                                     else:
-                                        submit = driver.execute_script(
-                                            "return window.__liveGameApiReader ? window.__liveGameApiReader.playUci(arguments[0], arguments[1]) : {ok:false, reason:'reader-not-installed'};",
-                                            chosen_move.uci(), fen,
+                                        submit = perform_api_move(
+                                            driver, chosen_move.uci(), fen, active_bot_color,
+                                            low_clock_mode=low_clock_mode,
                                         )
                                     if isinstance(submit, dict) and submit.get("ok"):
                                         if low_clock_mode:
@@ -4270,7 +4485,12 @@ def main() -> int:
                                                 f" | travel={int(submit.get('drag_ms', 0))} ms"
                                                 f" | pre-delay={int(submit.get('pre_delay_ms', 0))} ms"
                                             )
-                                        print(f"[AUTO] Move was not submitted ({reason}){detail}.", flush=True)
+                                        print(f"[AUTO] Move was not confirmed ({reason}){detail}.", flush=True)
+                                        if reason == "position-changed-before-drag":
+                                            print(
+                                                "[AUTO SAFETY] Board changed after selection; stale move was not retried.",
+                                                flush=True,
+                                            )
                                         if settings_window is not None:
                                             settings_window.update_move_status(
                                                 game_number, pending_ply,
