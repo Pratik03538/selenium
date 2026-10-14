@@ -4414,14 +4414,14 @@ def main() -> int:
                                         and (short_control_fast_mode or remaining_clock_seconds <= low_clock_trigger_seconds)
                                     )
                                     low_clock_total_budget_seconds = (
-                                        random.choice((0.100, 0.125, 0.150))
+                                        random.choice((0.075, 0.100, 0.125))
                                         if (
                                             low_clock_mode
                                             and remaining_clock_seconds is not None
                                             and opponent_clock_seconds is not None
                                             and remaining_clock_seconds <= opponent_clock_seconds
                                         )
-                                        else random.choice((0.100, 0.150, 0.200))
+                                        else random.choice((0.100, 0.125, 0.150))
                                         if low_clock_mode else None
                                     )
                                     if low_clock_mode:
@@ -4727,14 +4727,14 @@ def main() -> int:
                                     and (short_control_fast_mode or bot_clock_for_premove <= low_clock_trigger_seconds)
                                 )
                                 low_clock_premove_budget_seconds = (
-                                    random.choice((0.100, 0.125, 0.150))
+                                    random.choice((0.075, 0.100, 0.125))
                                     if (
                                         low_clock_premove_mode
                                         and bot_clock_for_premove is not None
                                         and opponent_clock_for_premove is not None
                                         and bot_clock_for_premove <= opponent_clock_for_premove
                                     )
-                                    else random.choice((0.100, 0.150, 0.200))
+                                    else random.choice((0.100, 0.125, 0.150))
                                     if low_clock_premove_mode else None
                                 )
                                 if low_clock_premove_mode:
