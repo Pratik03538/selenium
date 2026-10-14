@@ -42,7 +42,7 @@ BOT_THINK_UNCERTAINTY_CP = 75
 BOT_THINK_SHARP_EVAL_CP = 80
 BOT_THINK_STRATEGIC_LEGAL_MOVES = 24
 HUMAN_SELECTION_DIVERSITY_EXTRA_DROP = 0.04
-TRAINING_MULTI_PV = 15
+TRAINING_MULTI_PV = 100
 FORCE_BEST_MIN_CP = 200
 FORCE_BEST_IMPROVEMENT_FRACTION = 0.65
 HUMAN_ADVANTAGE_START_CP = 400
@@ -60,9 +60,9 @@ HUMAN_WINNING_GUARD_MAX_DROP_CP = 45
 # Keep the baseline weighted picker, but allow a few more safe ranks
 # to remain eligible in winning positions. CP and hanging-piece guards below
 # still decide whether a lower-ranked move is actually acceptable.
-HUMAN_WINNING_GUARD_RANK_CAP = 9
+HUMAN_WINNING_GUARD_RANK_CAP = 99
 HUMAN_STRONG_WINNING_CP = 300
-HUMAN_STRONG_WINNING_RANK_CAP = 7
+HUMAN_STRONG_WINNING_RANK_CAP = 99
 HUMAN_WINNING_NON_BEST_CHANCE = 0.45
 HUMAN_STRONG_WINNING_NON_BEST_CHANCE = 0.25
 FREE_CAPTURE_MIN_VALUE = 3
@@ -3048,11 +3048,14 @@ def choose_stockfish_move(
                 )
             )
 
-            weight *= (
-                rank_factors.get(
-                    candidate["rank"],
-                    0.45
-                )
+            rank = int(candidate["rank"])
+            fallback_rank_weight = max(
+                0.35,
+                0.90 - max(0, rank - 14) * 0.006
+            )
+            weight *= rank_factors.get(
+                rank,
+                fallback_rank_weight
             )
 
             weighted.append(
@@ -3174,7 +3177,10 @@ def choose_stockfish_move(
                 candidate,
                 rank_weights.get(
                     candidate["rank"],
-                    0.3
+                    max(
+                        0.35,
+                        0.92 - max(0, int(candidate["rank"]) - 14) * 0.006
+                    )
                 )
             )
         )
