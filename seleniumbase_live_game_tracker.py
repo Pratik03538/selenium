@@ -4379,7 +4379,7 @@ def main() -> int:
                                 if is_new_start:
                                     strategy_board = chess.Board(fen)
                                     opponent_match_history.clear()
-                                                                    next_opponent_best_cp = None
+                                    next_opponent_best_cp = None
                                     pending_opponent_best_cp = None
                                     pending_opponent_color = None
                                     previous_eval_white_cp = None
@@ -4397,7 +4397,7 @@ def main() -> int:
                                     else:
                                         strategy_board = chess.Board(fen)
                                         opponent_match_history.clear()
-                                                                            next_opponent_best_cp = None
+                                        next_opponent_best_cp = None
                                         pending_opponent_best_cp = None
                                         pending_opponent_color = None
                                         previous_eval_white_cp = None
@@ -4406,7 +4406,7 @@ def main() -> int:
                                     # Recover synchronization if a page skipped a FEN state.
                                     strategy_board = chess.Board(fen)
                                     opponent_match_history.clear()
-                                                                    next_opponent_best_cp = None
+                                    next_opponent_best_cp = None
                                     pending_opponent_best_cp = None
                                     pending_opponent_color = None
                                     previous_eval_white_cp = None
@@ -4426,7 +4426,7 @@ def main() -> int:
                                 ):
                                     pending_opponent_best_cp = float(next_opponent_best_cp)
                                     pending_opponent_color = strategy_transition.get("side")
-                                                                    next_opponent_best_cp = None
+                                    next_opponent_best_cp = None
                         except (ValueError, IndexError):
                             strategy_board = None
                             strategy_board_fen = ""
@@ -5039,11 +5039,11 @@ def main() -> int:
                                                     previous_eval_white_cp,
                                                     source="After-move analysis",
                                                 )
-                                            predicted = analysis_state.get("next_reply_best_move")
-                                                    next_opponent_best_cp = analysis_state.get("next_reply_eval_cp")
+
+                                            next_opponent_best_cp = analysis_state.get("next_reply_eval_cp")
                                         else:
                                             previous_eval_white_cp = None
-                                                                                    next_opponent_best_cp = None
+                                            next_opponent_best_cp = None
                                     else:
                                         move_retry_gate.finish(
                                             submit if isinstance(submit, dict)
