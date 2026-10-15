@@ -3664,22 +3664,58 @@ def choose_premove_candidate(
             return None, None, "premove-analysis-deadline-exceeded"
         engine = _DeadlineBoundEngine(engine, float(analysis_deadline))
 
-    if low_clock_mode:
-        low_clock_move, low_clock_reply, low_clock_reason = choose_low_clock_conversion_premove(
+    # At low clock, prioritize tactical conversion immediately. In a small
+    # endgame with a clear material lead or a pawn one step from promotion,
+    # use the same guarded conversion-premise check even before the emergency
+    # clock threshold; never widen this to unguarded speculative moves.
+    conversion_mode = bool(low_clock_mode)
+    if not conversion_mode:
+        try:
+            bot_material = strategy_module.side_material(board, bot_turn)
+            opponent_material = strategy_module.side_material(board, not bot_turn)
+            piece_count = len(board.piece_map())
+            advanced_pawn = any(
+                piece.color == bot_turn
+                and piece.piece_type == chess.PAWN
+                and chess.square_rank(square) == (6 if bot_turn == chess.WHITE else 1)
+                for square, piece in board.piece_map().items()
+            )
+            conversion_mode = (
+                piece_count <= 14
+                and (
+                    bot_material - opponent_material >= 300
+                    or advanced_pawn
+                )
+            )
+        except Exception:
+            conversion_mode = False
+
+    if conversion_mode:
+        if not low_clock_mode:
+            print(
+                "[PREMOVE] Winning-endgame conversion check active "
+                "(material lead >= 3 pawns or advanced pawn).",
+                flush=True,
+            )
+        conversion_move, conversion_reply, conversion_reason = choose_low_clock_conversion_premove(
             engine, board, strategy_module, bot_color, args
         )
         if analysis_deadline is not None and time.monotonic() >= float(analysis_deadline):
-            return None, low_clock_reply, "premove-analysis-deadline-exceeded"
-        if low_clock_move is not None:
-            return low_clock_move, low_clock_reply, low_clock_reason
-        fallback_move, fallback_reply, fallback_reason = choose_low_clock_likely_reply_premove(
-            engine, board, bot_color, args, strategy_module=strategy_module
-        )
-        if analysis_deadline is not None and time.monotonic() >= float(analysis_deadline):
-            return None, fallback_reply or low_clock_reply, "premove-analysis-deadline-exceeded"
-        if fallback_move is not None:
-            return fallback_move, fallback_reply, fallback_reason
-        return None, fallback_reply or low_clock_reply, f"{low_clock_reason}; {fallback_reason}"
+            return None, conversion_reply, "premove-analysis-deadline-exceeded"
+        if conversion_move is not None:
+            if not low_clock_mode:
+                conversion_reason = conversion_reason.replace("low-clock-", "winning-conversion-")
+            return conversion_move, conversion_reply, conversion_reason
+
+        if low_clock_mode:
+            fallback_move, fallback_reply, fallback_reason = choose_low_clock_likely_reply_premove(
+                engine, board, bot_color, args, strategy_module=strategy_module
+            )
+            if analysis_deadline is not None and time.monotonic() >= float(analysis_deadline):
+                return None, fallback_reply or conversion_reply, "premove-analysis-deadline-exceeded"
+            if fallback_move is not None:
+                return fallback_move, fallback_reply, fallback_reason
+            return None, fallback_reply or conversion_reply, f"{conversion_reason}; {fallback_reason}"
 
     mate_move, mate_reply, mate_reason = choose_mate_phase_premove(
         engine, board, bot_color, args
