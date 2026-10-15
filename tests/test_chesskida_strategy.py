@@ -172,6 +172,18 @@ class MaterialSafetyAndPriorityTests(unittest.TestCase):
         self.assertEqual(selected, chess.Move.from_uci("a7a8q"))
         self.assertEqual(meta.get("source"), "LOW_CLOCK_TACTIC")
 
+    def test_low_clock_prioritizes_a_safe_free_capture_outside_single_pv(self):
+        board = chess.Board("q6k/8/8/8/8/8/8/R3K3 w - - 0 1")
+        ordinary_move = chess.Move.from_uci("e1d1")
+        info = {
+            "pv": [ordinary_move],
+            "score": chess.engine.PovScore(chess.engine.Cp(250), board.turn),
+        }
+        selected, _selected_info, meta = strategy.choose_stockfish_move(
+            board, [info], bot_color=board.turn, low_clock_mode=True
+        )
+        self.assertEqual(selected, chess.Move.from_uci("a1a8"))
+        self.assertEqual(meta.get("source"), "LOW_CLOCK_TACTIC")
     def test_negative_position_respects_baseline_near_equal_eval_band(self):
         board = chess.Board("4k3/8/8/8/1p6/8/8/1N2K3 w - - 0 1")
         moves = [
