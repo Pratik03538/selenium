@@ -14,6 +14,7 @@ import json
 import ipaddress
 import re
 import random
+import subprocess
 import sys
 import threading
 import time
@@ -27,6 +28,7 @@ try:
     from selenium import webdriver
     from selenium.common.exceptions import WebDriverException
     from selenium.webdriver.chrome.service import Service as ChromeService
+    from selenium.webdriver.common.selenium_manager import SeleniumManager
     from selenium.webdriver.common.action_chains import ActionChains
 except ImportError as exc:
     raise SystemExit(
@@ -1001,9 +1003,54 @@ def target_matches(url: str | None, allowed_host: str) -> bool:
     return host == allowed_host or host.endswith("." + allowed_host)
 
 
-def attach_to_chrome_with_timeout(options, timeout_seconds: float = 30.0):
+def resolve_chromedriver_with_timeout(timeout_seconds: float = 45.0):
+    """Resolve ChromeDriver in a killable subprocess instead of hiding Selenium Manager inside webdriver.Chrome."""
+    try:
+        manager_binary = str(SeleniumManager._get_binary())
+    except Exception as exc:
+        return None, f"manager_binary:{type(exc).__name__}"
+
+    command = [
+        manager_binary,
+        "--browser", "chrome",
+        "--language-binding", "python",
+        "--output", "json",
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        return None, "manager_timeout"
+    except Exception as exc:
+        return None, f"manager_launch:{type(exc).__name__}"
+
+    try:
+        payload = json.loads(completed.stdout or "{}")
+        result = payload.get("result", {})
+        driver_path = str(result.get("driver_path") or "").strip()
+    except (AttributeError, TypeError, json.JSONDecodeError):
+        return None, "manager_invalid_output"
+
+    if completed.returncode != 0:
+        return None, f"manager_exit:{completed.returncode}"
+    if not driver_path or not Path(driver_path).is_file():
+        return None, "driver_path_missing"
+    return Path(driver_path), None
+
+
+def attach_to_chrome_with_timeout(
+    options, driver_path: Path, timeout_seconds: float = 30.0
+):
     """Bound ChromeDriver session creation so an unresponsive attach cannot freeze the tracker."""
-    service = ChromeService()
+    service = ChromeService(executable_path=str(driver_path))
     result = {}
     finished = threading.Event()
 
@@ -4130,11 +4177,21 @@ def main() -> int:
         options = webdriver.ChromeOptions()
         options.debugger_address = args.debugger_address
         wake_configured_debugger_tab(args.debugger_address, allowed_host)
+        print("[CONNECT] Resolving a compatible ChromeDriver...", flush=True)
+        driver_path, driver_resolution_error = resolve_chromedriver_with_timeout(timeout_seconds=45.0)
+        if driver_resolution_error == "manager_timeout":
+            print("[CONNECT ERROR] ChromeDriver resolution timed out after 45 seconds in Selenium Manager.", file=sys.stderr, flush=True)
+            print("[CONNECT ERROR] Check internet access and update Selenium in this venv; the browser session was not changed.", file=sys.stderr, flush=True)
+            return 2
+        if driver_resolution_error is not None:
+            print(f"[CONNECT ERROR] ChromeDriver resolution failed ({driver_resolution_error}). Update Selenium in this venv and retry.", file=sys.stderr, flush=True)
+            return 2
+        print("[CONNECT] Compatible ChromeDriver resolved.", flush=True)
         print("[CONNECT] Attaching Selenium to the existing Chrome session...", flush=True)
-        driver, attach_error = attach_to_chrome_with_timeout(options, timeout_seconds=30.0)
+        driver, attach_error = attach_to_chrome_with_timeout(options, driver_path, timeout_seconds=30.0)
         if attach_error == "timeout":
-            print("[CONNECT ERROR] Selenium attach timed out after 30 seconds; ChromeDriver did not finish creating a session.", file=sys.stderr, flush=True)
-            print("[CONNECT ERROR] Check Chrome/ChromeDriver compatibility and close stale ChromeDriver.exe processes, then retry.", file=sys.stderr, flush=True)
+            print("[CONNECT ERROR] ChromeDriver session creation timed out after 30 seconds, after driver resolution succeeded.", file=sys.stderr, flush=True)
+            print("[CONNECT ERROR] This points to the ChromeDriver-to-Chrome handshake; close stale ChromeDriver.exe processes and retry.", file=sys.stderr, flush=True)
             return 2
         if attach_error is not None:
             print(f"[CONNECT ERROR] Selenium could not attach to Chrome ({type(attach_error).__name__}). Check Chrome/ChromeDriver compatibility.", file=sys.stderr, flush=True)
