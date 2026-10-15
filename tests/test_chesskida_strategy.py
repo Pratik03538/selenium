@@ -249,6 +249,33 @@ class FastClockProtectionTests(unittest.TestCase):
         strategy._thinking_budget_remaining = None
 
 
+class OpeningFastPathTests(unittest.TestCase):
+    def test_opening_move_delay_is_capped_and_skips_optional_pause(self):
+        board = chess.Board()
+        move = chess.Move.from_uci("e2e4")
+        profile = {
+            "seconds_per_decision": 1.5,
+            "clock_margin": 0.0,
+            "lead_buffer": 0.0,
+            "spendable_lead": 0.0,
+            "pace_scale": 1.0,
+        }
+        strategy._thinking_budget_remaining = None
+        with patch.object(strategy, "_sample_base_move_delay", return_value=1.1):
+            with patch.object(strategy, "_clock_time_profile", return_value=profile):
+                delay = strategy.natural_bot_move_delay(
+                    board,
+                    move,
+                    thinking_enabled=True,
+                    initial_time_seconds=60.0,
+                    remaining_time_seconds=55.0,
+                    opponent_time_seconds=55.0,
+                )
+        self.assertGreaterEqual(delay, 0.0)
+        self.assertLessEqual(delay, 0.12)
+        strategy._thinking_budget_remaining = None
+
+
 class RandomizedTimingTests(unittest.TestCase):
     def test_base_move_delay_uses_continuous_samples(self):
         board = chess.Board()
