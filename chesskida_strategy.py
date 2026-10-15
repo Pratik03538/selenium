@@ -2395,6 +2395,20 @@ def choose_stockfish_move(
     if low_clock_mode:
         candidate_by_move = {candidate["move"]: candidate for candidate in candidates}
 
+        # Keep a short forced mate ahead of conversion tricks when the clock is low.
+        if best["mate"] is not None and 0 < best["mate"] <= MATE_FORCE_FAST_MAX:
+            return (
+                best["move"],
+                best["info"],
+                {
+                    "rank": best["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": best_cp,
+                    "source": "LOW_CLOCK_TACTIC",
+                    "reason": f"LOW CLOCK FORCED MATE M{best['mate']}",
+                },
+            )
+
         for legal_move in board.legal_moves:
             try:
                 after_mate = board.copy(stack=False)
