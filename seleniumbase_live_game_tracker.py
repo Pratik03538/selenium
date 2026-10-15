@@ -2360,13 +2360,11 @@ def _perform_cursor_drag_once(
     driver, uci: str, expected_fen: str, expected_color: str | None,
     allow_premove: bool = False, low_clock_mode: bool = False,
 ) -> dict[str, object]:
-    """Drag a legal move on the configured local/test board.
+    """Drag a legal move with a short curved gesture and report actual latency.
 
-    Each move chooses new points inside the source and destination squares.
-    Normal and premove gestures share the same randomized points, curved path, and
-    2-4 waypoint range. Low-clock mode keeps the total drag short and skips optional
-    pre/hover waits so time control remains the priority.
-    Premove gestures are best-effort and use explicit queue signals when exposed.
+    Normal and premove gestures share randomized square points and a two-segment
+    curve. Low-clock mode shortens movement and skips pre/hover waits. Premove
+    gestures are best-effort and use explicit queue signals when exposed.
     """
     try:
         target = driver.execute_script(
@@ -2474,6 +2472,7 @@ def _perform_cursor_drag_once(
     source_offset = (round(sx - width / 2.0), round(sy - height / 2.0))
     hover_ms = 0 if low_clock_mode else rng.randint(2, 8)
 
+    action_elapsed_ms = 0.0
     try:
         # Use W3C pointer actions with per-segment timing. Low-clock mode
         # removes optional waits and keeps positioning/drag movement very short.
@@ -2510,7 +2509,9 @@ def _perform_cursor_drag_once(
                     pointer.pause(rng.uniform(0.0002, 0.0010))
 
         pointer.pointer_up()
+        action_started_at = time.monotonic()
         actions.perform()
+        action_elapsed_ms = (time.monotonic() - action_started_at) * 1000.0
     except (WebDriverException, ValueError, TypeError, AttributeError) as exc:
         # Never leave the mouse button pressed if a pointer action fails.
         try:
@@ -2524,10 +2525,12 @@ def _perform_cursor_drag_once(
             "error": str(exc)[:240],
             "drag_ms": total_drag_ms,
             "pre_delay_ms": pre_delay_ms,
+            "action_elapsed_ms": round(action_elapsed_ms, 1),
         }
 
     # Confirm the UI accepted this drag before reporting success.
-    deadline = time.monotonic() + (
+    confirmation_started_at = time.monotonic()
+    deadline = confirmation_started_at + (
         0.12 if low_clock_mode else (0.45 if allow_premove else 0.90)
     )
     while time.monotonic() < deadline:
@@ -2547,6 +2550,8 @@ def _perform_cursor_drag_once(
                 "pre_delay_ms": pre_delay_ms,
                 "waypoints": waypoint_count,
                 "premove_applied": bool(allow_premove),
+                "action_elapsed_ms": round(action_elapsed_ms, 1),
+                "confirm_elapsed_ms": round((time.monotonic() - confirmation_started_at) * 1000.0, 1),
             }
         if allow_premove:
             try:
@@ -2560,6 +2565,8 @@ def _perform_cursor_drag_once(
                         "premove_confirmed": True, "premove_source": status.get("source", ""),
                         "drag_ms": total_drag_ms, "pre_delay_ms": pre_delay_ms,
                         "waypoints": waypoint_count,
+                        "action_elapsed_ms": round(action_elapsed_ms, 1),
+                        "confirm_elapsed_ms": round((time.monotonic() - confirmation_started_at) * 1000.0, 1),
                     }
             except WebDriverException:
                 pass
@@ -2571,6 +2578,8 @@ def _perform_cursor_drag_once(
             "premove_confirmed": False, "premove_source": "not-exposed",
             "drag_ms": total_drag_ms, "pre_delay_ms": pre_delay_ms,
             "waypoints": waypoint_count,
+            "action_elapsed_ms": round(action_elapsed_ms, 1),
+            "confirm_elapsed_ms": round((time.monotonic() - confirmation_started_at) * 1000.0, 1),
         }
     return {
         "ok": False,
@@ -2578,6 +2587,8 @@ def _perform_cursor_drag_once(
         "drag_ms": total_drag_ms,
         "pre_delay_ms": pre_delay_ms,
         "waypoints": waypoint_count,
+        "action_elapsed_ms": round(action_elapsed_ms, 1),
+        "confirm_elapsed_ms": round((time.monotonic() - confirmation_started_at) * 1000.0, 1),
     }
 
 
@@ -5077,7 +5088,14 @@ def main() -> int:
                                                 flush=True,
                                             )
                                         if args.move_input == "cursor":
-                                            print(f"[CURSOR] Drag accepted | travel={int(submit.get('drag_ms', 0))} ms | pre-delay={int(submit.get('pre_delay_ms', 0))} ms | waypoints={int(submit.get('waypoints', 0))}.", flush=True)
+                                            print(
+                                                f"[CURSOR] Drag accepted | configured-travel={int(submit.get('drag_ms', 0))} ms "
+                                                f"| action-roundtrip={float(submit.get('action_elapsed_ms', 0.0)):.1f} ms "
+                                                f"| confirmation={float(submit.get('confirm_elapsed_ms', 0.0)):.1f} ms "
+                                                f"| pre-delay={int(submit.get('pre_delay_ms', 0))} ms "
+                                                f"| waypoints={int(submit.get('waypoints', 0))}.",
+                                                flush=True,
+                                            )
                                         print(f"[AUTO] Submitted selected move: {chosen_san} ({chosen_move.uci()}).", flush=True)
                                         if settings_window is not None:
                                             settings_window.update_move_status(
