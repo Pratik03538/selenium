@@ -773,6 +773,29 @@ def natural_bot_move_delay(
     except Exception:
         pass
 
+    # Protect clock parity: Selenium submission already has real overhead, so
+    # only spend discretionary thinking time when we have a meaningful safe lead.
+    # Keep a short randomized base delay when the opponent's clock is close.
+    if own_clock is not None and opponent_clock is not None:
+        try:
+            spendable_clock_lead = float(clock_spendable_lead)
+        except (TypeError, ValueError):
+            spendable_clock_lead = 0.0
+        if spendable_clock_lead < 4.0:
+            parity_delay = min(float(delay), random.uniform(0.035, 0.220))
+            _last_bot_natural_delay = parity_delay
+            clock_relation = (
+                "behind opponent"
+                if own_clock < opponent_clock
+                else "protecting clock parity"
+            )
+            print(
+                f"[BOT CLOCK] {clock_relation}; safe lead={spendable_clock_lead:.1f}s, "
+                f"optional pause suppressed, delay={parity_delay:.3f}s.",
+                flush=True,
+            )
+            return max(0.0, parity_delay)
+
     # Sampled opening warm-up moves: no long pause.
     if _bot_timing_move_count <= int(_thinking_warmup_moves or BOT_THINKING_START_AFTER_MOVE):
         return max(0.0, float(delay))
