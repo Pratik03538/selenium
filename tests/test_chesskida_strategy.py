@@ -274,7 +274,7 @@ class FastClockProtectionTests(unittest.TestCase):
 
 
 class OpeningFastPathTests(unittest.TestCase):
-    def test_opening_move_delay_is_capped_and_skips_optional_pause(self):
+    def test_opening_quiet_move_uses_a_varied_short_cap_and_skips_pause(self):
         board = chess.Board()
         move = chess.Move.from_uci("e2e4")
         profile = {
@@ -287,6 +287,35 @@ class OpeningFastPathTests(unittest.TestCase):
         strategy._thinking_budget_remaining = None
         with patch.object(strategy, "_sample_base_move_delay", return_value=1.1):
             with patch.object(strategy, "_clock_time_profile", return_value=profile):
+                with patch("chesskida_strategy.random.uniform", return_value=0.18):
+                    delay = strategy.natural_bot_move_delay(
+                        board,
+                        move,
+                        thinking_enabled=True,
+                        initial_time_seconds=60.0,
+                        remaining_time_seconds=55.0,
+                        opponent_time_seconds=55.0,
+                    )
+        self.assertAlmostEqual(delay, 0.18)
+        strategy._thinking_budget_remaining = None
+
+    def test_opening_capture_uses_forced_fast_path_not_quiet_cap(self):
+        board = chess.Board()
+        board.push_san("e4")
+        board.push_san("d5")
+        move = chess.Move.from_uci("e4d5")
+        profile = {
+            "seconds_per_decision": 1.5,
+            "clock_margin": 0.0,
+            "lead_buffer": 0.0,
+            "spendable_lead": 0.0,
+            "pace_scale": 1.0,
+        }
+        strategy._thinking_budget_remaining = None
+        def sampled_delay(_board, _move, forced=False, opening_book=False, **_kwargs):
+            return 0.035 if forced else 0.8
+        with patch.object(strategy, "_sample_base_move_delay", side_effect=sampled_delay):
+            with patch.object(strategy, "_clock_time_profile", return_value=profile):
                 delay = strategy.natural_bot_move_delay(
                     board,
                     move,
@@ -295,8 +324,7 @@ class OpeningFastPathTests(unittest.TestCase):
                     remaining_time_seconds=55.0,
                     opponent_time_seconds=55.0,
                 )
-        self.assertGreaterEqual(delay, 0.0)
-        self.assertLessEqual(delay, 0.12)
+        self.assertLessEqual(delay, 0.035)
         strategy._thinking_budget_remaining = None
 
 
