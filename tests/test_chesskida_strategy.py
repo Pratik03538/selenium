@@ -200,13 +200,18 @@ class MaterialSafetyAndPriorityTests(unittest.TestCase):
             for move, cp in zip(moves, scores_cp)
         ]
 
-        selected_move, _selected_info, meta = strategy.choose_stockfish_move(
-            board, multipv_infos, bot_color=board.turn
-        )
+        # A lower-ranked but still in-band choice is now intentional.
+        # Force the normal selector's lower-rank path so this regression test
+        # stays deterministic instead of occasionally sampling the top two.
+        with patch.object(strategy.random, "random", return_value=1.0):
+            selected_move, _selected_info, meta = strategy.choose_stockfish_move(
+                board, multipv_infos, bot_color=board.turn
+            )
 
         self.assertIn(selected_move, moves)
-        self.assertEqual(meta["rank"], 0)
-        self.assertEqual(meta["selected_cp"], -500)
+        self.assertEqual(meta["rank"], 2)
+        self.assertGreaterEqual(meta["selected_cp"], -570)
+        self.assertLessEqual(meta["current_cp"] - meta["selected_cp"], 70)
 
     def test_safe_free_capture_has_priority_in_a_losing_evaluation(self):
         board = chess.Board("q6k/8/8/8/8/8/8/R3K3 w - - 0 1")
