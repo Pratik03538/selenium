@@ -789,7 +789,7 @@ def natural_bot_move_delay(
         deficit_forces_fast = _clock_deficit_forces_fast_pacing(
             own_clock, opponent_clock, initial_time_seconds
         )
-        late_clock_fast = own_clock <= max(18.0, low_clock_threshold)
+        late_clock_fast = own_clock <= low_clock_threshold
         if spendable_clock_lead < 4.0 and (late_clock_fast or deficit_forces_fast):
             parity_delay = min(float(delay), random.uniform(0.035, 0.220))
             _last_bot_natural_delay = parity_delay
