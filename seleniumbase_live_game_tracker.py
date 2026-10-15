@@ -19,8 +19,8 @@ import time
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlsplit
-from urllib.request import urlopen
+from urllib.parse import quote, urlsplit
+from urllib.request import Request, urlopen
 
 try:
     from selenium import webdriver
@@ -997,6 +997,35 @@ def target_matches(url: str | None, allowed_host: str) -> bool:
     if is_public_competitive_host(host):
         return False
     return host == allowed_host or host.endswith("." + allowed_host)
+
+
+def wake_configured_debugger_tab(debugger_address: str, allowed_host: str) -> bool:
+    """Wake the configured site's tab before ChromeDriver attaches to an idle session."""
+    base_url = f"http://{debugger_address}"
+    try:
+        with urlopen(f"{base_url}/json/list", timeout=2.0) as response:
+            targets = json.loads(response.read().decode("utf-8", errors="replace"))
+        target = next(
+            (
+                item for item in targets
+                if isinstance(item, dict)
+                and item.get("type") == "page"
+                and target_matches(item.get("url"), allowed_host)
+            ),
+            None,
+        )
+        target_id = str((target or {}).get("id") or "").strip()
+        if not target_id:
+            return False
+        activate_request = Request(
+            f"{base_url}/json/activate/{quote(target_id, safe='')}",
+            method="PUT",
+        )
+        with urlopen(activate_request, timeout=2.0) as response:
+            response.read()
+        return True
+    except Exception:
+        return False
 
 
 def check_target(url: str | None, allowed_host: str) -> None:
@@ -4072,6 +4101,7 @@ def main() -> int:
 
         options = webdriver.ChromeOptions()
         options.debugger_address = args.debugger_address
+        wake_configured_debugger_tab(args.debugger_address, allowed_host)
         print("[CONNECT] Attaching Selenium to the existing Chrome session...", flush=True)
         try:
             driver = webdriver.Chrome(options=options)
