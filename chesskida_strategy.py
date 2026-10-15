@@ -1598,11 +1598,6 @@ def find_priority_queen_promotion(
                 "reason_tag": "QUEEN PROMOTION MATE"
             }
 
-        # A promotion is a priority only if it does not simply leave material
-        # hanging. The helper also checks captures of pieces uncovered elsewhere.
-        if candidate_hangs_own_piece(board, move):
-            continue
-
         # Never force a queen promotion when the newly promoted queen can be
         # immediately captured and the engine did not consider the move.
         if candidate is None:
@@ -1644,7 +1639,6 @@ def find_priority_queen_promotion(
     )
 
     return choices[0]
-
 def free_capture_position_safe(
     board,
     move
@@ -1719,8 +1713,7 @@ def free_capture_engine_safe(
     board,
     move,
     engine,
-    reference_cp,
-    time_limit=0.025,
+    reference_cp
 ):
     """Second-stage safety check for a genuinely free capture.
 
@@ -1743,8 +1736,7 @@ def free_capture_engine_safe(
         info = engine.analyse(
             after,
             chess.engine.Limit(
-                depth=FREE_CAPTURE_SAFETY_DEPTH,
-                time=max(0.001, min(0.050, float(time_limit))),
+                depth=FREE_CAPTURE_SAFETY_DEPTH
             )
         )
 
@@ -1831,15 +1823,12 @@ def free_capture_engine_safe(
         # cannot evaluate the candidate reliably, do not elevate it as a safe
         # free capture.
         return False
-
 def find_priority_capture(
     board,
     candidates,
     best_cp,
     force_endgame=False,
-    engine=None,
-    safety_time_limit=0.025,
-    free_capture_check_limit=3,
+    engine=None
 ):
     """Prefer safe captures before human-like wandering.
 
@@ -1868,9 +1857,6 @@ def find_priority_capture(
 
     for move in board.legal_moves:
         if not board.is_capture(move):
-            continue
-
-        if candidate_hangs_own_piece(board, move):
             continue
 
         victim_square = move.to_square
@@ -2032,13 +2018,12 @@ def find_priority_capture(
             reverse=True
         )
 
-        for free_choice in free_choices[:max(1, int(free_capture_check_limit))]:
+        for free_choice in free_choices:
             if free_capture_engine_safe(
                 board,
                 free_choice["move"],
                 engine,
-                best_cp,
-                time_limit=safety_time_limit,
+                best_cp
             ):
                 return free_choice
     elif free_choices:
@@ -2071,7 +2056,6 @@ def find_priority_capture(
         return selected
 
     return None
-
 def find_safe_free_capture(
     board,
     candidates,
@@ -2148,31 +2132,30 @@ def candidate_hangs_own_piece(
     board,
     move
 ):
-    """Reject a move that lets the opponent win material with an immediate capture.
+    """Reject obvious one-move giveaways.
 
-    Check all friendly pieces after the move, not just the piece that moved.
-    A capture made by this move can justify the exchange only when its material
-    value is at least as large as the piece that would otherwise be lost.
-    Checkmate is always exempt; ordinary checks still have their legal replies
-    inspected so a checking move cannot automatically excuse a free giveaway.
+    This is intentionally conservative: a check/mate or a materially winning
+    capture can still be a deliberate sacrifice. Otherwise a moved piece that
+    can be taken next move without a recapture is rejected when that sequence
+    loses material.
     """
     try:
-        mover_color = board.turn
-        captured_square = move.to_square
-        if board.is_en_passant(move):
-            captured_square = (
-                move.to_square - 8
-                if mover_color == chess.WHITE
-                else move.to_square + 8
-            )
+        if board.gives_check(move):
+            return False
 
-        captured_piece = board.piece_at(captured_square)
-        captured_value = (
-            material_value(captured_piece.piece_type)
-            if captured_piece is not None
-            and captured_piece.color != mover_color
+        before_victim = board.piece_at(move.to_square)
+        victim_value = (
+            material_value(before_victim.piece_type)
+            if before_victim is not None
+            and before_victim.color != board.turn
             else 0
         )
+
+        moved_piece = board.piece_at(move.from_square)
+        if moved_piece is None:
+            return True
+
+        moved_value = material_value(moved_piece.piece_type)
 
         after = board.copy(stack=False)
         after.push(move)
@@ -2181,46 +2164,37 @@ def candidate_hangs_own_piece(
             return False
 
         for reply in after.legal_moves:
-            if not after.is_capture(reply):
+            if reply.to_square != move.to_square:
                 continue
 
-            victim_square = reply.to_square
-            if after.is_en_passant(reply):
-                victim_square = (
-                    reply.to_square - 8
-                    if after.turn == chess.WHITE
-                    else reply.to_square + 8
-                )
-
-            victim = after.piece_at(victim_square)
-            if victim is None or victim.color != mover_color:
-                continue
-
-            victim_value = material_value(victim.piece_type)
-            if victim_value <= captured_value:
+            reply_piece = after.piece_at(reply.from_square)
+            if reply_piece is None:
                 continue
 
             after_reply = after.copy(stack=False)
             after_reply.push(reply)
 
-            # If we can immediately recapture the attacker on its destination,
-            # the reply is not a free material giveaway.
-            can_recapture = any(
+            recaptured = any(
                 response.to_square == reply.to_square
                 for response in after_reply.legal_moves
             )
-            if can_recapture:
+
+            if recaptured:
                 continue
 
-            return True
+            # Net material swing after the opponent takes our moved piece.
+            # Negative means the move simply gave material away.
+            net = victim_value - moved_value
+
+            if net < 0 and moved_value >= 100:
+                return True
 
         return False
 
     except Exception:
-        # Keep the existing conservative fallback: engine evaluation remains
-        # the final authority when a tactical position cannot be checked.
+        # Safety-first fallback: unknown candidates are not rejected here;
+        # the existing engine score and physical verification remain in force.
         return False
-
 def _movable_piece_count_for_color(board, color) -> int:
     """Count the side's pieces with at least one legal move in a position copy."""
     try:
