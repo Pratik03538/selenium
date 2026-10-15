@@ -324,6 +324,37 @@ class ClockParityProtectionTests(unittest.TestCase):
         strategy._thinking_budget_remaining = None
 
 
+class ClockSafePauseAllowanceTests(unittest.TestCase):
+    def test_pause_allowance_preserves_clock_lead_after_elapsed_and_submission(self):
+        allowance = strategy._clock_safe_pause_allowance(
+            own_seconds=30.0,
+            opponent_seconds=20.0,
+            elapsed_seconds=1.0,
+            base_delay_seconds=0.5,
+            submission_reserve_seconds=0.1,
+            preserve_lead_seconds=0.75,
+        )
+        self.assertAlmostEqual(allowance, 7.65)
+
+    def test_no_optional_pause_when_clocks_are_equal_or_opponent_is_ahead(self):
+        self.assertEqual(
+            strategy._clock_safe_pause_allowance(own_seconds=20, opponent_seconds=20),
+            0.0,
+        )
+        self.assertEqual(
+            strategy._clock_safe_pause_allowance(own_seconds=19, opponent_seconds=20),
+            0.0,
+        )
+
+    def test_requested_normal_delay_pause_and_cooldown_ranges(self):
+        self.assertEqual(strategy.BOT_NORMAL_DELAY_MIN, 0.20)
+        self.assertEqual(strategy.BOT_NORMAL_DELAY_MAX, 0.70)
+        self.assertEqual(strategy.BOT_THINK_PAUSE_MIN, 1.0)
+        self.assertEqual(strategy.BOT_THINK_PAUSE_MAX, 6.0)
+        self.assertEqual(strategy.BOT_PAUSE_MOVE_COOLDOWN_MIN, 5)
+        self.assertEqual(strategy.BOT_PAUSE_MOVE_COOLDOWN_MAX, 10)
+
+
 class FastClockProtectionTests(unittest.TestCase):
     def test_endgame_pauses_are_available_but_bounded(self):
         self.assertGreater(strategy.BOT_ENDGAME_PAUSE_CHANCE, 0.0)
@@ -373,9 +404,9 @@ class OpeningFastPathTests(unittest.TestCase):
             "pace_scale": 1.0,
         }
         strategy._thinking_budget_remaining = None
-        with patch.object(strategy, "_sample_base_move_delay", return_value=1.1):
+        with patch.object(strategy, "_sample_base_move_delay", return_value=0.7):
             with patch.object(strategy, "_clock_time_profile", return_value=profile):
-                with patch("chesskida_strategy.random.uniform", return_value=0.18):
+                with patch("chesskida_strategy.random.uniform", return_value=0.25):
                     delay = strategy.natural_bot_move_delay(
                         board,
                         move,
@@ -384,7 +415,7 @@ class OpeningFastPathTests(unittest.TestCase):
                         remaining_time_seconds=55.0,
                         opponent_time_seconds=55.0,
                     )
-        self.assertAlmostEqual(delay, 0.18)
+        self.assertAlmostEqual(delay, 0.25)
         strategy._thinking_budget_remaining = None
 
     def test_opening_capture_uses_forced_fast_path_not_quiet_cap(self):
@@ -423,20 +454,20 @@ class MoveDelayBandTests(unittest.TestCase):
         with patch.object(strategy, "_timing_position_complexity", return_value=0.10):
             with patch("chesskida_strategy.random.choices", side_effect=lambda population, weights, k: [population[0]]):
                 quick = strategy._sample_base_move_delay(board, move)
-        self.assertGreaterEqual(quick, 0.18)
-        self.assertLess(quick, 0.51)
+        self.assertGreaterEqual(quick, 0.20)
+        self.assertLessEqual(quick, 0.45)
 
         with patch.object(strategy, "_timing_position_complexity", return_value=0.45):
             with patch("chesskida_strategy.random.choices", side_effect=lambda population, weights, k: [population[1]]):
                 medium = strategy._sample_base_move_delay(board, move)
-        self.assertGreaterEqual(medium, 0.55)
-        self.assertLess(medium, 1.44)
+        self.assertGreaterEqual(medium, 0.35)
+        self.assertLessEqual(medium, 0.60)
 
         with patch.object(strategy, "_timing_position_complexity", return_value=0.90):
             with patch("chesskida_strategy.random.choices", side_effect=lambda population, weights, k: [population[2]]):
                 long = strategy._sample_base_move_delay(board, move)
-        self.assertGreaterEqual(long, 1.15)
-        self.assertLessEqual(long, strategy.BOT_EVERY_MOVE_DELAY_MAX)
+        self.assertGreaterEqual(long, 0.52)
+        self.assertLessEqual(long, 0.70)
 
 
 class RandomizedTimingTests(unittest.TestCase):
@@ -456,7 +487,7 @@ class RandomizedTimingTests(unittest.TestCase):
             for _ in range(50)
         ]
         self.assertGreater(len(set(samples)), 35)
-        self.assertTrue(all(0.0 <= x <= 2.5 for x in samples))
+        self.assertTrue(all(1.0 <= x <= 2.5 for x in samples))
 
 
 class BotSideGuardTests(unittest.TestCase):
