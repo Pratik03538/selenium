@@ -2221,72 +2221,98 @@ def find_safe_free_capture(
     choices.sort(reverse=True, key=lambda item: item[:3])
     return choices[0][3]
 
-def candidate_hangs_own_piece(
-    board,
-    move
-):
-    """Reject obvious one-move giveaways.
+def candidate_hangs_own_piece(board, move):
+    """Reject moves that leave an important own piece freely capturable.
 
-    This is intentionally conservative: a check/mate or a materially winning
-    capture can still be a deliberate sacrifice. Otherwise a moved piece that
-    can be taken next move without a recapture is rejected when that sequence
-    loses material.
+    Inspect every legal opponent capture after the move, not only captures
+    landing on the moved piece. This catches discovered attacks on rooks,
+    bishops, knights and queens. A capture of the moved piece is tolerated
+    only when the move itself wins at least equivalent material. Immediate
+    checkmate is never rejected by this guard.
     """
     try:
-        if board.gives_check(move):
-            return False
-
-        before_victim = board.piece_at(move.to_square)
-        victim_value = (
-            material_value(before_victim.piece_type)
-            if before_victim is not None
-            and before_victim.color != board.turn
-            else 0
-        )
-
-        moved_piece = board.piece_at(move.from_square)
-        if moved_piece is None:
+        if move not in board.legal_moves:
             return True
 
-        moved_value = material_value(moved_piece.piece_type)
+        mover_color = board.turn
+        moved_piece = board.piece_at(move.from_square)
+        if moved_piece is None or moved_piece.color != mover_color:
+            return True
+
+        captured_value = 0
+        captured_piece = board.piece_at(move.to_square)
+        if captured_piece is not None and captured_piece.color != mover_color:
+            captured_value = material_value(captured_piece.piece_type)
+        elif board.is_en_passant(move):
+            captured_square = (
+                move.to_square - 8 if mover_color == chess.WHITE
+                else move.to_square + 8
+            )
+            captured_piece = board.piece_at(captured_square)
+            if captured_piece is not None and captured_piece.color != mover_color:
+                captured_value = material_value(captured_piece.piece_type)
+
+        promotion_gain = 0
+        if move.promotion is not None:
+            promotion_gain = max(
+                0, material_value(move.promotion) - material_value(chess.PAWN)
+            )
+        immediate_gain = captured_value + promotion_gain
 
         after = board.copy(stack=False)
         after.push(move)
-
         if after.is_checkmate():
             return False
 
         for reply in after.legal_moves:
-            if reply.to_square != move.to_square:
+            if not after.is_capture(reply):
                 continue
 
-            reply_piece = after.piece_at(reply.from_square)
-            if reply_piece is None:
+            if after.is_en_passant(reply):
+                victim_square = (
+                    reply.to_square - 8 if after.turn == chess.WHITE
+                    else reply.to_square + 8
+                )
+            else:
+                victim_square = reply.to_square
+            victim = after.piece_at(victim_square)
+            if victim is None or victim.color != mover_color:
+                continue
+            if victim.piece_type == chess.KING:
                 continue
 
+            victim_value = material_value(victim.piece_type)
             after_reply = after.copy(stack=False)
             after_reply.push(reply)
 
+            # Legal recapture on the capture square means it is not a free loss.
             recaptured = any(
                 response.to_square == reply.to_square
+                and (
+                    (attacker := after_reply.piece_at(response.from_square))
+                    is not None
+                    and attacker.color == mover_color
+                )
                 for response in after_reply.legal_moves
             )
-
             if recaptured:
                 continue
 
-            # Net material swing after the opponent takes our moved piece.
-            # Negative means the move simply gave material away.
-            net = victim_value - moved_value
+            # A direct recapture of the moved piece may be a sound exchange.
+            if victim_square == move.to_square:
+                if immediate_gain >= victim_value:
+                    continue
+                return True
 
-            if net < 0 and moved_value >= 100:
+            # An unrelated own piece becoming freely capturable is not excused
+            # by a capture elsewhere: avoid leaving a second piece en prise.
+            if victim_value >= material_value(chess.KNIGHT):
                 return True
 
         return False
-
     except Exception:
-        # Safety-first fallback: unknown candidates are not rejected here;
-        # the existing engine score and physical verification remain in force.
+        # Keep the selector operational if an unusual board adapter fails;
+        # move legality and Stockfish scoring remain additional constraints.
         return False
 def _movable_piece_count_for_color(board, color) -> int:
     """Count the side's pieces with at least one legal move in a position copy."""
@@ -3119,13 +3145,9 @@ def choose_stockfish_move(
                 c["cp"] >= selection_floor_cp
                 and c["cp"] > 0
                 and c["rank"] <= effective_rank_cap
-                and (
-                    not winning_guard
-                    or not candidate_hangs_own_piece(
-                        board,
-                        c["move"]
-                    )
-                )
+                # Never select an avoidable free-piece giveaway just to
+                # vary rank, even before a large winning advantage is established.
+                and not candidate_hangs_own_piece(board, c["move"])
             )
         ]
 
