@@ -2973,6 +2973,7 @@ def choose_stockfish_move(
 
             selected = best
 
+            _record_rank_selection(selected["rank"])
             return (
                 selected["move"],
                 selected["info"],
@@ -3026,6 +3027,7 @@ def choose_stockfish_move(
                 key=lambda c: c["rank"]
             )
 
+        _record_rank_selection(selected["rank"])
         return (
             selected["move"],
             selected["info"],
