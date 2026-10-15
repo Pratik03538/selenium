@@ -2336,6 +2336,23 @@ def calculate_engine_search_limit(
     else:
         search_fraction = normal_search_fraction
     clock_cap = max(0.005, per_move_clock * search_fraction * factor)
+
+    # Opening-book lines usually need very little engine time. When the book
+    # has no answer, keep the fallback search bounded in bullet/blitz while
+    # retaining a larger cap for three-minute controls.
+    try:
+        opening_fast_path = (
+            int(board.fullmove_number) <= 10
+            and len(board.piece_map()) >= 26
+            and not board.is_check()
+        )
+    except Exception:
+        opening_fast_path = False
+    if opening_fast_path and initial <= 60.0:
+        clock_cap = min(clock_cap, 0.18)
+    elif opening_fast_path and initial <= 180.0:
+        clock_cap = min(clock_cap, 0.30)
+
     return max(0.005, min(base, clock_cap))
 
 
@@ -2346,8 +2363,9 @@ def _perform_cursor_drag_once(
     """Drag a legal move on the configured local/test board.
 
     Each move chooses new points inside the source and destination squares.
-    Normal mode uses varied pointer travel and pre-delay; low-clock mode collapses
-    the gesture to a single 5-12 ms segment with no intentional pre-delay.
+    Normal and premove gestures share the same randomized points, curved path, and
+    2-4 waypoint range. Low-clock mode keeps the total drag short and skips optional
+    pre/hover waits so time control remains the priority.
     Premove gestures are best-effort and use explicit queue signals when exposed.
     """
     try:
@@ -2418,7 +2436,7 @@ def _perform_cursor_drag_once(
     control_x = min(max(2.0, control_x), width - 2.0)
     control_y = min(max(2.0, control_y), height - 2.0)
 
-    waypoint_count = rng.randint(2, 3) if low_clock_mode else rng.randint(2, 4)
+    waypoint_count = rng.randint(2, 4)
     total_drag_ms = rng.randint(8, 18) if low_clock_mode else rng.randint(8, 95)
     pre_delay_ms = 0 if low_clock_mode else rng.randint(0, 25)
     base_duration, extra_ms = divmod(total_drag_ms, waypoint_count)
@@ -2663,7 +2681,7 @@ def perform_api_premove(
 
 
 PREMOVE_OPENING_FULLMOVE_MIN = 5
-PREMOVE_OPENING_FULLMOVE_MAX = 8
+PREMOVE_OPENING_FULLMOVE_MAX = 10
 PREMOVE_ENDGAME_MAX_PIECES = 10
 PREMOVE_MIN_BOT_EVAL_CP = -25
 PREMOVE_MAX_EVAL_DROP_CP = 40
