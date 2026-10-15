@@ -7,6 +7,7 @@ import chess
 from seleniumbase_live_game_tracker import (
     PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP,
     PREMOVE_OPENING_MAX_EVAL_DROP_CP,
+    PREMOVE_MAX_EVAL_DROP_CP,
     PREMOVE_OPENING_MIN_BOT_EVAL_CP,
     PREMOVE_OPENING_FULLMOVE_MIN,
     PREMOVE_OPENING_FULLMOVE_MAX,
@@ -223,6 +224,7 @@ class LateClockAndPremoveSafetyTests(unittest.TestCase):
 
     def test_premove_evaluation_guards_reject_large_drops(self):
         self.assertEqual(PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP, 50)
+        self.assertEqual(PREMOVE_MAX_EVAL_DROP_CP, 50)
         self.assertEqual(PREMOVE_OPENING_MAX_EVAL_DROP_CP, 60)
         self.assertEqual(PREMOVE_OPENING_MIN_BOT_EVAL_CP, -50)
 
