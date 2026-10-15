@@ -2,7 +2,7 @@
 import unittest
 
 import chess
-from chesskida_strategy import _clock_time_profile
+from chesskida_strategy import _clock_deficit_forces_fast_pacing, _clock_time_profile
 
 
 class ClockTimingProfileTests(unittest.TestCase):
@@ -48,6 +48,18 @@ class ClockTimingProfileTests(unittest.TestCase):
         self.assertLess(behind["pace_scale"], level["pace_scale"])
         self.assertGreater(ahead["pace_scale"], level["pace_scale"])
         self.assertGreater(ahead["spendable_lead"], 0)
+
+    def test_small_clock_deficit_keeps_midgame_timing_but_large_deficit_speeds_up(self):
+        self.assertFalse(
+            _clock_deficit_forces_fast_pacing(
+                own_seconds=50, opponent_seconds=53, initial_seconds=60
+            )
+        )
+        self.assertTrue(
+            _clock_deficit_forces_fast_pacing(
+                own_seconds=45, opponent_seconds=52, initial_seconds=60
+            )
+        )
 
     def test_missing_clock_uses_safe_neutral_profile(self):
         profile = _clock_time_profile(self.board)
