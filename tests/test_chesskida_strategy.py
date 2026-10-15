@@ -208,7 +208,7 @@ class MaterialSafetyAndPriorityTests(unittest.TestCase):
 
 
 class ClockParityProtectionTests(unittest.TestCase):
-    def test_close_clocks_suppress_discretionary_delays(self):
+    def test_close_healthy_clocks_keep_varied_midgame_base_delay(self):
         board = chess.Board("4k3/8/8/8/8/8/R7/4K3 w - - 0 30")
         move = chess.Move.from_uci("a2a3")
         profile = {
@@ -226,13 +226,15 @@ class ClockParityProtectionTests(unittest.TestCase):
                     move,
                     thinking_enabled=True,
                     initial_time_seconds=60.0,
-                    remaining_time_seconds=20.0,
-                    opponent_time_seconds=20.0,
+                    remaining_time_seconds=50.0,
+                    opponent_time_seconds=50.0,
                     low_clock_trigger_seconds=7.3,
                     low_clock_mode=False,
                 )
-        self.assertGreaterEqual(delay, 0.0)
-        self.assertLessEqual(delay, 0.22)
+        # Near-equal healthy clocks must not force every move into the old
+        # 35-220ms base-delay cap; long pauses remain governed by position gates.
+        self.assertGreater(delay, 0.22)
+        self.assertLessEqual(delay, 2.1)
         strategy._thinking_budget_remaining = None
 
 
