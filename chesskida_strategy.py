@@ -697,6 +697,28 @@ def natural_bot_move_delay(
             delay = min(delay, random.uniform(0.060, 0.400))
         elif own_clock <= 45.0:
             delay = min(delay, random.uniform(0.120, 0.720))
+    # Forced/tactical replies should not consume an artificial pause budget.
+    try:
+        if (
+            board.is_check()
+            or board.is_capture(move)
+            or board.is_castling(move)
+            or move.promotion is not None
+            or board.gives_check(move)
+        ):
+            quick_delay = _sample_base_move_delay(
+                board,
+                move,
+                engine_result=engine_result,
+                selection_meta=selection_meta,
+                forced=True,
+            )
+            quick_delay = min(quick_delay, delay)
+            _last_bot_natural_delay = quick_delay
+            return quick_delay
+    except Exception:
+        pass
+
     # Keep ordinary opening moves brisk even when the opening book has no
     # matching line. This avoids adding discretionary thinking pauses during
     # the first ten full moves; forced replies still use the same safe path.
@@ -705,11 +727,16 @@ def natural_bot_move_delay(
             int(board.fullmove_number) <= 10
             and len(board.piece_map()) >= 26
             and not board.is_check()
+            and not is_opening_book_move
         )
     except Exception:
         opening_fast_path = False
     if opening_fast_path:
-        delay = min(float(delay), 0.12)
+        # Keep the opening brisk without flattening every move to the same
+        # 120ms cap. Quiet developing moves receive a fresh, small cap;
+        # captures/checks/promotions and prepared book moves have separate paths.
+        opening_cap = random.uniform(0.055, 0.240)
+        delay = min(float(delay), opening_cap)
         _last_bot_natural_delay = delay
         return max(0.0, float(delay))
 
@@ -750,28 +777,6 @@ def natural_bot_move_delay(
         delay = min(base_delay, delay, 0.185)
         _last_bot_natural_delay = delay
         return max(0.010, float(delay))
-
-    # Forced/tactical replies should not consume an artificial pause budget.
-    try:
-        if (
-            board.is_check()
-            or board.is_capture(move)
-            or board.is_castling(move)
-            or move.promotion is not None
-            or board.gives_check(move)
-        ):
-            quick_delay = _sample_base_move_delay(
-                board,
-                move,
-                engine_result=engine_result,
-                selection_meta=selection_meta,
-                forced=True,
-            )
-            quick_delay = min(quick_delay, delay)
-            _last_bot_natural_delay = quick_delay
-            return quick_delay
-    except Exception:
-        pass
 
     # Protect clock parity: Selenium submission already has real overhead, so
     # only spend discretionary thinking time when we have a meaningful safe lead.
