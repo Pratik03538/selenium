@@ -1063,7 +1063,14 @@ def _download_matching_chromedriver(browser_version: str) -> tuple[Path | None, 
             metadata = json.loads(response.read().decode("utf-8", errors="replace"))
         driver_version = str(metadata.get("builds", {}).get(build_key, {}).get("version") or "")
         if not driver_version:
-            return None, "matching_build_not_published"
+            milestone_url = "https://googlechromelabs.github.io/chrome-for-testing/latest-versions-per-milestone.json"
+            with urlopen(milestone_url, timeout=5.0) as response:
+                milestone_data = json.loads(response.read().decode("utf-8", errors="replace"))
+            driver_version = str(
+                milestone_data.get("milestones", {}).get(parts[0], {}).get("version") or ""
+            )
+        if not driver_version:
+            return None, "matching_build_and_milestone_not_published"
         platform_name = "win64" if sys.maxsize > 2**32 else "win32"
         archive_url = (
             f"https://storage.googleapis.com/chrome-for-testing-public/"
