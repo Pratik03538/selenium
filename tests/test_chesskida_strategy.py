@@ -129,12 +129,48 @@ class LosingPositionIntegrationTests(unittest.TestCase):
 
 class MaterialSafetyAndPriorityTests(unittest.TestCase):
     def test_detects_a_move_that_uncovers_a_free_rook(self):
-        board = chess.Board("4k3/8/8/8/8/5q2/4P3/K2R4 w - - 0 1")
+        # The knight is not itself hanging after e2-c1, but vacating e2 opens
+        # the queen's diagonal to the rook on d1.
+        board = chess.Board("4k3/8/8/8/8/5q2/4N3/K2R4 w - - 0 1")
         self.assertTrue(
             strategy.candidate_hangs_own_piece(
-                board, chess.Move.from_uci("e2e3")
+                board, chess.Move.from_uci("e2c1")
             )
         )
+
+    def test_selector_avoids_the_hanging_piece_move_when_a_safe_line_exists(self):
+        board = chess.Board("4k3/8/8/8/8/5q2/4N3/K2R4 w - - 0 1")
+        hanging = chess.Move.from_uci("e2c1")
+        safe_rook_move = chess.Move.from_uci("d1d2")
+        safe_king_move = chess.Move.from_uci("a1a2")
+        moves = [hanging, safe_rook_move, safe_king_move]
+        scores = [100, 95, 90]
+        infos = [
+            {
+                "pv": [move],
+                "score": chess.engine.PovScore(
+                    chess.engine.Cp(score), board.turn
+                ),
+            }
+            for move, score in zip(moves, scores)
+        ]
+        selected, _info, _meta = strategy.choose_stockfish_move(
+            board, infos, bot_color=board.turn
+        )
+        self.assertNotEqual(selected, hanging)
+
+    def test_low_clock_promotes_a_safe_queen_even_outside_single_pv(self):
+        board = chess.Board("4k3/P7/8/8/8/8/8/4K3 w - - 0 1")
+        ordinary_move = chess.Move.from_uci("e1d1")
+        info = {
+            "pv": [ordinary_move],
+            "score": chess.engine.PovScore(chess.engine.Cp(250), board.turn),
+        }
+        selected, _selected_info, meta = strategy.choose_stockfish_move(
+            board, [info], bot_color=board.turn, low_clock_mode=True
+        )
+        self.assertEqual(selected, chess.Move.from_uci("a7a8q"))
+        self.assertEqual(meta.get("source"), "LOW_CLOCK_TACTIC")
 
     def test_negative_position_respects_baseline_near_equal_eval_band(self):
         board = chess.Board("4k3/8/8/8/1p6/8/8/1N2K3 w - - 0 1")
