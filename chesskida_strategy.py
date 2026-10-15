@@ -79,6 +79,8 @@ HUMAN_SELECTION_EXTRA_DROP_CP = 70
 HUMAN_SELECTION_DISTANCE_CP = 80.0
 HUMAN_SELECTION_NON_BEST_CHANCE = 0.88
 HUMAN_SELECTION_TOP12_MAX_CHANCE = 0.10
+# Normal/equal positions should prefer ranks #3+ when safe alternatives exist.
+NON_ADVANTAGE_TOP12_MAX_CHANCE = 0.05
 MATE_CLEANUP_MAX_REMAINING_PIECES = 1
 MATE_CLEANUP_MIN_VALUE = 1
 MIN_POSITIVE_CP = 5
@@ -3568,18 +3570,12 @@ def choose_stockfish_move(
             }
         )
 
-    near_equal_floor = (
-        best_cp - 20
+    # The old fixed 20cp floor routinely excluded every line below #2.
+    # Reuse the existing bounded recovery pool so normal/equal positions may
+    # consider up to 70cp lower lines, while still respecting the adaptive rank cap.
+    safe, near_equal_floor, near_equal_drop_cap = _near_equal_selection_pool(
+        candidates, best_cp, adaptive_max_rank
     )
-
-    safe = [
-        c
-        for c in candidates
-        if (
-            c["cp"] >= near_equal_floor
-            and c["rank"] <= adaptive_max_rank
-        )
-    ]
 
     if not safe:
         safe = [best]
@@ -3608,11 +3604,13 @@ def choose_stockfish_move(
         if candidate["rank"] >= 2
     ]
 
+    # Prefer rank #3 and below almost every time when the bounded safe pool
+    # contains such alternatives. Keep a small fallback chance for the top two.
     selection_safe = (
         lower_rank_safe
         if (
             lower_rank_safe
-            and random.random() > HUMAN_SELECTION_TOP12_MAX_CHANCE
+            and random.random() > NON_ADVANTAGE_TOP12_MAX_CHANCE
         )
         else safe
     )
