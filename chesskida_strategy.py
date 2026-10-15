@@ -3465,6 +3465,9 @@ def choose_stockfish_move(
                 14: 0.94,
             }
 
+        pool, _avoided_ranks = _diversify_rank_pool(
+            pool, _recent_selected_ranks
+        )
         lower_rank_pool = [
             candidate
             for candidate in pool
@@ -3662,6 +3665,9 @@ def choose_stockfish_move(
         14: 0.92,
     }
 
+    safe, _avoided_ranks = _diversify_rank_pool(
+        safe, _recent_selected_ranks
+    )
     lower_rank_safe = [
         candidate
         for candidate in safe
