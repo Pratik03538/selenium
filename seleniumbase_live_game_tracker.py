@@ -3225,23 +3225,27 @@ def choose_low_clock_conversion_premove(
 
     try:
         opponent_movable_pieces = len({move.from_square for move in board.legal_moves})
-        bot_non_king_count = sum(
-            1 for piece in board.piece_map().values()
-            if piece.color == bot_turn and piece.piece_type != chess.KING
-        )
-        opponent_non_king_count = sum(
-            1 for piece in board.piece_map().values()
-            if piece.color != bot_turn and piece.piece_type != chess.KING
-        )
-        bot_material = strategy_module.side_material(board, bot_turn)
-        opponent_material = strategy_module.side_material(board, not bot_turn)
+        # A pawn one step from promotion deserves a fast conversion check even
+        # when the opponent king has many legal replies or material is equal.
+        pawn_near_promotion = False
+        for square, piece in board.piece_map().items():
+            if piece.color != bot_turn or piece.piece_type != chess.PAWN:
+                continue
+            target_rank = 6 if bot_turn == chess.WHITE else 1
+            if chess.square_rank(square) != target_rank:
+                continue
+            step = 8 if bot_turn == chess.WHITE else -8
+            forward = square + step
+            if 0 <= forward < 64 and board.piece_at(forward) is None:
+                pawn_near_promotion = True
+                break
     except Exception:
         return None, None, "low-clock-position-metrics-unavailable"
 
-    if not (1 <= opponent_movable_pieces <= 3):
-        return None, None, f"opponent-has-{opponent_movable_pieces}-movable-pieces"
-    if bot_non_king_count <= opponent_non_king_count or bot_material <= opponent_material:
-        return None, None, "material-advantage-not-confirmed"
+    if not (1 <= opponent_movable_pieces <= 3) and not pawn_near_promotion:
+        return None, None, (
+            f"opponent-has-{opponent_movable_pieces}-movable-pieces-and-no-urgent-promotion"
+        )
 
     search_time = max(0.003, min(float(args.engine_time), 0.006))
     try:
