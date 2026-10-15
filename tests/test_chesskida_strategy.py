@@ -98,6 +98,39 @@ class RankOneStreakTests(unittest.TestCase):
         self.assertEqual(strategy._rank1_selection_streak, 0)
 
 
+class RankDiversityTests(unittest.TestCase):
+    def setUp(self):
+        strategy._recent_selected_ranks = []
+        strategy._rank1_selection_streak = 0
+
+    def tearDown(self):
+        strategy._recent_selected_ranks = []
+        strategy._rank1_selection_streak = 0
+
+    def test_recent_ranks_are_excluded_when_other_safe_ranks_exist(self):
+        candidates = [{"rank": rank, "cp": 100 - rank} for rank in range(6)]
+        pool, avoided = strategy._diversify_rank_pool(candidates, [0, 2, 4])
+
+        self.assertEqual([c["rank"] for c in pool], [1, 3, 5])
+        self.assertEqual(avoided, [0, 2, 4])
+
+    def test_small_pool_relaxes_old_history_but_avoids_immediate_repeat(self):
+        candidates = [{"rank": rank, "cp": 100 - rank} for rank in (2, 4, 5)]
+        pool, avoided = strategy._diversify_rank_pool(candidates, [2, 3, 4, 5])
+
+        self.assertEqual([c["rank"] for c in pool], [2, 4])
+        self.assertEqual(avoided, [5])
+
+    def test_rank_history_is_bounded_and_updates_rank_one_streak(self):
+        for rank in (0, 2, 3, 0, 4, 5):
+            strategy._record_rank_selection(rank)
+
+        self.assertEqual(strategy._recent_selected_ranks, [3, 0, 4, 5])
+        self.assertEqual(strategy._rank1_selection_streak, 0)
+        strategy._record_rank_selection(0)
+        self.assertEqual(strategy._rank1_selection_streak, 1)
+
+
 class LosingPositionIntegrationTests(unittest.TestCase):
     def test_selector_uses_baseline_near_equal_shuffle_within_eval_band(self):
         board = chess.Board()
