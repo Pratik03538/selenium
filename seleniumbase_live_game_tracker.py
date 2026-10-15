@@ -3217,7 +3217,7 @@ PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP = 50
 def choose_low_clock_conversion_premove(
     engine, board, strategy_module, bot_color: str, args,
 ) -> tuple[object | None, object | None, str]:
-    """Fast, safety-checked capture/promotion premove for a favorable low-clock endgame."""
+    """Fast, safety-checked mate/capture/promotion premove under clock pressure."""
     if chess is None or engine is None or strategy_module is None or board is None:
         return None, None, "low-clock-prerequisites-unavailable"
 
@@ -3227,8 +3227,10 @@ def choose_low_clock_conversion_premove(
 
     try:
         opponent_movable_pieces = len({move.from_square for move in board.legal_moves})
-        # A pawn one step from promotion deserves a fast conversion check even
-        # when the opponent king has many legal replies or material is equal.
+        # Record whether a promotion is near for diagnostics, but don't gate
+        # emergency conversion on opponent piece count or a material lead.
+        # A safe tactic may be available even when the opponent has many legal
+        # replies or the material count is currently equal/negative.
         pawn_near_promotion = False
         for square, piece in board.piece_map().items():
             if piece.color != bot_turn or piece.piece_type != chess.PAWN:
@@ -3236,18 +3238,10 @@ def choose_low_clock_conversion_premove(
             target_rank = 6 if bot_turn == chess.WHITE else 1
             if chess.square_rank(square) != target_rank:
                 continue
-            step = 8 if bot_turn == chess.WHITE else -8
-            forward = square + step
-            if 0 <= forward < 64 and board.piece_at(forward) is None:
-                pawn_near_promotion = True
-                break
+            pawn_near_promotion = True
+            break
     except Exception:
         return None, None, "low-clock-position-metrics-unavailable"
-
-    if not (1 <= opponent_movable_pieces <= 3) and not pawn_near_promotion:
-        return None, None, (
-            f"opponent-has-{opponent_movable_pieces}-movable-pieces-and-no-urgent-promotion"
-        )
 
     search_time = max(0.003, min(float(args.engine_time), 0.006))
     try:
