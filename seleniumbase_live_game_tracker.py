@@ -883,6 +883,48 @@ class RuntimeSettingsWindow:
             time.sleep(min(0.025, max(0.001, remaining)))
 
 
+def configure_optional_bot_elo(engine, setting_value=None):
+    """Apply an explicitly configured Stockfish Elo limit for a labeled AI difficulty.
+
+    No setting means no change: the default engine strength is preserved.
+    This is a game-product difficulty control, not a move-timing or identity
+    simulation feature.
+    """
+    raw = (
+        str(setting_value).strip()
+        if setting_value is not None
+        else load_optional_txt_setting("bot_elo")
+    )
+    if not raw:
+        return None
+
+    try:
+        elo = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("bot_elo must be a whole-number Stockfish Elo value.") from exc
+
+    options = getattr(engine, "options", {})
+    elo_option = options.get("UCI_Elo") if hasattr(options, "get") else None
+    strength_option = options.get("UCI_LimitStrength") if hasattr(options, "get") else None
+    if elo_option is None or strength_option is None:
+        raise RuntimeError(
+            "The configured Stockfish build does not support UCI_Elo difficulty limits."
+        )
+
+    try:
+        min_elo = int(elo_option.min)
+        max_elo = int(elo_option.max)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("Stockfish did not expose a valid UCI_Elo range.") from exc
+    if not min_elo <= elo <= max_elo:
+        raise RuntimeError(
+            f"bot_elo must be between {min_elo} and {max_elo} for this Stockfish build."
+        )
+
+    engine.configure({"UCI_LimitStrength": True, "UCI_Elo": elo})
+    return elo
+
+
 def prepare_bot_components(args, allowed_host, installed):
     """Initialize the optional bot only for the configured, non-blocked site."""
     if chess is None:
@@ -916,6 +958,7 @@ def prepare_bot_components(args, allowed_host, installed):
     try:
         engine = chess.engine.SimpleEngine.popen_uci(str(engine_path))
         engine.configure({"Threads": 2, "Hash": 128})
+        configured_elo = configure_optional_bot_elo(engine)
     except Exception as exc:
         raise RuntimeError("Stockfish could not be started or configured. Check the configured executable.") from exc
 
@@ -931,7 +974,8 @@ def prepare_bot_components(args, allowed_host, installed):
         print("[INPUT] Direct game API mode enabled.", flush=True)
     print(
         f"[ENGINE] Threads=2 | Hash=128 MB | depth=12 | "
-        f"MultiPV={strategy_module.TRAINING_MULTI_PV} | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s.",
+        f"MultiPV={strategy_module.TRAINING_MULTI_PV} | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s."
+        f"{f\" | AI difficulty Elo={configured_elo}\" if configured_elo is not None else \"\"}.",
         flush=True,
     )
     return engine, book, strategy_module
