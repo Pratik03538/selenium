@@ -2221,8 +2221,76 @@ def find_safe_free_capture(
     choices.sort(reverse=True, key=lambda item: item[:3])
     return choices[0][3]
 
-def candidate_hangs_own_piece(board, move):
-    """Reject moves that leave an important own piece freely capturable.
+def candidate_hangs_own_piece(
+    board,
+    move
+):
+    """Reject obvious one-move giveaways.
+
+    This is intentionally conservative: a check/mate or a materially winning
+    capture can still be a deliberate sacrifice. Otherwise a moved piece that
+    can be taken next move without a recapture is rejected when that sequence
+    loses material.
+    """
+    try:
+        if board.gives_check(move):
+            return False
+
+        before_victim = board.piece_at(move.to_square)
+        victim_value = (
+            material_value(before_victim.piece_type)
+            if before_victim is not None
+            and before_victim.color != board.turn
+            else 0
+        )
+
+        moved_piece = board.piece_at(move.from_square)
+        if moved_piece is None:
+            return True
+
+        moved_value = material_value(moved_piece.piece_type)
+
+        after = board.copy(stack=False)
+        after.push(move)
+
+        if after.is_checkmate():
+            return False
+
+        for reply in after.legal_moves:
+            if reply.to_square != move.to_square:
+                continue
+
+            reply_piece = after.piece_at(reply.from_square)
+            if reply_piece is None:
+                continue
+
+            after_reply = after.copy(stack=False)
+            after_reply.push(reply)
+
+            recaptured = any(
+                response.to_square == reply.to_square
+                for response in after_reply.legal_moves
+            )
+
+            if recaptured:
+                continue
+
+            # Net material swing after the opponent takes our moved piece.
+            # Negative means the move simply gave material away.
+            net = victim_value - moved_value
+
+            if net < 0 and moved_value >= 100:
+                return True
+
+        return False
+
+    except Exception:
+        # Safety-first fallback: unknown candidates are not rejected here;
+        # the existing engine score and physical verification remain in force.
+        return False
+
+def candidate_exposes_free_major_piece(board, move):
+    """Detect a move that leaves an unrelated important own piece freely capturable.
 
     Inspect every legal opponent capture after the move, not only captures
     landing on the moved piece. This catches discovered attacks on rooks,
@@ -2362,7 +2430,7 @@ def find_fast_low_clock_capture(board, candidates=None):
                     "victim_value": victim_value / 100.0,
                     "free": True, "reason_tag": "CHECKMATE CAPTURE",
                 }
-            if candidate_hangs_own_piece(board, move):
+            if candidate_exposes_free_major_piece(board, move):
                 continue
 
             immediate_replies = [
@@ -2532,54 +2600,41 @@ def choose_stockfish_move(
             }
         )
 
-    # Retain the tracker-side safety check: select only for the verified bot side.
+    # Keep the baseline selector's move distribution, but never choose for an
+    # unverified side or when it is not that side's turn.
     if bot_color not in (chess.WHITE, chess.BLACK):
         return (
-            None,
-            None,
+            None, None,
             {
-                "rank": 0,
-                "current_cp": 0,
-                "selected_cp": 0,
-                "reason": "BOT COLOR GUARD | verified bot side is unknown"
-            }
+                "rank": 0, "current_cp": 0, "selected_cp": 0,
+                "reason": "BOT COLOR GUARD | verified bot side is unknown",
+            },
         )
     if board.turn != bot_color:
         return (
-            None,
-            None,
+            None, None,
             {
-                "rank": 0,
-                "current_cp": 0,
-                "selected_cp": 0,
-                "reason": "BOT COLOR GUARD | position is not the verified bot's turn"
-            }
+                "rank": 0, "current_cp": 0, "selected_cp": 0,
+                "reason": "BOT COLOR GUARD | position is not the verified bot's turn",
+            },
         )
 
     best = candidates[0]
     best_cp = best["cp"]
-
-    # Emergency clock path: do not spend the last seconds on human-like
-    # rank shuffling or multi-stage advantage shaping. First check exact mate,
-    # then safe queen promotion / safe captures, and otherwise play Stockfish's
-    # top legal line. The tracker uses a single-PV search for this path.
+    # Emergency clock mode is the only intentional selection exception to the
+    # restored fast-main-baseline policy: mate, safe promotion, safe capture,
+    # then the top scored legal move, with no human-like rank shuffle.
     if low_clock_mode:
         candidate_by_move = {candidate["move"]: candidate for candidate in candidates}
-
-        # Keep a short forced mate ahead of conversion tricks when the clock is low.
         if best["mate"] is not None and 0 < best["mate"] <= MATE_FORCE_FAST_MAX:
             return (
-                best["move"],
-                best["info"],
+                best["move"], best["info"],
                 {
-                    "rank": best["rank"],
-                    "current_cp": best_cp,
-                    "selected_cp": best_cp,
-                    "source": "LOW_CLOCK_TACTIC",
+                    "rank": best["rank"], "current_cp": best_cp,
+                    "selected_cp": best_cp, "source": "LOW_CLOCK_TACTIC",
                     "reason": f"LOW CLOCK FORCED MATE M{best['mate']}",
                 },
             )
-
         for legal_move in board.legal_moves:
             try:
                 after_mate = board.copy(stack=False)
@@ -2587,67 +2642,50 @@ def choose_stockfish_move(
             except Exception:
                 continue
             if after_mate.is_checkmate():
-                mate_candidate = candidate_by_move.get(legal_move)
+                item = candidate_by_move.get(legal_move, {})
                 return (
-                    legal_move,
-                    mate_candidate["info"] if mate_candidate else None,
+                    legal_move, item.get("info"),
                     {
-                        "rank": mate_candidate["rank"] if mate_candidate else 0,
-                        "current_cp": best_cp,
-                        "selected_cp": mate_candidate["cp"] if mate_candidate else best_cp,
+                        "rank": item.get("rank", 0), "current_cp": best_cp,
+                        "selected_cp": item.get("cp", best_cp),
                         "source": "LOW_CLOCK_TACTIC",
                         "reason": "LOW CLOCK IMMEDIATE CHECKMATE",
                     },
                 )
-
         promotion = find_priority_queen_promotion(board, candidates, best_cp)
         if (
             promotion is not None
-            and not candidate_hangs_own_piece(board, promotion["move"])
+            and not candidate_exposes_free_major_piece(board, promotion["move"])
         ):
             return (
-                promotion["move"],
-                promotion["info"],
+                promotion["move"], promotion["info"],
                 {
-                    "rank": promotion["rank"],
-                    "current_cp": best_cp,
-                    "selected_cp": promotion["cp"],
-                    "source": "LOW_CLOCK_TACTIC",
+                    "rank": promotion["rank"], "current_cp": best_cp,
+                    "selected_cp": promotion["cp"], "source": "LOW_CLOCK_TACTIC",
                     "reason": f"LOW CLOCK SAFE QUEEN PROMOTION | {promotion['reason_tag']}",
                 },
             )
-
         safe_capture = find_fast_low_clock_capture(board, candidates)
-        if (
-            safe_capture is not None
-            and not candidate_hangs_own_piece(board, safe_capture["move"])
-        ):
+        if safe_capture is not None:
             return (
-                safe_capture["move"],
-                safe_capture["info"],
+                safe_capture["move"], safe_capture["info"],
                 {
-                    "rank": safe_capture["rank"],
-                    "current_cp": best_cp,
-                    "selected_cp": safe_capture["cp"],
-                    "source": "LOW_CLOCK_TACTIC",
+                    "rank": safe_capture["rank"], "current_cp": best_cp,
+                    "selected_cp": safe_capture["cp"], "source": "LOW_CLOCK_TACTIC",
                     "reason": (
                         f"LOW CLOCK {safe_capture['reason_tag']} | "
                         f"VICTIM={safe_capture['victim_value']:.1f}"
                     ),
                 },
             )
-
         return (
-            best["move"],
-            best["info"],
+            best["move"], best["info"],
             {
-                "rank": best["rank"],
-                "current_cp": best_cp,
-                "selected_cp": best_cp,
-                "source": "LOW_CLOCK_BEST",
-                "reason": "LOW CLOCK FAST BEST LEGAL MOVE",
+                "rank": best["rank"], "current_cp": best_cp, "selected_cp": best_cp,
+                "source": "LOW_CLOCK_BEST", "reason": "LOW CLOCK FAST BEST LEGAL MOVE",
             },
         )
+
 
     profile = adaptive_accuracy_profile(
         opponent_accuracy,
@@ -2694,7 +2732,6 @@ def choose_stockfish_move(
         if (
             improvement_fraction
             >= FORCE_BEST_IMPROVEMENT_FRACTION
-            and not candidate_hangs_own_piece(board, best["move"])
         ):
             selected = best
 
@@ -3015,10 +3052,7 @@ def choose_stockfish_move(
             best_cp
         )
 
-        if (
-            priority_promotion is not None
-            and not candidate_hangs_own_piece(board, priority_promotion["move"])
-        ):
+        if priority_promotion is not None:
             return (
                 priority_promotion["move"],
                 priority_promotion["info"],
@@ -3043,10 +3077,7 @@ def choose_stockfish_move(
             engine=engine
         )
 
-        if (
-            priority_capture is not None
-            and not candidate_hangs_own_piece(board, priority_capture["move"])
-        ):
+        if priority_capture is not None:
             return (
                 priority_capture["move"],
                 priority_capture["info"],
@@ -3242,41 +3273,20 @@ def choose_stockfish_move(
                 c["cp"] >= selection_floor_cp
                 and c["cp"] > 0
                 and c["rank"] <= effective_rank_cap
-                # Never select an avoidable free-piece giveaway just to
-                # vary rank, even before a large winning advantage is established.
-                and not candidate_hangs_own_piece(board, c["move"])
+                and (
+                    not winning_guard
+                    or not candidate_hangs_own_piece(
+                        board,
+                        c["move"]
+                    )
+                )
             )
         ]
 
         if not safe:
-            # If the evaluation/rank band contains only hanging-piece moves,
-            # search the already-scored alternatives for the best non-hanging
-            # line before falling back to Stockfish's top move.
-            safe_alternatives = [
-                candidate for candidate in candidates
-                if candidate["rank"] <= effective_rank_cap
-                and not candidate_hangs_own_piece(board, candidate["move"])
-            ]
-            if safe_alternatives:
-                selected = max(
-                    safe_alternatives,
-                    key=lambda candidate: (candidate["cp"], -candidate["rank"]),
-                )
-                return (
-                    selected["move"],
-                    selected["info"],
-                    {
-                        "rank": selected["rank"],
-                        "current_cp": best_cp,
-                        "selected_cp": selected["cp"],
-                        "source": "PIECE_SAFETY_FALLBACK",
-                        "reason": (
-                            f"PIECE SAFETY FALLBACK | BEST={best_cp / 100:+.2f} "
-                            f"SELECTED={selected['cp'] / 100:+.2f} "
-                            f"RANK=#{selected['rank'] + 1}"
-                        ),
-                    },
-                )
+            safe = [best]
+
+        if not safe:
             safe = [best]
 
         non_best = [
@@ -3511,6 +3521,16 @@ def choose_stockfish_move(
                 else pool
             )
 
+        # Baseline weighting/rank diversity remains unchanged unless a candidate
+        # clearly gives away an unrelated major/minor piece and another safe
+        # candidate already exists in the same pool.
+        non_giveaway_pool = [
+            candidate for candidate in selection_pool
+            if not candidate_exposes_free_major_piece(board, candidate["move"])
+        ]
+        if non_giveaway_pool:
+            selection_pool = non_giveaway_pool
+
         weighted = []
 
         for candidate in selection_pool:
@@ -3613,39 +3633,10 @@ def choose_stockfish_move(
         if (
             c["cp"] >= near_equal_floor
             and c["rank"] <= adaptive_max_rank
-            and not candidate_hangs_own_piece(board, c["move"])
         )
     ]
 
     if not safe:
-        # Do not gift a piece merely because every near-equal candidate is
-        # outside the tight score band. Pick the best already-scored safe
-        # alternative before allowing a forced best-move fallback.
-        safe_alternatives = [
-            candidate for candidate in candidates
-            if candidate["rank"] <= adaptive_max_rank
-            and not candidate_hangs_own_piece(board, candidate["move"])
-        ]
-        if safe_alternatives:
-            selected = max(
-                safe_alternatives,
-                key=lambda candidate: (candidate["cp"], -candidate["rank"]),
-            )
-            return (
-                selected["move"],
-                selected["info"],
-                {
-                    "rank": selected["rank"],
-                    "current_cp": best_cp,
-                    "selected_cp": selected["cp"],
-                    "source": "PIECE_SAFETY_FALLBACK",
-                    "reason": (
-                        f"PIECE SAFETY FALLBACK | BEST={best_cp / 100:+.2f} "
-                        f"SELECTED={selected['cp'] / 100:+.2f} "
-                        f"RANK=#{selected['rank'] + 1}"
-                    ),
-                },
-            )
         safe = [best]
 
     rank_weights = {
