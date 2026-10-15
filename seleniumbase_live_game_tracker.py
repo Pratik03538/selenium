@@ -2512,7 +2512,7 @@ def _perform_cursor_drag_once(
 
     if not isinstance(target, dict) or not target.get("ok"):
         return target if isinstance(target, dict) else {"ok": False, "reason": "invalid-drag-target"}
-    if len(text) == 5:
+    if len(text) == 5 and not allow_premove:
         return perform_api_move(
             driver, text, expected_fen, expected_color,
             low_clock_mode=low_clock_mode, source="promotion-api-fallback",
@@ -5023,7 +5023,10 @@ def main() -> int:
                                             # Keep the baseline MultiPV candidate width even at low clock;
                                             # the tiny search-time cap controls speed, while selection still
                                             # needs enough legal alternatives for its weighted baseline policy.
-                                            multipv=strategy_module.TRAINING_MULTI_PV,
+                                            multipv=(
+                                                1 if low_clock_mode
+                                                else strategy_module.TRAINING_MULTI_PV
+                                            ),
                                         )
                                         if not isinstance(engine_result, list):
                                             engine_result = [engine_result]
@@ -5406,11 +5409,6 @@ def main() -> int:
                                             f"[PREMOVE] Skipped ({premove_source}); normal turn handling remains enabled.",
                                             flush=True,
                                         )
-                                    elif len(premove_move.uci()) == 5 and args.move_input == "cursor":
-                                        print(
-                                            "[PREMOVE] Skipped promotion candidate; this board needs a site-specific promotion handler.",
-                                            flush=True,
-                                        )
                                     else:
                                         predicted_san = engine_board.san(predicted_reply) if predicted_reply else "unknown"
                                         chosen_premove_uci = premove_move.uci()
@@ -5438,25 +5436,11 @@ def main() -> int:
                                         if not args.auto_play or not args.premove_enabled:
                                             premove_submit = {"ok": False, "reason": "bot-or-extra-premove-disabled-in-settings"}
                                         elif args.move_input == "cursor" and low_clock_premove_mode:
-                                            # Prefer the site's explicit premove queue when exposed.
-                                            # Fall back to the guarded cursor gesture only when that
-                                            # API is absent; never repeat a rejected/stale premove.
-                                            premove_submit = perform_api_premove(
-                                                driver,
-                                                chosen_premove_uci,
-                                                fen,
-                                                active_bot_color,
-                                            )
-                                            if (
-                                                not premove_submit.get("ok")
-                                                and premove_submit.get("reason") in {
-                                                    "premove-api-unavailable",
-                                                    "reader-not-installed",
-                                                    "board-game-api-unavailable",
-                                                }
-                                            ):
+                                            if len(chosen_premove_uci) == 5:
+                                                # The configured site has no exposed promotion-premove API;
+                                                # use the guarded cursor path to queue the promotion gesture.
                                                 print(
-                                                    "[PREMOVE] Site queue API unavailable; using guarded low-clock cursor fallback.",
+                                                    "[PREMOVE] Using guarded cursor gesture for low-clock promotion premove.",
                                                     flush=True,
                                                 )
                                                 premove_submit = perform_cursor_drag(
@@ -5467,6 +5451,35 @@ def main() -> int:
                                                     allow_premove=True,
                                                     low_clock_mode=True,
                                                 )
+                                            else:
+                                                # Prefer the site's explicit premove queue when exposed.
+                                                # Fall back only when that API is unavailable; never replay stale moves.
+                                                premove_submit = perform_api_premove(
+                                                    driver,
+                                                    chosen_premove_uci,
+                                                    fen,
+                                                    active_bot_color,
+                                                )
+                                                if (
+                                                    not premove_submit.get("ok")
+                                                    and premove_submit.get("reason") in {
+                                                        "premove-api-unavailable",
+                                                        "reader-not-installed",
+                                                        "board-game-api-unavailable",
+                                                    }
+                                                ):
+                                                    print(
+                                                        "[PREMOVE] Site queue API unavailable; using guarded low-clock cursor fallback.",
+                                                        flush=True,
+                                                    )
+                                                    premove_submit = perform_cursor_drag(
+                                                        driver,
+                                                        chosen_premove_uci,
+                                                        fen,
+                                                        active_bot_color,
+                                                        allow_premove=True,
+                                                        low_clock_mode=True,
+                                                    )
                                         elif args.move_input == "cursor":
                                             premove_submit = perform_cursor_drag(
                                                 driver,
