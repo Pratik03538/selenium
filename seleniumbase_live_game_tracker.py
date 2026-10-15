@@ -26,6 +26,11 @@ try:
     from selenium import webdriver
     from selenium.common.exceptions import WebDriverException
     from selenium.webdriver.common.action_chains import ActionChains
+
+try:
+    import websocket  # Selenium's websocket-client dependency, used for low-latency CDP input.
+except ImportError:
+    websocket = None
 except ImportError as exc:
     raise SystemExit(
         "Missing Selenium. Install with: python -m pip install -U selenium"
@@ -2356,47 +2361,173 @@ def calculate_engine_search_limit(
     return max(0.005, min(base, clock_cap))
 
 
+class _DirectCDPPage:
+    """Small synchronous CDP client for the currently selected owned-site tab."""
+
+    def __init__(self, socket, target_id: str):
+        self.socket = socket
+        self.target_id = target_id
+        self.next_id = 1
+        self.responses: dict[int, dict[str, object]] = {}
+
+    def send(self, method: str, params: dict[str, object] | None = None) -> int:
+        command_id = self.next_id
+        self.next_id += 1
+        self.socket.send(json.dumps({
+            "id": command_id,
+            "method": method,
+            "params": params or {},
+        }, separators=(",", ":")))
+        return command_id
+
+    def wait_for(self, command_ids: set[int], timeout: float = 1.5) -> dict[int, dict[str, object]]:
+        pending = set(command_ids)
+        found: dict[int, dict[str, object]] = {}
+        for command_id in list(pending):
+            cached = self.responses.pop(command_id, None)
+            if cached is not None:
+                found[command_id] = cached
+                pending.discard(command_id)
+        deadline = time.monotonic() + max(0.001, timeout)
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("CDP command response timed out")
+            self.socket.settimeout(remaining)
+            try:
+                message = json.loads(self.socket.recv())
+            except Exception as exc:
+                if websocket is not None and isinstance(exc, websocket.WebSocketTimeoutException):
+                    raise TimeoutError("CDP command response timed out") from exc
+                raise
+            response_id = message.get("id")
+            if not isinstance(response_id, int):
+                continue
+            if response_id in pending:
+                found[response_id] = message
+                pending.remove(response_id)
+            else:
+                self.responses[response_id] = message
+        return found
+
+    def call(self, method: str, params: dict[str, object] | None = None, timeout: float = 1.5) -> dict[str, object]:
+        command_id = self.send(method, params)
+        response = self.wait_for({command_id}, timeout=timeout)[command_id]
+        if response.get("error"):
+            raise RuntimeError("CDP command failed: " + str(response["error"])[:180])
+        return response
+
+    def evaluate(self, expression: str, timeout: float = 1.5) -> object:
+        response = self.call("Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": True,
+        }, timeout=timeout)
+        result = response.get("result", {})
+        if isinstance(result, dict) and result.get("exceptionDetails"):
+            raise RuntimeError("Browser evaluation failed")
+        remote = result.get("result", {}) if isinstance(result, dict) else {}
+        return remote.get("value") if isinstance(remote, dict) else None
+
+
+def _direct_cdp_page_for_driver(driver):
+    """Reuse a CDP websocket for the selected tab, avoiding ChromeDriver per-event overhead."""
+    if websocket is None:
+        return None
+    try:
+        handle = str(driver.current_window_handle)
+        target_id = handle.removeprefix("CDwindow-")
+        cached = getattr(driver, "_live_tracker_direct_cdp", None)
+        if cached is not None and cached.target_id == target_id:
+            try:
+                if not cached.socket.connected:
+                    cached = None
+            except Exception:
+                cached = None
+        if cached is not None and cached.target_id == target_id:
+            return cached
+
+        chrome_options = (getattr(driver, "capabilities", {}) or {}).get("goog:chromeOptions", {})
+        debugger_address = str(chrome_options.get("debuggerAddress") or "").strip()
+        if not debugger_address:
+            return None
+        with urlopen(f"http://{debugger_address}/json/list", timeout=1.0) as response:
+            targets = json.loads(response.read().decode("utf-8", errors="replace"))
+        page = next((
+            item for item in targets
+            if isinstance(item, dict)
+            and item.get("type") == "page"
+            and str(item.get("id") or "") == target_id
+            and str(item.get("webSocketDebuggerUrl") or "").startswith("ws")
+        ), None)
+        if page is None:
+            return None
+        if cached is not None:
+            try:
+                cached.socket.close()
+            except Exception:
+                pass
+        socket = websocket.create_connection(
+            page["webSocketDebuggerUrl"], timeout=1.5, suppress_origin=True
+        )
+        socket.settimeout(1.5)
+        cached = _DirectCDPPage(socket, target_id)
+        setattr(driver, "_live_tracker_direct_cdp", cached)
+        return cached
+    except Exception:
+        return None
+
+
 def _perform_cursor_drag_once(
     driver, uci: str, expected_fen: str, expected_color: str | None,
     allow_premove: bool = False, low_clock_mode: bool = False,
 ) -> dict[str, object]:
-    """Drag a legal move with a short multi-waypoint gesture and report latency.
+    """Dispatch short multi-waypoint input over CDP and confirm inside the page.
 
-    Normal and premove gestures share randomized square points and a curved path
-    with 2-4 waypoints. All pointer waits are short, randomized millisecond values;
-    thinking time belongs before pickup, never during piece travel.
+    Browser-side input and confirmation avoid repeated ChromeDriver round-trips.
+    Requested millisecond timings are best-effort; OS scheduling and page event
+    processing can still make measured end-to-end latency longer.
     """
+    cdp = _direct_cdp_page_for_driver(driver)
+    if cdp is None:
+        return {"ok": False, "reason": "direct-cdp-unavailable"}
+
+    text = str(uci or "").lower()
     try:
-        target = driver.execute_script(
-            "return window.__liveGameApiReader ? "
-            "window.__liveGameApiReader.dragTarget(arguments[0], arguments[1], arguments[2], arguments[3]) : "
-            "{ok:false, reason:'reader-not-installed'};",
-            uci, expected_fen, expected_color, allow_premove,
+        # Keep legality, expected-position and player-side guards in the page's
+        # existing reader. Return only primitive geometry; never expose the URL.
+        args_json = json.dumps([text, expected_fen, expected_color, bool(allow_premove)])
+        target_expression = (
+            "(() => { const a = " + args_json + "; "
+            "const api = window.__liveGameApiReader; "
+            "if (!api || typeof api.dragTarget !== 'function') return {ok:false,reason:'reader-not-installed'}; "
+            "const t = api.dragTarget(a[0],a[1],a[2],a[3]); "
+            "if (!t || !t.ok) return t || {ok:false,reason:'invalid-drag-target'}; "
+            "const r = t.boardElement.getBoundingClientRect(); "
+            "return {ok:true,width:r.width,height:r.height,left:r.left,top:r.top,bottomSide:t.bottomSide}; })()"
         )
-    except WebDriverException:
-        return {"ok": False, "reason": "drag-target-unavailable"}
+        target = cdp.evaluate(target_expression, timeout=0.8)
+    except Exception:
+        return {"ok": False, "reason": "direct-cdp-target-check-failed"}
 
     if not isinstance(target, dict) or not target.get("ok"):
         return target if isinstance(target, dict) else {"ok": False, "reason": "invalid-drag-target"}
-
-    text = str(uci or "").lower()
     if len(text) == 5:
-        # Cursor promotion UI differs by site. Use only the configured site's
-        # already-exposed legal-move API as a verified fallback for promotions.
         return perform_api_move(
             driver, text, expected_fen, expected_color,
             low_clock_mode=low_clock_mode, source="promotion-api-fallback",
         )
 
-    board_element = target.get("boardElement")
     try:
         width = float(target["width"])
         height = float(target["height"])
+        left = float(target["left"])
+        top = float(target["top"])
         bottom_side = str(target["bottomSide"])
     except (KeyError, TypeError, ValueError):
         return {"ok": False, "reason": "invalid-board-geometry"}
-    if board_element is None or width <= 0 or height <= 0:
-        return {"ok": False, "reason": "invalid-board-element"}
+    if width <= 0 or height <= 0 or bottom_side not in {"white", "black"}:
+        return {"ok": False, "reason": "invalid-board-geometry"}
 
     rng = random.SystemRandom()
     square_w = width / 8.0
@@ -2409,35 +2540,21 @@ def _perform_cursor_drag_once(
             col, row = file_index, 8 - rank_number
         else:
             col, row = 7 - file_index, rank_number - 1
-
-        # New independent target for every source and destination click.
-        # Keep the pointer within the square, away from its borders.
-        jitter_x = rng.uniform(-0.22, 0.22)
-        jitter_y = rng.uniform(-0.22, 0.22)
         return (
-            (col + 0.5 + jitter_x) * square_w,
-            (row + 0.5 + jitter_y) * square_h,
+            (col + 0.5 + rng.uniform(-0.22, 0.22)) * square_w,
+            (row + 0.5 + rng.uniform(-0.22, 0.22)) * square_h,
         )
 
     sx, sy = square_point(text[:2])
     dx, dy = square_point(text[2:4])
-
-    # Build a shallow quadratic curve using a randomized perpendicular control
-    # point; source and destination remain inside their selected squares.
     vx, vy = dx - sx, dy - sy
     distance = max(1.0, (vx * vx + vy * vy) ** 0.5)
     normal_x, normal_y = -vy / distance, vx / distance
-    curve_sign = rng.choice((-1.0, 1.0))
-    curve_size = rng.uniform(0.035, 0.085) * min(width, height) * curve_sign
-    control_x = (sx + dx) / 2.0 + normal_x * curve_size
-    control_y = (sy + dy) / 2.0 + normal_y * curve_size
-    control_x = min(max(2.0, control_x), width - 2.0)
-    control_y = min(max(2.0, control_y), height - 2.0)
+    curve_size = rng.uniform(0.035, 0.085) * min(width, height) * rng.choice((-1.0, 1.0))
+    control_x = min(max(2.0, (sx + dx) / 2.0 + normal_x * curve_size), width - 2.0)
+    control_y = min(max(2.0, (sy + dy) / 2.0 + normal_y * curve_size), height - 2.0)
 
-    # Keep the total configured piece-travel time in the 2-20ms range while
-    # retaining several path points. Give every segment at least 1ms so no
-    # pointer-move action gets a zero duration.
-    total_drag_ms = rng.randint(2, 20)
+    total_drag_ms = rng.randint(3, 30)
     waypoint_count = min(rng.randint(2, 4), total_drag_ms)
     segment_durations = [1] * waypoint_count
     remaining_drag_ms = total_drag_ms - waypoint_count
@@ -2445,130 +2562,140 @@ def _perform_cursor_drag_once(
         segment_durations[rng.randrange(waypoint_count)] += 1
         remaining_drag_ms -= 1
 
-    # Use tiny randomized waits rather than literal zero-duration waits.
-    pre_delay_ms = rng.randint(1, 5)
-    pickup_hold_ms = rng.randint(1, 3)
-
     path_points: list[tuple[float, float]] = []
     for index in range(1, waypoint_count + 1):
         t = index / waypoint_count
-        one_minus_t = 1.0 - t
-        px = (
-            one_minus_t * one_minus_t * sx
-            + 2.0 * one_minus_t * t * control_x
-            + t * t * dx
-        )
-        py = (
-            one_minus_t * one_minus_t * sy
-            + 2.0 * one_minus_t * t * control_y
-            + t * t * dy
-        )
+        omt = 1.0 - t
+        px = omt * omt * sx + 2.0 * omt * t * control_x + t * t * dx
+        py = omt * omt * sy + 2.0 * omt * t * control_y + t * t * dy
         if index < waypoint_count:
-            px += rng.uniform(-2.0, 2.0)
-            py += rng.uniform(-2.0, 2.0)
-            px = min(max(2.0, px), width - 2.0)
-            py = min(max(2.0, py), height - 2.0)
+            px = min(max(2.0, px + rng.uniform(-2.0, 2.0)), width - 2.0)
+            py = min(max(2.0, py + rng.uniform(-2.0, 2.0)), height - 2.0)
         else:
-            # Make sure the mouse button is released exactly at the chosen target.
             px, py = dx, dy
-        path_points.append((px, py))
+        path_points.append((left + px, top + py))
 
-    source_offset = (round(sx - width / 2.0), round(sy - height / 2.0))
+    source_x, source_y = left + sx, top + sy
+    pre_delay_ms = rng.randint(1, 5)
     hover_ms = rng.randint(3, 8)
+    pickup_hold_ms = rng.randint(1, 3)
+    confirm_interval_ms = rng.randint(4, 10)
+    confirmation_timeout_ms = int(120 if low_clock_mode else (450 if allow_premove else 900))
 
-    action_elapsed_ms = 0.0
+    # Start a page-side watcher before sending mouse input. MutationObserver is
+    # immediate; a 4-10ms in-page interval is the fallback for API-only updates.
+    watch_args = json.dumps([expected_fen, bool(allow_premove), confirm_interval_ms, confirmation_timeout_ms])
+    watcher_expression = (
+        "(() => { const a = " + watch_args + "; const api = window.__liveGameApiReader; "
+        "if (!api) return Promise.resolve({fen:'',detected_ms:0,reason:'reader-not-installed'}); "
+        "const base = String(a[0] || ''); const started = performance.now(); "
+        "return new Promise(resolve => { let done = false; let observer = null; let interval = null; let timer = null; "
+        "const finish = value => { if (done) return; done = true; try { observer && observer.disconnect(); } catch (_) {} "
+        "if (interval !== null) clearInterval(interval); if (timer !== null) clearTimeout(timer); resolve(value); }; "
+        "const check = () => { let state = {}; try { state = api.current() || {}; } catch (_) {} "
+        "const fen = String(state.fen || ''); if (fen && fen !== base) { finish({fen,detected_ms:performance.now()-started}); return; } "
+        "if (a[1]) { try { const status = api.premoveStatus(); if (status && status.pending) "
+        "finish({fen, pending:true, detected_ms:performance.now()-started}); } catch (_) {} } }; "
+        "observer = new MutationObserver(check); observer.observe(document.documentElement, "
+        "{subtree:true,childList:true,characterData:true,attributes:true}); "
+        "interval = setInterval(check, a[2]); timer = setTimeout(() => { check(); "
+        "finish({fen:String((api.current()||{}).fen||''),timed_out:true,detected_ms:performance.now()-started}); }, a[3]); "
+        "check(); }); })()"
+    )
     try:
-        # Use W3C pointer actions with randomized per-segment timing. All waits
-        # remain small; there are no deliberate pauses while the piece is moving.
+        watcher_id = cdp.send("Runtime.evaluate", {
+            "expression": watcher_expression,
+            "returnByValue": True,
+            "awaitPromise": True,
+        })
         if pre_delay_ms:
             time.sleep(pre_delay_ms / 1000.0)
 
-        actions = ActionChains(driver)
-        pointer = actions.w3c_actions.pointer_action
-        pointer.source.create_pointer_move(
-            origin=board_element,
-            duration=rng.randint(1, 2) if low_clock_mode else rng.randint(2, 4),
-            x=source_offset[0],
-            y=source_offset[1],
-        )
-        pointer.pause(hover_ms / 1000.0)
-        pointer.pointer_down()
-        # Keep the lifted-piece hold randomized but limited to 1-3ms.
-        pointer.pause(pickup_hold_ms / 1000.0)
-
-        for point_index, ((px, py), segment_ms) in enumerate(zip(path_points, segment_durations)):
-            pointer.source.create_pointer_move(
-                origin=board_element,
-                duration=segment_ms,
-                x=round(px - width / 2.0),
-                y=round(py - height / 2.0),
-            )
-            # Intermediate points keep the path smooth without adding pauses.
-
-        pointer.pointer_up()
         action_started_at = time.monotonic()
-        actions.perform()
+        command_ids: set[int] = set()
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": source_x, "y": source_y, "button": "none",
+            "buttons": 0, "pointerType": "mouse",
+        }))
+        time.sleep(hover_ms / 1000.0)
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": source_x, "y": source_y, "button": "left",
+            "buttons": 1, "clickCount": 1, "pointerType": "mouse",
+        }))
+        time.sleep(pickup_hold_ms / 1000.0)
+
+        for (px, py), segment_ms in zip(path_points, segment_durations):
+            command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+                "type": "mouseMoved", "x": px, "y": py, "button": "left",
+                "buttons": 1, "pointerType": "mouse",
+            }))
+            time.sleep(segment_ms / 1000.0)
+
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": left + dx, "y": top + dy, "button": "left",
+            "buttons": 0, "clickCount": 1, "pointerType": "mouse",
+        }))
+        # Await all CDP acknowledgements together instead of paying one network
+        # round-trip per mouse event.
+        cdp.wait_for(command_ids, timeout=1.0)
         action_elapsed_ms = (time.monotonic() - action_started_at) * 1000.0
-    except (WebDriverException, ValueError, TypeError, AttributeError) as exc:
-        # Never leave the mouse button pressed if a pointer action fails.
+    except Exception as exc:
         try:
-            ActionChains(driver).release().perform()
+            cdp.send("Input.dispatchMouseEvent", {
+                "type": "mouseReleased", "button": "left", "buttons": 0,
+                "pointerType": "mouse",
+            })
         except Exception:
             pass
         return {
             "ok": False,
-            "reason": "cursor-action-failed",
+            "reason": "direct-cdp-input-failed",
             "error_type": type(exc).__name__,
-            "error": str(exc)[:240],
             "drag_ms": total_drag_ms,
             "pre_delay_ms": pre_delay_ms,
-            "action_elapsed_ms": round(action_elapsed_ms, 1),
+            "waypoints": waypoint_count,
         }
 
-    # Confirm the UI accepted this drag before reporting success.
     confirmation_started_at = time.monotonic()
-    deadline = confirmation_started_at + (
-        0.12 if low_clock_mode else (0.45 if allow_premove else 0.90)
-    )
-    while time.monotonic() < deadline:
-        try:
-            current_fen = driver.execute_script(
-                "return window.__liveGameApiReader ? "
-                "window.__liveGameApiReader.current().fen : '';"
-            )
-        except WebDriverException:
-            current_fen = ""
-        if current_fen and uci_move_reaches_fen(expected_fen, str(current_fen).strip(), text):
-            return {
-                "ok": True,
-                "confirmed": True,
-                "uci": text,
-                "drag_ms": total_drag_ms,
-                "pre_delay_ms": pre_delay_ms,
-                "waypoints": waypoint_count,
-                "premove_applied": bool(allow_premove),
-                "action_elapsed_ms": round(action_elapsed_ms, 1),
-                "confirm_elapsed_ms": round((time.monotonic() - confirmation_started_at) * 1000.0, 1),
-            }
-        if allow_premove:
-            try:
-                status = driver.execute_script(
-                    "return window.__liveGameApiReader ? "
-                    "window.__liveGameApiReader.premoveStatus() : {pending:false,source:'reader-not-installed'};"
-                )
-                if isinstance(status, dict) and status.get("pending"):
-                    return {
-                        "ok": True, "uci": text, "premove_attempted": True,
-                        "premove_confirmed": True, "premove_source": status.get("source", ""),
-                        "drag_ms": total_drag_ms, "pre_delay_ms": pre_delay_ms,
-                        "waypoints": waypoint_count,
-                        "action_elapsed_ms": round(action_elapsed_ms, 1),
-                        "confirm_elapsed_ms": round((time.monotonic() - confirmation_started_at) * 1000.0, 1),
-                    }
-            except WebDriverException:
-                pass
-        time.sleep(0.003 if low_clock_mode else 0.015)
+    try:
+        watcher_response = cdp.wait_for({watcher_id}, timeout=(confirmation_timeout_ms / 1000.0) + 1.0)[watcher_id]
+        if watcher_response.get("error"):
+            raise RuntimeError("confirmation watcher failed")
+        remote_result = watcher_response.get("result", {}).get("result", {})
+        observed = remote_result.get("value") if isinstance(remote_result, dict) else None
+    except Exception:
+        observed = None
+    confirm_elapsed_ms = (time.monotonic() - confirmation_started_at) * 1000.0
+    if not isinstance(observed, dict):
+        observed = {}
 
+    current_fen = str(observed.get("fen") or "").strip()
+    page_detected_ms = observed.get("detected_ms")
+    pending_premove = bool(observed.get("pending"))
+    if current_fen and uci_move_reaches_fen(expected_fen, current_fen, text):
+        return {
+            "ok": True,
+            "confirmed": True,
+            "uci": text,
+            "drag_ms": total_drag_ms,
+            "pre_delay_ms": pre_delay_ms,
+            "waypoints": waypoint_count,
+            "action_elapsed_ms": round(action_elapsed_ms, 1),
+            "confirm_elapsed_ms": round(confirm_elapsed_ms, 1),
+            "confirm_detected_ms": round(float(page_detected_ms or 0.0), 1),
+            "confirm_interval_ms": confirm_interval_ms,
+        }
+    if allow_premove and pending_premove:
+        return {
+            "ok": True, "uci": text, "premove_attempted": True,
+            "premove_confirmed": True, "premove_source": "page-side observer",
+            "drag_ms": total_drag_ms, "pre_delay_ms": pre_delay_ms,
+            "waypoints": waypoint_count,
+            "action_elapsed_ms": round(action_elapsed_ms, 1),
+            "confirm_elapsed_ms": round(confirm_elapsed_ms, 1),
+            "confirm_detected_ms": round(float(page_detected_ms or 0.0), 1),
+            "confirm_interval_ms": confirm_interval_ms,
+        }
     if allow_premove:
         return {
             "ok": True, "uci": text, "premove_attempted": True,
@@ -2576,7 +2703,9 @@ def _perform_cursor_drag_once(
             "drag_ms": total_drag_ms, "pre_delay_ms": pre_delay_ms,
             "waypoints": waypoint_count,
             "action_elapsed_ms": round(action_elapsed_ms, 1),
-            "confirm_elapsed_ms": round((time.monotonic() - confirmation_started_at) * 1000.0, 1),
+            "confirm_elapsed_ms": round(confirm_elapsed_ms, 1),
+            "confirm_detected_ms": round(float(page_detected_ms or 0.0), 1),
+            "confirm_interval_ms": confirm_interval_ms,
         }
     return {
         "ok": False,
@@ -2585,9 +2714,10 @@ def _perform_cursor_drag_once(
         "pre_delay_ms": pre_delay_ms,
         "waypoints": waypoint_count,
         "action_elapsed_ms": round(action_elapsed_ms, 1),
-        "confirm_elapsed_ms": round((time.monotonic() - confirmation_started_at) * 1000.0, 1),
+        "confirm_elapsed_ms": round(confirm_elapsed_ms, 1),
+        "confirm_detected_ms": round(float(page_detected_ms or 0.0), 1),
+        "confirm_interval_ms": confirm_interval_ms,
     }
-
 
 def perform_cursor_drag(
     driver, uci: str, expected_fen: str, expected_color: str | None,
