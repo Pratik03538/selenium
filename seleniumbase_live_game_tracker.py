@@ -4163,6 +4163,10 @@ def main() -> int:
                                 f"{active_bot_color}.",
                                 flush=True,
                             )
+                            # Process this one confirming snapshot immediately so the
+                            # bot checks the current turn without waiting for another
+                            # board/clock mutation. This only queues one snapshot.
+                            events = [side_probe]
 
                 for event in events or []:
                     if settings_window is not None:
