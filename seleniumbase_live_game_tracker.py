@@ -4135,6 +4135,35 @@ def main() -> int:
                     ):
                         events = [retry_snapshot]
 
+                # Side resolution needs repeated evidence even when the board is
+                # quiet. Do not turn this probe into a normal queued event: that
+                # would duplicate CSV rows and live move processing every loop.
+                if not events and args.auto_play and active_bot_color is None:
+                    try:
+                        side_probe = driver.execute_script(
+                            "return window.__liveGameApiReader ? "
+                            "window.__liveGameApiReader.current() : null;"
+                        )
+                    except WebDriverException:
+                        side_probe = None
+                    if isinstance(side_probe, dict):
+                        probe_api_color, _probe_api_conflict = normalize_api_bot_color(
+                            side_probe.get("playingAsColor"), side_probe.get("playingAs")
+                        )
+                        probe_name_color = normalize_chess_color(
+                            side_probe.get("playerNameColor")
+                        )
+                        resolved_probe = side_resolver.resolve(
+                            probe_api_color, probe_name_color
+                        )
+                        if resolved_probe is not None:
+                            active_bot_color = resolved_probe
+                            print(
+                                f"[SIDE] Bot side confirmed from stable game evidence: "
+                                f"{active_bot_color}.",
+                                flush=True,
+                            )
+
                 for event in events or []:
                     if settings_window is not None:
                         settings_window.pump()
