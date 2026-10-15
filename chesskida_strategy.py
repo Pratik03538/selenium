@@ -840,6 +840,61 @@ def natural_bot_move_delay(
         )
         return max(0.0, accelerated_delay)
 
+    # Use one bounded, position-shaped pause for normal quiet decisions.
+    # The range is intentionally wider than the tiny action/confirmation delays,
+    # but it spends the existing thinking budget and never runs near the late-clock
+    # trigger. Forced replies and opening-book moves already returned above.
+    if (
+        own_clock is not None
+        and own_clock > max(18.0, low_clock_threshold + 8.0)
+        and not is_opening_book_move
+    ):
+        budget_before = max(0.0, float(_thinking_budget_remaining or 0.0))
+        if budget_before <= 0.05:
+            return max(0.0, min(float(delay), 0.22))
+
+        complexity = _timing_position_complexity(
+            board, move, engine_result=engine_result, selection_meta=selection_meta
+        )
+        if complexity < 0.28:
+            band_name, band_low, band_high = "QUIET", 0.055, 0.200
+        elif complexity < 0.62:
+            band_name, band_low, band_high = "DECISION", 0.110, 0.360
+        else:
+            band_name, band_low, band_high = "COMPLEX", 0.200, 0.550
+
+        try:
+            if initial_time_seconds is not None and float(initial_time_seconds) > 0:
+                clock_reserve = max(
+                    1.0,
+                    float(initial_time_seconds) * float(_thinking_clock_reserve_fraction or 0.36),
+                )
+            else:
+                clock_reserve = max(0.25, min(2.0, own_clock * 0.08))
+        except (TypeError, ValueError):
+            clock_reserve = 1.0
+        clock_safe_cap = max(0.0, own_clock - clock_reserve - 0.20)
+        base_delay = min(max(0.0, float(delay)), band_high, clock_safe_cap)
+        sampled_delay = min(
+            band_high,
+            max(base_delay, random.uniform(band_low, band_high)),
+            clock_safe_cap,
+        )
+        extra = min(
+            max(0.0, sampled_delay - base_delay),
+            budget_before,
+        )
+        final_delay = base_delay + extra
+        _thinking_budget_remaining = max(0.0, budget_before - extra)
+        _last_bot_natural_delay = final_delay
+        print(
+            f"[BOT THINK] band={band_name} complexity={complexity:.2f} "
+            f"delay={final_delay:.3f}s extra={extra:.3f}s "
+            f"budget_left={_thinking_budget_remaining:.3f}s.",
+            flush=True,
+        )
+        return max(0.0, final_delay)
+
     # Late/endgame positions use occasional short pauses rather than the
     # regular multi-second pause. Piece count complements move-count detection.
     try:
