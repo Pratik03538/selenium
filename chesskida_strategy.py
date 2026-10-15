@@ -2621,6 +2621,7 @@ def choose_stockfish_move(
     if low_clock_mode:
         candidate_by_move = {candidate["move"]: candidate for candidate in candidates}
         if best["mate"] is not None and 0 < best["mate"] <= MATE_FORCE_FAST_MAX:
+            _record_rank_selection(best["rank"])
             return (
                 best["move"], best["info"],
                 {
@@ -2637,6 +2638,7 @@ def choose_stockfish_move(
                 continue
             if after_mate.is_checkmate():
                 item = candidate_by_move.get(legal_move, {})
+                _record_rank_selection(item.get("rank"))
                 return (
                     legal_move, item.get("info"),
                     {
@@ -2651,6 +2653,7 @@ def choose_stockfish_move(
             promotion is not None
             and not candidate_exposes_free_major_piece(board, promotion["move"])
         ):
+            _record_rank_selection(promotion["rank"])
             return (
                 promotion["move"], promotion["info"],
                 {
@@ -2661,6 +2664,7 @@ def choose_stockfish_move(
             )
         safe_capture = find_fast_low_clock_capture(board, candidates)
         if safe_capture is not None:
+            _record_rank_selection(safe_capture["rank"])
             return (
                 safe_capture["move"], safe_capture["info"],
                 {
@@ -2672,6 +2676,7 @@ def choose_stockfish_move(
                     ),
                 },
             )
+        _record_rank_selection(best["rank"])
         return (
             best["move"], best["info"],
             {
@@ -2728,6 +2733,7 @@ def choose_stockfish_move(
             >= FORCE_BEST_IMPROVEMENT_FRACTION
         ):
             selected = best
+            _record_rank_selection(selected["rank"])
 
             return (
                 selected["move"],
@@ -2768,6 +2774,7 @@ def choose_stockfish_move(
             )
 
             if cleanup is not None:
+                _record_rank_selection(cleanup["rank"])
                 selected = cleanup["candidate"]
 
                 if selected is None:
@@ -2814,6 +2821,7 @@ def choose_stockfish_move(
 
         # M4 or closer: stop humanizing and take the fastest mate immediately.
         if best["mate"] <= MATE_FORCE_FAST_MAX:
+            _record_rank_selection(best["rank"])
             _mate_progress_target_mate = None
             _mate_progress_hold_moves = 0
             _mate_progress_hold_limit = MATE_SUSTAIN_MIN_MOVES
@@ -2843,6 +2851,7 @@ def choose_stockfish_move(
             <= best["mate"]
             <= MATE_GRACE_MAX
         ):
+            _record_rank_selection(best["rank"])
             _mate_progress_target_mate = None
             _mate_progress_hold_moves = 0
             _mate_progress_hold_limit = MATE_SUSTAIN_MIN_MOVES
@@ -2942,6 +2951,7 @@ def choose_stockfish_move(
                     exact_best,
                     key=lambda c: c["rank"]
                 )
+                _record_rank_selection(selected["rank"])
 
                 return (
                     selected["move"],
@@ -3047,6 +3057,7 @@ def choose_stockfish_move(
         )
 
         if priority_promotion is not None:
+            _record_rank_selection(priority_promotion["rank"])
             return (
                 priority_promotion["move"],
                 priority_promotion["info"],
@@ -3072,6 +3083,7 @@ def choose_stockfish_move(
         )
 
         if priority_capture is not None:
+            _record_rank_selection(priority_capture["rank"])
             return (
                 priority_capture["move"],
                 priority_capture["info"],
