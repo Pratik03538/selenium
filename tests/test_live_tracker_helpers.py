@@ -18,11 +18,57 @@ from seleniumbase_live_game_tracker import (
     _DeadlineBoundEngine,
     _PremoveDeadlineExceeded,
     choose_mate_phase_premove,
+    configure_optional_bot_elo,
     infer_move_between_fens,
     premove_phase_allowed,
     reconstruct_history_from_dom_moves,
     uci_move_reaches_fen,
 )
+
+
+class StockfishDifficultyConfigurationTests(unittest.TestCase):
+    class FakeOption:
+        def __init__(self, minimum=1000, maximum=2800):
+            self.min = minimum
+            self.max = maximum
+
+    class FakeEngine:
+        def __init__(self):
+            self.options = {
+                "UCI_Elo": StockfishDifficultyConfigurationTests.FakeOption(),
+                "UCI_LimitStrength": object(),
+            }
+            self.configuration = None
+
+        def configure(self, configuration):
+            self.configuration = configuration
+
+    def test_missing_setting_preserves_stockfish_default_strength(self):
+        engine = self.FakeEngine()
+        self.assertIsNone(configure_optional_bot_elo(engine, ""))
+        self.assertIsNone(engine.configuration)
+
+    def test_valid_setting_enables_explicit_ai_difficulty(self):
+        engine = self.FakeEngine()
+        self.assertEqual(configure_optional_bot_elo(engine, "2100"), 2100)
+        self.assertEqual(
+            engine.configuration,
+            {"UCI_LimitStrength": True, "UCI_Elo": 2100},
+        )
+
+    def test_non_integer_setting_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "whole-number"):
+            configure_optional_bot_elo(self.FakeEngine(), "strong")
+
+    def test_out_of_range_setting_is_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "between 1000 and 2800"):
+            configure_optional_bot_elo(self.FakeEngine(), "3000")
+
+    def test_unsupported_stockfish_build_is_reported(self):
+        engine = self.FakeEngine()
+        engine.options = {}
+        with self.assertRaisesRegex(RuntimeError, "does not support UCI_Elo"):
+            configure_optional_bot_elo(engine, "2100")
 
 
 class PlayerSideResolverTests(unittest.TestCase):
