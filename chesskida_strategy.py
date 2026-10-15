@@ -81,6 +81,8 @@ HUMAN_SELECTION_NON_BEST_CHANCE = 0.88
 HUMAN_SELECTION_TOP12_MAX_CHANCE = 0.10
 # Normal/equal positions should prefer ranks #3+ when safe alternatives exist.
 NON_ADVANTAGE_TOP12_MAX_CHANCE = 0.05
+# Avoid recently used MultiPV ranks when other safe choices exist.
+RANK_DIVERSITY_WINDOW = 4
 MATE_CLEANUP_MAX_REMAINING_PIECES = 1
 MATE_CLEANUP_MIN_VALUE = 1
 MIN_POSITIVE_CP = 5
@@ -116,6 +118,7 @@ _thinking_budget_total = None
 _thinking_move_cooldown_remaining = 0
 _mate_pause_used = False
 _rank1_selection_streak = 0
+_recent_selected_ranks = []
 _thinking_warmup_moves = None
 _book_fast_move_limit = None
 _thinking_clock_reserve_fraction = None
@@ -141,9 +144,49 @@ def _limit_rank1_streak_pool(candidates, consecutive_rank1):
     return pool, False
 
 
+def _diversify_rank_pool(candidates, recent_ranks=None, window=RANK_DIVERSITY_WINDOW):
+    """Avoid ranks used in recent turns whenever another safe rank is available."""
+    pool = list(candidates)
+    if len(pool) <= 1:
+        return pool, []
+
+    try:
+        window = max(1, int(window))
+    except (TypeError, ValueError):
+        window = RANK_DIVERSITY_WINDOW
+    try:
+        recent = [int(rank) for rank in list(recent_ranks or [])[-window:] if rank is not None]
+    except (TypeError, ValueError):
+        recent = []
+
+    if not recent:
+        return pool, []
+
+    used = set(recent)
+    alternatives = [c for c in pool if int(c["rank"]) not in used]
+    if alternatives:
+        return alternatives, sorted(used)
+
+    # When the safe choices are few, relax older history but avoid an immediate
+    # repeat whenever another candidate is available.
+    last_rank = recent[-1]
+    alternatives = [c for c in pool if int(c["rank"]) != last_rank]
+    if alternatives:
+        return alternatives, [last_rank]
+    return pool, []
+
+
 def _record_rank_selection(rank):
-    global _rank1_selection_streak
-    _rank1_selection_streak = _rank1_selection_streak + 1 if int(rank) == 0 else 0
+    global _rank1_selection_streak, _recent_selected_ranks
+    try:
+        rank = int(rank)
+    except (TypeError, ValueError):
+        return
+    if rank < 0:
+        return
+    _rank1_selection_streak = _rank1_selection_streak + 1 if rank == 0 else 0
+    _recent_selected_ranks.append(rank)
+    del _recent_selected_ranks[:-RANK_DIVERSITY_WINDOW]
 
 
 def score_to_cp(score):
@@ -2459,8 +2502,12 @@ def choose_stockfish_move(
     global _mate_progress_target_mate
     global _mate_progress_hold_moves
     global _mate_progress_hold_limit
+    global _rank1_selection_streak
+    global _recent_selected_ranks
 
     if len(board.move_stack) <= 1:
+        _rank1_selection_streak = 0
+        _recent_selected_ranks = []
         _advantage_target_cp = None
         _advantage_hold_moves = 0
         _advantage_hold_limit = random.randint(
@@ -3478,6 +3525,10 @@ def choose_stockfish_move(
         if non_giveaway_pool:
             selection_pool = non_giveaway_pool
 
+        selection_pool, _avoided_ranks = _diversify_rank_pool(
+            selection_pool, _recent_selected_ranks
+        )
+
         weighted = []
 
         for candidate in selection_pool:
@@ -3539,6 +3590,7 @@ def choose_stockfish_move(
                 selected = candidate
                 break
 
+        _record_rank_selection(selected["rank"])
         return (
             selected["move"],
             selected["info"],
@@ -3614,6 +3666,9 @@ def choose_stockfish_move(
         )
         else safe
     )
+    selection_safe, _avoided_ranks = _diversify_rank_pool(
+        selection_safe, _recent_selected_ranks
+    )
 
     weighted = []
 
@@ -3649,6 +3704,7 @@ def choose_stockfish_move(
             selected = candidate
             break
 
+    _record_rank_selection(selected["rank"])
     return (
         selected["move"],
         selected["info"],
