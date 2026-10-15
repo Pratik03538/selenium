@@ -2261,7 +2261,6 @@ def choose_stockfish_move(
     global _mate_progress_target_mate
     global _mate_progress_hold_moves
     global _mate_progress_hold_limit
-    global _rank1_selection_streak
 
     if len(board.move_stack) <= 1:
         _advantage_target_cp = None
@@ -2279,7 +2278,6 @@ def choose_stockfish_move(
             MATE_SUSTAIN_MIN_MOVES,
             MATE_SUSTAIN_MAX_MOVES
         )
-        _rank1_selection_streak = 0
     if not multipv_infos:
         return (
             None,
@@ -2289,31 +2287,6 @@ def choose_stockfish_move(
                 "current_cp": 0,
                 "selected_cp": 0,
                 "reason": "no MultiPV candidates"
-            }
-        )
-
-    # Move preferences and evaluations are only meaningful for our verified side.
-    # Fail closed on an unknown/mismatched side; never silently select for the opponent.
-    if bot_color not in (chess.WHITE, chess.BLACK):
-        return (
-            None,
-            None,
-            {
-                "rank": 0,
-                "current_cp": 0,
-                "selected_cp": 0,
-                "reason": "BOT COLOR GUARD | verified bot side is unknown"
-            }
-        )
-    if board.turn != bot_color:
-        return (
-            None,
-            None,
-            {
-                "rank": 0,
-                "current_cp": 0,
-                "selected_cp": 0,
-                "reason": "BOT COLOR GUARD | position is not the verified bot's turn"
             }
         )
 
@@ -2376,6 +2349,30 @@ def choose_stockfish_move(
             }
         )
 
+    # Retain the tracker-side safety check: select only for the verified bot side.
+    if bot_color not in (chess.WHITE, chess.BLACK):
+        return (
+            None,
+            None,
+            {
+                "rank": 0,
+                "current_cp": 0,
+                "selected_cp": 0,
+                "reason": "BOT COLOR GUARD | verified bot side is unknown"
+            }
+        )
+    if board.turn != bot_color:
+        return (
+            None,
+            None,
+            {
+                "rank": 0,
+                "current_cp": 0,
+                "selected_cp": 0,
+                "reason": "BOT COLOR GUARD | position is not the verified bot's turn"
+            }
+        )
+
     best = candidates[0]
     best_cp = best["cp"]
 
@@ -2402,8 +2399,7 @@ def choose_stockfish_move(
         )
 
     if (
-        not low_clock_mode
-        and reference_cp is not None
+        reference_cp is not None
         and reference_cp >= FORCE_BEST_MIN_CP
         and not (
             best["mate"] is not None
@@ -2447,65 +2443,28 @@ def choose_stockfish_move(
                 }
             )
 
-    # Low-clock decisions use only the MultiPV already in memory: take an
-    # available shortest mate immediately (randomizing ties), without the
-    # normal M5-M15 mate-sustain hold. No extra mate-search pass is launched.
-    low_clock_conversion_priority = False
-    if low_clock_mode:
-        mate_candidates_fast = [
-            candidate for candidate in candidates
-            if candidate["mate"] is not None and candidate["mate"] > 0
-        ]
-        if mate_candidates_fast:
-            shortest_mate = min(candidate["mate"] for candidate in mate_candidates_fast)
-            fastest_choices = [
-                candidate for candidate in mate_candidates_fast
-                if candidate["mate"] == shortest_mate
-            ]
-            selected = random.choice(fastest_choices)
-            return (
-                selected["move"],
-                selected["info"],
-                {
-                    "rank": selected["rank"],
-                    "current_cp": best_cp,
-                    "selected_cp": selected["cp"],
-                    "source": "LOW_CLOCK_FAST_MATE",
-                    "reason": (
-                        f"LOW CLOCK FAST MATE | M{selected['mate']} "
-                        f"RANK=#{selected['rank'] + 1} | randomized equal-mate tie"
-                    ),
-                },
+    if (
+        best["mate"] is not None
+        and best["mate"] > 0
+    ):
+        # During the human-like mating window, clear genuinely free
+        # material first. This is intentionally before the M4 force rule:
+        # if the opponent blunders a queen/rook/minor/pawn and it is safely
+        # capturable, take it before closing the game. When only one
+        # non-king piece remains, proceed with the normal mate plan.
+        if (
+            MATE_GRACE_MIN
+            <= best["mate"]
+            <= MATE_GRACE_MAX
+        ):
+            cleanup = find_free_mate_cleanup_capture(
+                board,
+                candidates
             )
 
-        # Only suppress the regular mate progression if the material is
-        # winning and the opponent has at most three pieces with legal moves.
-        try:
-            opponent_color = not mover
-            opponent_movable_count = _movable_piece_count_for_color(board, opponent_color)
-            low_clock_conversion_priority = (
-                best_cp >= HUMAN_STRONG_WINNING_CP
-                and side_material(board, mover) > side_material(board, opponent_color)
-                and 1 <= opponent_movable_count <= 3
-            )
-            if low_clock_conversion_priority:
-                print(
-                    f"[LOW CLOCK] Winning conversion mode: opponent movable pieces={opponent_movable_count}; "
-                    "using existing safe promotion/capture priorities instead of mate-sustain.",
-                    flush=True,
-                )
-        except Exception:
-            low_clock_conversion_priority = False
-
-    # Preserve the material-cleanup idea, but never artificially hold a slower
-    # mate for multiple moves. Usually play a shortest mate; a one-step slower
-    # conversion is only sampled occasionally when clocks are healthy.
-    if best["mate"] is not None and best["mate"] > 0:
-        best_mate = int(best["mate"])
-        if MATE_GRACE_MIN <= best_mate <= MATE_GRACE_MAX:
-            cleanup = find_free_mate_cleanup_capture(board, candidates)
             if cleanup is not None:
                 selected = cleanup["candidate"]
+
                 if selected is None:
                     selected = {
                         "move": cleanup["move"],
@@ -2515,262 +2474,932 @@ def choose_stockfish_move(
                         "mate": None,
                     }
                 else:
-                    selected = dict(selected)
+                    selected = dict(
+                        selected
+                    )
                     selected["move"] = cleanup["move"]
-                victim_name = chess.piece_name(cleanup["victim"].piece_type).upper()
+
+                victim_name = chess.piece_name(
+                    cleanup["victim"].piece_type
+                ).upper()
+
                 rank_text = (
                     f"#{cleanup['rank'] + 1}"
-                    if cleanup["rank"] is not None else "FREE"
+                    if cleanup["rank"] is not None
+                    else "FREE"
                 )
+
                 return (
-                    selected["move"], selected["info"],
+                    selected["move"],
+                    selected["info"],
                     {
                         "rank": cleanup["rank"],
                         "current_cp": best_cp,
                         "selected_cp": cleanup["cp"],
                         "source": "MATE_CLEANUP",
                         "reason": (
-                            f"MATE CLEANUP | FREE {victim_name} "
-                            f"TARGET={chess.square_name(selected['move'].to_square)} "
+                            f"MATE CLEANUP | "
+                            f"FREE {victim_name} "
+                            f"TARGET="
+                            f"{chess.square_name(selected['move'].to_square)} "
                             f"RANK={rank_text}"
-                        ),
-                    },
+                        )
+                    }
                 )
 
-        if MATE_GRACE_MIN <= best_mate <= MATE_GRACE_MAX and not low_clock_mode:
-            slower_mates = [
-                candidate for candidate in candidates
-                if candidate["mate"] is not None
-                and int(candidate["mate"]) == best_mate + 1
-            ]
-            exact_mates = [
-                candidate for candidate in candidates
-                if candidate["mate"] is not None
-                and int(candidate["mate"]) == best_mate
-            ]
-            mate_pool = (
-                slower_mates if slower_mates and random.random() < 0.10
-                else exact_mates
+        # M4 or closer: stop humanizing and take the fastest mate immediately.
+        if best["mate"] <= MATE_FORCE_FAST_MAX:
+            _mate_progress_target_mate = None
+            _mate_progress_hold_moves = 0
+            _mate_progress_hold_limit = MATE_SUSTAIN_MIN_MOVES
+
+            selected = best
+
+            return (
+                selected["move"],
+                selected["info"],
+                {
+                    "rank": selected["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": selected["cp"],
+                    "reason": (
+                        f"MATE FORCE | "
+                        f"M{selected['mate']} "
+                        f"RANK=#"
+                        f"{selected['rank'] + 1}"
+                    )
+                }
             )
-        else:
-            mate_pool = [
-                candidate for candidate in candidates
-                if candidate["mate"] is not None
-                and int(candidate["mate"]) == best_mate
+
+        # The human-like mate window remains M5-M15. Outside that window,
+        # keep the existing direct #1 behavior.
+        if not (
+            MATE_GRACE_MIN
+            <= best["mate"]
+            <= MATE_GRACE_MAX
+        ):
+            _mate_progress_target_mate = None
+            _mate_progress_hold_moves = 0
+            _mate_progress_hold_limit = MATE_SUSTAIN_MIN_MOVES
+
+            selected = best
+
+            return (
+                selected["move"],
+                selected["info"],
+                {
+                    "rank": selected["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": selected["cp"],
+                    "reason": (
+                        f"MATE #1 | "
+                        f"M{selected['mate']} "
+                        f"RANK=#"
+                        f"{selected['rank'] + 1}"
+                    )
+                }
+            )
+
+        # Start/recover the sustained mate target. The target represents the
+        # mate level the bot is currently willing to play around. It can move
+        # faster only one step at a time; it may move slower when the actual
+        # engine mate itself has become slower because the opponent defended.
+        if _mate_progress_target_mate is None:
+            _mate_progress_target_mate = best["mate"]
+            _mate_progress_hold_moves = 0
+            _mate_progress_hold_limit = random.randint(
+                MATE_SUSTAIN_MIN_MOVES,
+                MATE_SUSTAIN_MAX_MOVES
+            )
+        elif best["mate"] > _mate_progress_target_mate:
+            _mate_progress_target_mate = best["mate"]
+            _mate_progress_hold_moves = 0
+            _mate_progress_hold_limit = random.randint(
+                MATE_SUSTAIN_MIN_MOVES,
+                MATE_SUSTAIN_MAX_MOVES
+            )
+        elif best["mate"] < _mate_progress_target_mate:
+            # Do not follow M10 -> M9 -> M8 immediately. Hold the current
+            # target for a few moves first, then improve it by exactly one.
+            _mate_progress_hold_moves += 1
+
+            if (
+                _mate_progress_hold_moves
+                >= _mate_progress_hold_limit
+            ):
+                _mate_progress_target_mate = max(
+                    MATE_GRACE_MIN,
+                    _mate_progress_target_mate - 1
+                )
+                _mate_progress_hold_moves = 0
+                _mate_progress_hold_limit = random.randint(
+                    MATE_SUSTAIN_MIN_MOVES,
+                    MATE_SUSTAIN_MAX_MOVES
+                )
+
+        target_mate = int(
+            _mate_progress_target_mate
+        )
+
+        # Never jump multiple mate steps in a single decision. The active
+        # target is the anchor; one slower line is allowed to preserve a
+        # natural sustain feel, but it cannot become an accumulating +5 cap.
+        allowed_mate_max = target_mate + 1
+
+        mate_candidates = [
+            c
+            for c in candidates
+            if (
+                c["mate"] is not None
+                and c["mate"] > 0
+                and target_mate
+                <= c["mate"]
+                <= allowed_mate_max
+            )
+        ]
+
+        # If the engine's current best mate is already faster than the target
+        # but no exact target line exists, allow the current best only when
+        # the target has caught up to that one-step improvement. Otherwise
+        # keep the slower candidate to sustain the plan.
+        if not mate_candidates:
+            exact_best = [
+                c
+                for c in candidates
+                if (
+                    c["mate"] is not None
+                    and c["mate"] == best["mate"]
+                )
             ]
-        if not mate_pool:
-            mate_pool = [best]
-        selected = random.choice(mate_pool)
-        _record_rank_selection(selected["rank"])
+
+            if exact_best:
+                selected = max(
+                    exact_best,
+                    key=lambda c: c["rank"]
+                )
+
+                return (
+                    selected["move"],
+                    selected["info"],
+                    {
+                        "rank": selected["rank"],
+                        "current_cp": best_cp,
+                        "selected_cp": selected["cp"],
+                        "reason": (
+                            f"MATE ADAPT | "
+                            f"TARGET=M{target_mate} "
+                            f"BEST=M{best['mate']} "
+                            f"SELECTED=M{selected['mate']} "
+                            f"RANK=#"
+                            f"{selected['rank'] + 1}"
+                        )
+                    }
+                )
+
+            selected = best
+
+            return (
+                selected["move"],
+                selected["info"],
+                {
+                    "rank": selected["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": selected["cp"],
+                    "reason": (
+                        f"MATE BEST | "
+                        f"TARGET=M{target_mate} "
+                        f"BEST=M{best['mate']} "
+                        f"RANK=#"
+                        f"{selected['rank'] + 1}"
+                    )
+                }
+            )
+
+        exact_target = [
+            c
+            for c in mate_candidates
+            if c["mate"] == target_mate
+        ]
+
+        slower_target = [
+            c
+            for c in mate_candidates
+            if c["mate"] == allowed_mate_max
+        ]
+
+        if exact_target:
+            # Same mate distance: keep the earlier rule—take the lowest
+            # MultiPV line, e.g. #1 M6/#2 M6/#3 M6 -> #3.
+            selected = max(
+                exact_target,
+                key=lambda c: c["rank"]
+            )
+
+            # Occasionally sustain with the one-step slower mate when it is
+            # available, but never jump several mate moves at once.
+            if (
+                slower_target
+                and random.random() < MATE_SLOWER_LINE_CHANCE
+            ):
+                selected = max(
+                    slower_target,
+                    key=lambda c: c["rank"]
+                )
+        else:
+            selected = max(
+                slower_target,
+                key=lambda c: c["rank"]
+            )
+
         return (
-            selected["move"], selected["info"],
+            selected["move"],
+            selected["info"],
             {
                 "rank": selected["rank"],
                 "current_cp": best_cp,
                 "selected_cp": selected["cp"],
-                "source": "MATE_CONVERSION",
                 "reason": (
-                    f"MATE CONVERSION | BEST=M{best_mate} "
-                    f"SELECTED=M{selected['mate']} RANK=#{selected['rank'] + 1}"
-                ),
-            },
+                    f"MATE SUSTAIN | "
+                    f"TARGET=M{target_mate} "
+                    f"BEST=M{best['mate']} "
+                    f"SELECTED=M{selected['mate']} "
+                    f"HOLD={_mate_progress_hold_moves}/"
+                    f"{_mate_progress_hold_limit} "
+                    f"RANK=#"
+                    f"{selected['rank'] + 1}"
+                )
+            }
         )
 
-    # Do not let conversion priorities override a defensive line when
-    # Stockfish reports a forced mate against us.
-    forced_loss_position = (
-        best["mate"] is not None
-        and best["mate"] < 0
-    )
-
-    # Convert an extra pawn when a queen promotion is genuinely
-    # available. Promotion is a stronger conversion priority than
-    # wandering/shuffling, including in equal/losing positions.
-    priority_promotion = None
-    if not forced_loss_position:
+    if best_cp > MIN_POSITIVE_CP:
+        # Convert an extra pawn when a queen promotion is genuinely
+        # available. Promotion is a stronger conversion priority than
+        # wandering/shuffling in a winning position.
         priority_promotion = find_priority_queen_promotion(
             board,
             candidates,
             best_cp
         )
 
-    if priority_promotion is not None:
-        return (
-            priority_promotion["move"],
-            priority_promotion["info"],
-            {
-                "rank": priority_promotion["rank"],
-                "current_cp": best_cp,
-                "selected_cp": priority_promotion["cp"],
-                "source": "QUEEN_PROMOTION",
-                "reason": (
-                    f"{priority_promotion['reason_tag']} | "
-                    f"TARGET={chess.square_name(priority_promotion['move'].to_square)}"
-                )
-            }
-        )
+        if priority_promotion is not None:
+            return (
+                priority_promotion["move"],
+                priority_promotion["info"],
+                {
+                    "rank": priority_promotion["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": priority_promotion["cp"],
+                    "source": "QUEEN_PROMOTION",
+                    "reason": (
+                        f"{priority_promotion['reason_tag']} | "
+                        f"TARGET={chess.square_name(priority_promotion['move'].to_square)}"
+                    )
+                }
+            )
 
-    # Before normal fuzzy selection, prefer safe captures so "human-like"
-    # does not become "wander around while a free piece is hanging".
-    priority_capture = None
-    if not forced_loss_position:
+        # Before normal fuzzy selection, prefer safe captures so "human-like"
+        # does not become "wander around while a free piece is hanging".
         priority_capture = find_priority_capture(
             board,
             candidates,
             best_cp,
-            engine=engine,
-            safety_time_limit=0.008 if low_clock_mode else 0.025,
-            free_capture_check_limit=1 if low_clock_mode else 3,
+            engine=engine
         )
 
-    if priority_capture is not None:
-        return (
-            priority_capture["move"],
-            priority_capture["info"],
-            {
-                "rank": priority_capture["rank"],
-                "current_cp": best_cp,
-                "selected_cp": priority_capture["cp"],
-                "source": "CAPTURE_PRIORITY",
-                "reason": (
-                    f"{priority_capture['reason_tag']} | "
-                    f"TARGET={chess.square_name(priority_capture['move'].to_square)} "
-                    f"VICTIM={priority_capture['victim_value']/100:.1f} "
-                    f"{'FREE' if priority_capture['free'] else 'LIQUIDATION'}"
+        if priority_capture is not None:
+            return (
+                priority_capture["move"],
+                priority_capture["info"],
+                {
+                    "rank": priority_capture["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": priority_capture["cp"],
+                    "source": "CAPTURE_PRIORITY",
+                    "reason": (
+                        f"{priority_capture['reason_tag']} | "
+                        f"TARGET={chess.square_name(priority_capture['move'].to_square)} "
+                        f"VICTIM={priority_capture['victim_value']/100:.1f} "
+                        f"{'FREE' if priority_capture['free'] else 'LIQUIDATION'}"
+                    )
+                }
+            )
+
+        normal_max_drop = safe_drop_fraction(
+            best_cp
+        )
+
+        max_drop = min(
+            normal_max_drop,
+            adaptive_max_drop
+        )
+
+        floor_cp = max(
+            5,
+            int(
+                best_cp
+                * (
+                    1.0
+                    - max_drop
                 )
-            }
+            )
         )
 
-    # Quality-first weighted choice. Variation is permitted only among moves
-    # with a close evaluation and no obvious material giveaway. There is no
-    # forced non-best percentage, rank-streak rule, or periodic advantage target.
-    if best["mate"] is not None and best["mate"] < 0:
-        losing_floor = best_cp - (18 if low_clock_mode else 35)
-        losing_mates = [
-            candidate for candidate in candidates
-            if candidate["mate"] is not None
-            and int(candidate["mate"]) < 0
-            and candidate["cp"] >= losing_floor
-            and candidate["rank"] <= (4 if low_clock_mode else 8)
+        global _advantage_progress_target_cp
+        global _advantage_progress_hold_moves
+        global _advantage_progress_hold_limit
+        global _advantage_progress_side
+
+        advantage_mode = False
+        advantage_maintain = False
+        advantage_growth = False
+        advantage_target_cp = None
+
+        if best_cp < HUMAN_ADVANTAGE_START_CP:
+            _advantage_progress_target_cp = None
+            _advantage_progress_hold_moves = 0
+            _advantage_progress_hold_limit = random.randint(
+                HUMAN_ADVANTAGE_HOLD_MIN_MOVES,
+                HUMAN_ADVANTAGE_HOLD_MAX_MOVES
+            )
+            _advantage_progress_side = None
+
+        else:
+            if _advantage_progress_side != mover:
+                _advantage_progress_target_cp = None
+                _advantage_progress_hold_moves = 0
+                _advantage_progress_hold_limit = random.randint(
+                    HUMAN_ADVANTAGE_HOLD_MIN_MOVES,
+                    HUMAN_ADVANTAGE_HOLD_MAX_MOVES
+                )
+                _advantage_progress_side = mover
+
+            if _advantage_progress_target_cp is None:
+                _advantage_progress_target_cp = best_cp
+                _advantage_progress_hold_moves = 0
+                _advantage_progress_hold_limit = random.randint(
+                    HUMAN_ADVANTAGE_HOLD_MIN_MOVES,
+                    HUMAN_ADVANTAGE_HOLD_MAX_MOVES
+                )
+
+            # Do not lower the stored winning target for a small evaluation
+            # fluctuation. Only reset it when the engine's best itself has
+            # fallen materially below the protected winning level.
+            if (
+                best_cp
+                < _advantage_progress_target_cp
+                - HUMAN_ADVANTAGE_PROTECT_BAND_CP
+            ):
+                _advantage_progress_target_cp = best_cp
+                _advantage_progress_hold_moves = 0
+
+            advantage_target_cp = int(
+                _advantage_progress_target_cp
+            )
+
+            advantage_mode = True
+
+            # Every few actual Stockfish moves, make a progress move. This is
+            # independent of whether the evaluation changed on the previous
+            # move, so the bot cannot sit on +6.0 for dozens of moves simply
+            # because the short engine scores happen to repeat.
+            _advantage_progress_hold_moves += 1
+
+            progress_due = (
+                _advantage_progress_hold_moves
+                >= _advantage_progress_hold_limit
+                or
+                best_cp
+                >= advantage_target_cp
+                + HUMAN_ADVANTAGE_GROWTH_TRIGGER_CP
+                or
+                opponent_pressure
+            )
+
+            if progress_due:
+                # If the position genuinely improved, advance only a small
+                # step toward the new best instead of jumping straight there.
+                if best_cp > advantage_target_cp + 10:
+                    growth_step = random.randint(
+                        HUMAN_ADVANTAGE_GROWTH_STEP_MIN_CP,
+                        HUMAN_ADVANTAGE_GROWTH_STEP_MAX_CP
+                    )
+
+                    _advantage_progress_target_cp = min(
+                        best_cp,
+                        advantage_target_cp + growth_step
+                    )
+                    advantage_target_cp = int(
+                        _advantage_progress_target_cp
+                    )
+                    advantage_growth = True
+
+                else:
+                    # Even without a visible CP jump, deliberately use a
+                    # stronger move from the current safe top end so the game
+                    # keeps developing instead of repeating a passive hold.
+                    advantage_growth = True
+
+                _advantage_progress_hold_moves = 0
+                _advantage_progress_hold_limit = random.randint(
+                    HUMAN_ADVANTAGE_HOLD_MIN_MOVES,
+                    HUMAN_ADVANTAGE_HOLD_MAX_MOVES
+                )
+            else:
+                advantage_maintain = True
+
+            # Protect the current winning advantage. +6 should not casually
+            # fall toward +4 just because a lower MultiPV move exists.
+            floor_cp = max(
+                floor_cp,
+                int(
+                    advantage_target_cp
+                    - HUMAN_ADVANTAGE_PROTECT_BAND_CP
+                )
+            )
+        # Keep the original safety floor for winning positions, but in
+        # normal/early play allow a small extra human-like evaluation band.
+        selection_floor_cp = floor_cp
+
+        winning_guard = (
+            best_cp >= HUMAN_WINNING_GUARD_START_CP
+        )
+
+        if not advantage_mode:
+            selection_floor_cp = max(
+                5,
+                floor_cp - HUMAN_SELECTION_EXTRA_DROP_CP
+            )
+
+        # Once ahead, keep human-like variation inside a tight evaluation
+        # band. The old 70cp extra drop could turn a winning position into
+        # equality for the sake of rank shuffling.
+        if winning_guard:
+            winning_drop_floor = max(
+                5,
+                best_cp - HUMAN_WINNING_GUARD_MAX_DROP_CP
+            )
+            selection_floor_cp = max(
+                selection_floor_cp,
+                winning_drop_floor
+            )
+
+        winning_rank_cap = (
+            HUMAN_STRONG_WINNING_RANK_CAP
+            if best_cp >= HUMAN_STRONG_WINNING_CP
+            else HUMAN_WINNING_GUARD_RANK_CAP
+        )
+
+        effective_rank_cap = (
+            min(adaptive_max_rank, winning_rank_cap)
+            if winning_guard
+            else adaptive_max_rank
+        )
+
+        safe = [
+            c
+            for c in candidates
+            if (
+                c["cp"] >= selection_floor_cp
+                and c["cp"] > 0
+                and c["rank"] <= effective_rank_cap
+                and (
+                    not winning_guard
+                    or not candidate_hangs_own_piece(
+                        board,
+                        c["move"]
+                    )
+                )
+            )
         ]
-        safe_losing_mates = [
-            candidate for candidate in losing_mates
-            if not candidate_hangs_own_piece(board, candidate["move"])
+
+        if not safe:
+            safe = [best]
+
+        if not safe:
+            safe = [best]
+
+        non_best = [
+            c
+            for c in safe
+            if c["rank"] > 0
         ]
-        selection_pool = safe_losing_mates or losing_mates or [best]
-        weights = [
-            (1.0 / (1.0 + max(0, best_cp - candidate["cp"]) / 18.0))
-            * (1.0 / (1.0 + int(candidate["rank"]) * 0.09))
-            for candidate in selection_pool
+
+        non_best_chance = (
+            HUMAN_STRONG_WINNING_NON_BEST_CHANCE
+            if best_cp >= HUMAN_STRONG_WINNING_CP
+            else HUMAN_WINNING_NON_BEST_CHANCE
+            if winning_guard
+            else HUMAN_SELECTION_NON_BEST_CHANCE
+        )
+
+        if (
+            len(non_best) >= 2
+            and random.random() < non_best_chance
+        ):
+            pool = non_best
+        else:
+            pool = safe
+
+        roll = random.random()
+
+        if roll < 0.45:
+            target_drop = random.uniform(
+                0.00,
+                max_drop * 0.35
+            )
+
+        elif roll < 0.78:
+            target_drop = random.uniform(
+                max_drop * 0.35,
+                max_drop * 0.70
+            )
+
+        elif roll < 0.95:
+            target_drop = random.uniform(
+                max_drop * 0.70,
+                max_drop * 0.90
+            )
+
+        else:
+            target_drop = random.uniform(
+                max_drop * 0.90,
+                max_drop
+            )
+
+        desired_cp = max(
+            floor_cp,
+            int(
+                best_cp
+                * (
+                    1.0
+                    - target_drop
+                )
+            )
+        )
+
+        if advantage_mode:
+            if advantage_maintain:
+                desired_cp = min(
+                    best_cp,
+                    max(
+                        floor_cp,
+                        int(
+                            advantage_target_cp
+                            + random.uniform(
+                                -HUMAN_ADVANTAGE_MAINTAIN_BAND_CP * 0.20,
+                                HUMAN_ADVANTAGE_MAINTAIN_BAND_CP * 0.20
+                            )
+                        )
+                    )
+                )
+            else:
+                growth_preference_cp = random.randint(
+                    HUMAN_ADVANTAGE_GROWTH_PREFERENCE_MIN_CP,
+                    HUMAN_ADVANTAGE_GROWTH_PREFERENCE_MAX_CP
+                )
+                desired_cp = min(
+                    best_cp,
+                    max(
+                        floor_cp,
+                        int(
+                            advantage_target_cp
+                            + growth_preference_cp
+                        )
+                    )
+                )
+
+        if advantage_mode:
+            if advantage_growth:
+                # Progress moves must still feel human-like. Do not collapse
+                # the pool to only the top few centipawn lines: that makes
+                # advantage growth select #1 repeatedly. Keep every safe
+                # MultiPV=15 candidate available and let the fuzzy rank/score
+                # weighting decide among them.
+                growth_pool = [
+                    c
+                    for c in safe
+                    if c["cp"] >= floor_cp
+                ]
+
+                if growth_pool:
+                    pool = growth_pool
+                else:
+                    pool = safe
+            else:
+                maintain_min = max(
+                    floor_cp,
+                    int(
+                        advantage_target_cp
+                        - HUMAN_ADVANTAGE_MAINTAIN_BAND_CP
+                    )
+                )
+
+                maintain_pool = [
+                    c
+                    for c in safe
+                    if (
+                        c["cp"] >= maintain_min
+                        and c["cp"] <= best_cp
+                    )
+                ]
+
+                if maintain_pool:
+                    pool = maintain_pool
+
+        if advantage_mode and advantage_growth:
+            # Keep #1/#2 available, but spread lower-rank preference instead
+            # of making #3 the default. Growth remains protected by the CP
+            # preference above.
+            rank_factors = {
+                0: 0.50,
+                1: 0.62,
+                2: 0.82,
+                3: 1.06,
+                4: 1.15,
+                5: 1.16,
+                6: 1.14,
+                7: 1.11,
+                8: 1.08,
+                9: 1.05,
+                10: 1.02,
+                11: 1.00,
+                12: 0.98,
+                13: 0.96,
+                14: 0.94,
+            }
+        else:
+            # Spread the lower-rank preference across #3-#8 so #3 does not
+            # become the default answer when several safe choices exist.
+            rank_factors = {
+                0: 0.55,
+                1: 0.68,
+                2: 0.82,
+                3: 1.06,
+                4: 1.15,
+                5: 1.16,
+                6: 1.14,
+                7: 1.11,
+                8: 1.08,
+                9: 1.05,
+                10: 1.02,
+                11: 1.00,
+                12: 0.98,
+                13: 0.96,
+                14: 0.94,
+            }
+
+        lower_rank_pool = [
+            candidate
+            for candidate in pool
+            if candidate["rank"] >= 2
         ]
-        selected = random.choices(selection_pool, weights=weights, k=1)[0]
-        _record_rank_selection(selected["rank"])
+
+        # If the normal safety/evaluation band leaves fewer than three
+        # candidates, do NOT let the fuzzy draw collapse back to #1/#2.
+        # Build a slightly wider lower-rank-only pool using the same engine
+        # candidates and the same rank cap. The extra band is small and is
+        # used only to create human-like choice diversity.
+        diversity_floor_cp = max(
+            5,
+            int(
+                best_cp
+                * (
+                    1.0
+                    - min(
+                        0.28,
+                        max_drop
+                        + HUMAN_SELECTION_DIVERSITY_EXTRA_DROP
+                    )
+                )
+            )
+        )
+
+        diversity_lower_pool = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate["rank"] >= 2
+                and candidate["rank"] <= effective_rank_cap
+                and candidate["cp"] >= diversity_floor_cp
+                and candidate["cp"] > 0
+                and (
+                    not winning_guard
+                    or not candidate_hangs_own_piece(
+                        board,
+                        candidate["move"]
+                    )
+                )
+            )
+        ]
+
+        if (
+            diversity_lower_pool
+            and (
+                len(pool) <= 1
+                or not lower_rank_pool
+            )
+        ):
+            selection_pool = diversity_lower_pool
+        else:
+            selection_pool = (
+                lower_rank_pool
+                if (
+                    lower_rank_pool
+                    and random.random() > HUMAN_SELECTION_TOP12_MAX_CHANCE
+                )
+                else pool
+            )
+
+        weighted = []
+
+        for candidate in selection_pool:
+            distance = abs(
+                candidate["cp"]
+                - desired_cp
+            )
+
+            weight = (
+                1.0
+                / (
+                    1.0
+                    + distance / (
+                        HUMAN_SELECTION_DISTANCE_CP
+                        * (
+                            1.35
+                            if advantage_mode
+                            else 1.0
+                        )
+                    )
+                )
+            )
+
+            weight *= (
+                rank_factors.get(
+                    candidate["rank"],
+                    0.45
+                )
+            )
+
+            weighted.append(
+                (
+                    candidate,
+                    max(
+                        0.01,
+                        weight
+                    )
+                )
+            )
+
+        total = sum(
+            weight
+            for _, weight
+            in weighted
+        )
+
+        pick = random.uniform(
+            0,
+            total
+        )
+
+        running = 0.0
+        selected = weighted[0][0]
+
+        for candidate, weight in weighted:
+            running += weight
+
+            if pick <= running:
+                selected = candidate
+                break
+
         return (
-            selected["move"], selected["info"],
+            selected["move"],
+            selected["info"],
             {
                 "rank": selected["rank"],
                 "current_cp": best_cp,
                 "selected_cp": selected["cp"],
                 "reason": (
-                    "best defensive score | "
-                    f"BEST={best_cp/100:+.2f} "
-                    f"SELECTED={selected['cp']/100:+.2f} "
-                    f"RANK=#{selected['rank'] + 1}"
-                ),
-            },
+                    (
+                        "advantage growth"
+                        if advantage_mode and advantage_growth
+                        else "advantage maintain"
+                        if advantage_mode
+                        else "controlled shuffle"
+                    )
+                    + " | "
+                    + f"BEST={best_cp/100:+.2f} "
+                    + f"SELECTED={selected['cp']/100:+.2f} "
+                    + f"RANK=#{selected['rank'] + 1} "
+                    + f"FLOOR={floor_cp/100:+.2f} "
+                    + f"MAX_DROP={max_drop*100:.1f}% "
+                    + f"OPP="
+                    f"{profile['opponent_accuracy'] if profile['opponent_accuracy'] is not None else 0.0:.1f}% "
+                    f"TARGET="
+                    f"{profile['target_accuracy']:.1f}% "
+                    f"RANKCAP=#"
+                    f"{adaptive_max_rank + 1}"
+                )
+            }
         )
 
-    if best_cp >= 100:
-        allowed_drop_fraction = min(
-            safe_drop_fraction(best_cp), adaptive_max_drop
-        )
-        max_drop_cp = max(18, int(best_cp * allowed_drop_fraction))
-        if best_cp >= HUMAN_WINNING_GUARD_START_CP:
-            max_drop_cp = min(max_drop_cp, HUMAN_WINNING_GUARD_MAX_DROP_CP)
-        if best_cp >= HUMAN_STRONG_WINNING_CP:
-            max_drop_cp = min(max_drop_cp, 35)
-        selection_floor_cp = max(5, best_cp - max_drop_cp)
-    else:
-        max_drop_cp = 65
-        try:
-            accuracy = float(opponent_accuracy) if opponent_accuracy is not None else None
-        except (TypeError, ValueError):
-            accuracy = None
-        if accuracy is not None and accuracy >= 90.0:
-            max_drop_cp = 45
-        elif accuracy is not None and accuracy >= 80.0:
-            max_drop_cp = 55
-        if low_clock_mode:
-            max_drop_cp = min(max_drop_cp, 35)
-        selection_floor_cp = best_cp - max_drop_cp
+    near_equal_floor = (
+        best_cp - 20
+    )
 
-    rank_cap = min(adaptive_max_rank, 4 if low_clock_mode else 8)
-    in_band = [
-        candidate for candidate in candidates
+    safe = [
+        c
+        for c in candidates
         if (
-            candidate["rank"] <= rank_cap
-            and candidate["cp"] >= selection_floor_cp
-            and (best_cp < 100 or candidate["cp"] > 0)
+            c["cp"] >= near_equal_floor
+            and c["rank"] <= adaptive_max_rank
         )
     ]
-    safe_pool = [
-        candidate for candidate in in_band
-        if not candidate_hangs_own_piece(board, candidate["move"])
+
+    if not safe:
+        safe = [best]
+
+    rank_weights = {
+        0: 0.85,
+        1: 0.90,
+        2: 0.98,
+        3: 1.04,
+        4: 1.08,
+        5: 1.10,
+        6: 1.08,
+        7: 1.06,
+        8: 1.04,
+        9: 1.02,
+        10: 1.00,
+        11: 0.98,
+        12: 0.96,
+        13: 0.94,
+        14: 0.92,
+    }
+
+    lower_rank_safe = [
+        candidate
+        for candidate in safe
+        if candidate["rank"] >= 2
     ]
 
-    if not safe_pool:
-        material_safe = [
-            candidate for candidate in candidates
-            if not candidate_hangs_own_piece(board, candidate["move"])
-        ]
-        safe_pool = (
-            [max(material_safe, key=lambda candidate: candidate["cp"])]
-            if material_safe else [best]
+    selection_safe = (
+        lower_rank_safe
+        if (
+            lower_rank_safe
+            and random.random() > HUMAN_SELECTION_TOP12_MAX_CHANCE
+        )
+        else safe
+    )
+
+    weighted = []
+
+    for candidate in selection_safe:
+        weighted.append(
+            (
+                candidate,
+                rank_weights.get(
+                    candidate["rank"],
+                    0.3
+                )
+            )
         )
 
-    # Evaluation loss dominates rank: close alternatives remain possible, but
-    # a clear win and low time both bias more strongly toward the best line.
-    if low_clock_mode:
-        score_scale = 15.0
-    elif best_cp >= HUMAN_STRONG_WINNING_CP:
-        score_scale = 19.0
-    elif best_cp >= 100:
-        score_scale = 26.0
-    else:
-        score_scale = 38.0
-    try:
-        if opponent_accuracy is not None and float(opponent_accuracy) >= 90.0:
-            score_scale *= 0.80
-        elif opponent_accuracy is not None and float(opponent_accuracy) < 70.0:
-            score_scale *= 1.10
-    except (TypeError, ValueError):
-        pass
+    total = sum(
+        weight
+        for _, weight
+        in weighted
+    )
 
-    weights = []
-    for candidate in safe_pool:
-        cp_loss = max(0, best_cp - int(candidate["cp"]))
-        rank = max(0, int(candidate["rank"]))
-        evaluation_weight = 1.0 / (1.0 + cp_loss / score_scale)
-        rank_weight = 1.0 / (1.0 + rank * 0.09)
-        weights.append(evaluation_weight * rank_weight)
+    pick = random.uniform(
+        0,
+        total
+    )
 
-    selected = random.choices(safe_pool, weights=weights, k=1)[0]
-    _record_rank_selection(selected["rank"])
+    running = 0.0
+    selected = weighted[0][0]
+
+    for candidate, weight in weighted:
+        running += weight
+
+        if pick <= running:
+            selected = candidate
+            break
+
     return (
-        selected["move"], selected["info"],
+        selected["move"],
+        selected["info"],
         {
             "rank": selected["rank"],
             "current_cp": best_cp,
             "selected_cp": selected["cp"],
             "reason": (
-                "quality-weighted safe choice | "
-                f"BEST={best_cp/100:+.2f} "
-                f"SELECTED={selected['cp']/100:+.2f} "
-                f"DROP={max(0, best_cp - selected['cp'])/100:.2f} "
-                f"RANK=#{selected['rank'] + 1} "
-                f"POOL={len(safe_pool)} "
-                f"OPP={profile['opponent_accuracy'] if profile['opponent_accuracy'] is not None else 'warmup'}"
-            ),
-        },
+                f"near-equal shuffle | "
+                f"BEST="
+                f"{best_cp/100:+.2f} "
+                f"SELECTED="
+                f"{selected['cp']/100:+.2f} "
+                f"RANK=#"
+                f"{selected['rank'] + 1}"
+            )
+        }
     )
-
