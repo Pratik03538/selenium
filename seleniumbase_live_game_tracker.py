@@ -3327,10 +3327,8 @@ def choose_low_clock_conversion_premove(
             chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
             chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 20000,
         }
-        allow_promotion = getattr(args, "move_input", "api") != "cursor"
+        # The guarded cursor drag can queue promotions on the configured site.
         for move in hypothetical.legal_moves:
-            if move.promotion is not None and not allow_promotion:
-                continue
             is_promotion = move.promotion is not None
             is_capture = hypothetical.is_capture(move)
             if not (is_promotion or is_capture or hypothetical.gives_check(move)):
@@ -3449,8 +3447,7 @@ def choose_low_clock_likely_reply_premove(
             move = pv[0]
             if move not in hypothetical.legal_moves or move.uci() in seen:
                 continue
-            if move.promotion is not None and getattr(args, "move_input", "api") == "cursor":
-                continue
+            # Guarded cursor promotion premoves are supported on the configured site.
             # Reject an immediate, uncompensated material loss after this premove.
             if strategy_module.candidate_hangs_own_piece(hypothetical, move):
                 continue
@@ -3585,11 +3582,8 @@ def choose_mate_phase_premove(
             return None, predicted_reply, "mate-premove-no-mating-follow-up"
 
         mate_candidates = []
-        cursor_input = getattr(args, "move_input", "api") == "cursor"
         for rank, info in enumerate(own_lines):
             move = info["pv"][0]
-            if move.promotion is not None and cursor_input:
-                continue
             after_move = hypothetical.copy(stack=True)
             after_move.push(move)
             mate_distance = 0 if after_move.is_checkmate() else _premove_mate_distance_for_bot(info, bot_color)
