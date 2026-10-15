@@ -12,9 +12,12 @@ import argparse
 import csv
 import json
 import ipaddress
+import io
 import re
 import random
+import shutil
 import subprocess
+import zipfile
 import sys
 import threading
 import time
@@ -1003,47 +1006,164 @@ def target_matches(url: str | None, allowed_host: str) -> bool:
     return host == allowed_host or host.endswith("." + allowed_host)
 
 
-def resolve_chromedriver_with_timeout(timeout_seconds: float = 45.0):
-    """Resolve ChromeDriver in a killable subprocess instead of hiding Selenium Manager inside webdriver.Chrome."""
-    try:
-        manager_binary = str(SeleniumManager._get_binary())
-    except Exception as exc:
-        return None, f"manager_binary:{type(exc).__name__}"
-
-    command = [
-        manager_binary,
-        "--browser", "chrome",
-        "--language-binding", "python",
-        "--output", "json",
-    ]
+def _driver_major_version(driver_path: Path) -> int | None:
     try:
         completed = subprocess.run(
-            command,
+            [str(driver_path), "--version"],
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=timeout_seconds,
+            timeout=3.0,
             check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-    except subprocess.TimeoutExpired:
-        return None, "manager_timeout"
-    except Exception as exc:
-        return None, f"manager_launch:{type(exc).__name__}"
+    except Exception:
+        return None
+    match = re.search(r"ChromeDriver\\s+(\\d+)", completed.stdout + " " + completed.stderr)
+    return int(match.group(1)) if match else None
 
+
+def _find_cached_chromedriver(browser_major: int) -> Path | None:
+    candidates: set[Path] = set()
+    in_path = shutil.which("chromedriver.exe") or shutil.which("chromedriver")
+    if in_path:
+        candidates.add(Path(in_path))
+
+    home = Path.home()
+    cache_roots = (
+        home / ".cache" / "selenium" / "chromedriver",
+        home / ".wdm" / "drivers" / "chromedriver",
+    )
+    for root in cache_roots:
+        if root.is_dir():
+            try:
+                candidates.update(path for path in root.rglob("chromedriver.exe") if path.is_file())
+                candidates.update(path for path in root.rglob("chromedriver") if path.is_file())
+            except OSError:
+                continue
+
+    # Prefer the most recently modified candidate; every candidate is version-checked.
+    for candidate in sorted(candidates, key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True):
+        if _driver_major_version(candidate) == browser_major:
+            return candidate
+    return None
+
+
+def _download_matching_chromedriver(browser_version: str) -> tuple[Path | None, str | None]:
+    """Download the ChromeDriver matching the browser's MAJOR.MINOR.BUILD from official CfT metadata."""
+    version = browser_version.rsplit("/", 1)[-1].strip()
+    parts = version.split(".")
+    if len(parts) < 3 or not all(part.isdigit() for part in parts[:3]):
+        return None, "browser_version_unavailable"
+    build_key = ".".join(parts[:3])
+    metadata_url = "https://googlechromelabs.github.io/chrome-for-testing/latest-patch-versions-per-build.json"
     try:
-        payload = json.loads(completed.stdout or "{}")
-        result = payload.get("result", {})
-        driver_path = str(result.get("driver_path") or "").strip()
-    except (AttributeError, TypeError, json.JSONDecodeError):
-        return None, "manager_invalid_output"
+        with urlopen(metadata_url, timeout=6.0) as response:
+            metadata = json.loads(response.read().decode("utf-8", errors="replace"))
+        driver_version = str(metadata.get("builds", {}).get(build_key, {}).get("version") or "")
+        if not driver_version:
+            return None, "matching_build_not_published"
+        platform_name = "win64" if sys.maxsize > 2**32 else "win32"
+        archive_url = (
+            f"https://storage.googleapis.com/chrome-for-testing-public/"
+            f"{driver_version}/{platform_name}/chromedriver-{platform_name}.zip"
+        )
+        with urlopen(archive_url, timeout=12.0) as response:
+            archive_bytes = response.read()
+        with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
+            member = next(
+                (name for name in archive.namelist()
+                 if name.replace("\\\\", "/").endswith("/chromedriver.exe")
+                 or name == "chromedriver.exe"),
+                None,
+            )
+            if member is None:
+                return None, "driver_archive_invalid"
+            driver_bytes = archive.read(member)
+    except Exception as exc:
+        return None, f"official_download:{type(exc).__name__}"
 
-    if completed.returncode != 0:
-        return None, f"manager_exit:{completed.returncode}"
-    if not driver_path or not Path(driver_path).is_file():
-        return None, "driver_path_missing"
-    return Path(driver_path), None
+    cache_dir = Path.home() / ".cache" / "selenium" / "chromedriver" / platform_name / driver_version
+    driver_path = cache_dir / "chromedriver.exe"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        driver_path.write_bytes(driver_bytes)
+    except OSError:
+        return None, "driver_cache_write_failed"
+    if _driver_major_version(driver_path) != int(parts[0]):
+        return None, "downloaded_driver_version_mismatch"
+    return driver_path, None
+
+
+def resolve_chromedriver_with_timeout(timeout_seconds: float = 12.0, browser_version: str = ""):
+    """Resolve a compatible ChromeDriver from cache, Selenium Manager, or official Chrome for Testing."""
+    version = browser_version.rsplit("/", 1)[-1].strip()
+    major_match = re.match(r"(\\d+)", version)
+    if not major_match:
+        return None, "browser_version_unavailable"
+    browser_major = int(major_match.group(1))
+
+    print("[CONNECT] Checking local ChromeDriver cache...", flush=True)
+    cached_driver = _find_cached_chromedriver(browser_major)
+    if cached_driver is not None:
+        print("[CONNECT] Compatible cached ChromeDriver found.", flush=True)
+        return cached_driver, None
+
+    print("[CONNECT] Trying Selenium Manager with a short network timeout...", flush=True)
+    try:
+        manager_binary = str(SeleniumManager._get_binary())
+    except Exception as exc:
+        manager_binary = ""
+        manager_error = f"manager_binary:{type(exc).__name__}"
+    else:
+        manager_error = "manager_unresolved"
+
+    if manager_binary:
+        command = [
+            manager_binary,
+            "--browser", "chrome",
+            "--language-binding", "python",
+            "--output", "json",
+            "--timeout", "8",
+            "--avoid-stats",
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            try:
+                payload = json.loads(completed.stdout or "{}")
+                result = payload.get("result", {})
+                driver_path = Path(str(result.get("driver_path") or "").strip())
+            except (AttributeError, TypeError, json.JSONDecodeError):
+                driver_path = Path()
+            if (
+                completed.returncode == 0
+                and str(driver_path) not in {"", "."}
+                and driver_path.is_file()
+                and _driver_major_version(driver_path) == browser_major
+            ):
+                return driver_path, None
+            manager_error = f"manager_exit:{completed.returncode}"
+        except subprocess.TimeoutExpired:
+            manager_error = "manager_timeout"
+        except Exception as exc:
+            manager_error = f"manager_launch:{type(exc).__name__}"
+
+    print("[CONNECT] Trying the official Chrome for Testing driver download...", flush=True)
+    downloaded_driver, download_error = _download_matching_chromedriver(version)
+    if downloaded_driver is not None:
+        return downloaded_driver, None
+
+    return None, f"{manager_error};{download_error}"
 
 
 def attach_to_chrome_with_timeout(
@@ -4178,13 +4298,11 @@ def main() -> int:
         options.debugger_address = args.debugger_address
         wake_configured_debugger_tab(args.debugger_address, allowed_host)
         print("[CONNECT] Resolving a compatible ChromeDriver...", flush=True)
-        driver_path, driver_resolution_error = resolve_chromedriver_with_timeout(timeout_seconds=45.0)
-        if driver_resolution_error == "manager_timeout":
-            print("[CONNECT ERROR] ChromeDriver resolution timed out after 45 seconds in Selenium Manager.", file=sys.stderr, flush=True)
-            print("[CONNECT ERROR] Check internet access and update Selenium in this venv; the browser session was not changed.", file=sys.stderr, flush=True)
-            return 2
+        driver_path, driver_resolution_error = resolve_chromedriver_with_timeout(
+            timeout_seconds=12.0, browser_version=browser_version
+        )
         if driver_resolution_error is not None:
-            print(f"[CONNECT ERROR] ChromeDriver resolution failed ({driver_resolution_error}). Update Selenium in this venv and retry.", file=sys.stderr, flush=True)
+            print(f"[CONNECT ERROR] ChromeDriver resolution failed ({driver_resolution_error}). Check network access or install a matching ChromeDriver locally.", file=sys.stderr, flush=True)
             return 2
         print("[CONNECT] Compatible ChromeDriver resolved.", flush=True)
         print("[CONNECT] Attaching Selenium to the existing Chrome session...", flush=True)
