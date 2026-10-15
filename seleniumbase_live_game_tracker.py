@@ -3336,13 +3336,22 @@ def choose_low_clock_likely_reply_premove(
         best_after_reply_eval = _premove_score_for_bot(own_lines[0], bot_color) if own_lines else None
         if best_after_reply_eval is None:
             return None, predicted_reply, "low-clock-follow-up-evaluation-unavailable"
-        if best_after_reply_eval < PREMOVE_MIN_BOT_EVAL_CP:
-            return None, predicted_reply, "low-clock-position-too-losing-for-premove"
+
+        # In an already-losing position, refusing every premove because the
+        # absolute score is below zero can guarantee a timeout. Still require
+        # a legal predicted reply, a non-hanging move, and a tight drop from
+        # the best continuation; only the absolute score floor is relaxed.
+        already_losing_after_reply = best_after_reply_eval < PREMOVE_MIN_BOT_EVAL_CP
+        candidate_floor = (
+            best_after_reply_eval - PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP
+            if already_losing_after_reply
+            else PREMOVE_MIN_BOT_EVAL_CP
+        )
 
         guarded_candidates = []
         for move, info in candidates:
             selected_eval = _premove_score_for_bot(info, bot_color)
-            if selected_eval is None or selected_eval < PREMOVE_MIN_BOT_EVAL_CP:
+            if selected_eval is None or selected_eval < candidate_floor:
                 continue
             if best_after_reply_eval - selected_eval > PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP:
                 continue
@@ -3353,10 +3362,15 @@ def choose_low_clock_likely_reply_premove(
         selected, selected_info, selected_eval = guarded_candidates[0]
         reply_san = board.san(predicted_reply)
         eval_text = f" eval={selected_eval / 100:+.2f}" if selected_eval is not None else ""
+        recovery_label = (
+            "low-clock-losing-position-recovery"
+            if already_losing_after_reply
+            else "low-clock-likely-reply-fallback"
+        )
         return (
             selected,
             predicted_reply,
-            f"low-clock-likely-reply-fallback reply={reply_san} rank=1{eval_text}",
+            f"{recovery_label} reply={reply_san} rank=1{eval_text}",
         )
     except (chess.engine.EngineError, ValueError, RuntimeError, TypeError, AttributeError):
         return None, None, "low-clock-fallback-analysis-failed"
