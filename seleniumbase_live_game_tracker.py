@@ -5220,8 +5220,22 @@ def main() -> int:
                                         )
                                     if isinstance(submit, dict) and submit.get("ok"):
                                         move_retry_gate.finish(submit)
+                                        move_elapsed = time.monotonic() - move_cycle_started_at
+                                        action_elapsed_ms = float(submit.get("action_elapsed_ms", 0.0) or 0.0)
+                                        confirmation_elapsed_ms = float(submit.get("confirm_elapsed_ms", 0.0) or 0.0)
+                                        pre_submit_elapsed_ms = max(
+                                            0.0,
+                                            move_elapsed * 1000.0 - action_elapsed_ms - confirmation_elapsed_ms,
+                                        )
+                                        print(
+                                            f"[MOVE LATENCY] total-cycle={move_elapsed * 1000.0:.1f} ms "
+                                            f"| pre-submit-work+wait={pre_submit_elapsed_ms:.1f} ms "
+                                            f"| planned-thinking={float(natural_delay) * 1000.0:.1f} ms "
+                                            f"| input-roundtrip={action_elapsed_ms:.1f} ms "
+                                            f"| confirmation-roundtrip={confirmation_elapsed_ms:.1f} ms.",
+                                            flush=True,
+                                        )
                                         if low_clock_mode:
-                                            move_elapsed = time.monotonic() - move_cycle_started_at
                                             print(
                                                 f"[MOVE BUDGET] target={low_clock_total_budget_seconds:.3f}s "
                                                 f"end-to-end={move_elapsed:.3f}s "
@@ -5291,6 +5305,13 @@ def main() -> int:
                                                 f" | travel={int(submit.get('drag_ms', 0))} ms"
                                                 f" | pre-delay={int(submit.get('pre_delay_ms', 0))} ms"
                                             )
+                                        failed_cycle_ms = (time.monotonic() - move_cycle_started_at) * 1000.0
+                                        print(
+                                            f"[MOVE LATENCY] failed-cycle={failed_cycle_ms:.1f} ms "
+                                            f"| planned-thinking={float(natural_delay) * 1000.0:.1f} ms "
+                                            f"| reason={str(reason)[:80]}.",
+                                            flush=True,
+                                        )
                                         print(f"[AUTO] Move was not confirmed ({reason}){detail}.", flush=True)
                                         if reason == "position-changed-before-drag":
                                             print(
