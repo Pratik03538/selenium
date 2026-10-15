@@ -3369,7 +3369,7 @@ def choose_middle_game_premove(
         # not prevent another candidate from passing the material/eval guards.
         for candidate in ordered[:3]:
             if any(
-                _premove_candidate_is_safe(strategy_module, after_capture, candidate)
+                not _premove_candidate_is_safe(strategy_module, after_capture, candidate)
                 for _reply, after_capture in outcomes
             ):
                 continue
@@ -3424,7 +3424,7 @@ def choose_middle_game_premove(
 
     for candidate in candidates[:4]:
         if any(
-            _premove_candidate_is_safe(strategy_module, after_reply, candidate)
+            not _premove_candidate_is_safe(strategy_module, after_reply, candidate)
             for _reply, after_reply in response_boards
         ):
             continue
@@ -3594,7 +3594,7 @@ def choose_low_clock_conversion_premove(
         # long search. A move is accepted only if it stays winning enough.
         checked = set()
         for _kind, _value, move in tactical[:6]:
-            if _premove_candidate_is_safe(strategy_module, hypothetical, move):
+            if not _premove_candidate_is_safe(strategy_module, hypothetical, move):
                 continue
             uci = move.uci()
             if uci in checked:
@@ -3696,7 +3696,7 @@ def choose_low_clock_likely_reply_premove(
                 continue
             # Guarded cursor promotion premoves are supported on the configured site.
             # Reject an immediate, uncompensated material loss after this premove.
-            if _premove_candidate_is_safe(strategy_module, hypothetical, move):
+            if not _premove_candidate_is_safe(strategy_module, hypothetical, move):
                 continue
             candidates.append((move, info))
             seen.add(move.uci())
@@ -4025,7 +4025,7 @@ def choose_promotion_threat_response_premove(
 
 
 def choose_premove_candidate(
-    engine, board, strategy_module, bot_color: str, args,
+    engine, board, strategy_module, bot_color: str, args, book=None,
     opponent_match_history: list[float] | None = None,
     low_clock_mode: bool = False,
     analysis_deadline: float | None = None,
@@ -4203,7 +4203,7 @@ def choose_premove_candidate(
             if selected.promotion is not None and cursor_input:
                 continue
             # A bounded eval drop alone can miss a one-move hanging piece.
-            if _premove_candidate_is_safe(strategy_module, hypothetical, selected):
+            if not _premove_candidate_is_safe(strategy_module, hypothetical, selected):
                 continue
 
             after_selected = hypothetical.copy(stack=True)
