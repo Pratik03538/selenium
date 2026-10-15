@@ -99,7 +99,7 @@ class RankOneStreakTests(unittest.TestCase):
 
 
 class LosingPositionIntegrationTests(unittest.TestCase):
-    def test_selector_can_choose_near_best_alternative_after_rank_one_streak(self):
+    def test_selector_can_keep_best_move_instead_of_forcing_a_weaker_choice(self):
         board = chess.Board()
         board.push_san("e4")
         board.push_san("e5")
@@ -118,13 +118,18 @@ class LosingPositionIntegrationTests(unittest.TestCase):
             for move, cp in zip(moves, scores_cp)
         ]
 
-        strategy._rank1_selection_streak = 2
-        selected_move, _selected_info, meta = strategy.choose_stockfish_move(
-            board, multipv_infos, bot_color=board.turn
-        )
+        # The quality-weighted selector may vary among safe close candidates,
+        # but it must not force a lower-ranked move just to manufacture variety.
+        with patch(
+            "chesskida_strategy.random.choices",
+            side_effect=lambda population, weights, k: [population[0]],
+        ):
+            selected_move, _selected_info, meta = strategy.choose_stockfish_move(
+                board, multipv_infos, bot_color=board.turn
+            )
 
         self.assertIn(selected_move, moves)
-        self.assertGreater(meta["rank"], 0)
+        self.assertEqual(meta["rank"], 0)
         self.assertLessEqual(meta["current_cp"] - meta["selected_cp"], 70)
 
 
