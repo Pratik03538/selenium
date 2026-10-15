@@ -774,21 +774,14 @@ def natural_bot_move_delay(
         elif own_clock <= 45.0:
             delay = min(delay, random.uniform(0.120, 0.720))
 
-    # Protect the clock lead during the ordinary move delay too, not only
-    # during optional thinking pauses. If either clock is unavailable, stay
-    # conservative because preserving an ahead-of-opponent lead cannot be verified.
-    if own_clock is not None:
-        if opponent_clock is not None:
-            safe_base_delay = _clock_safe_pause_allowance(
-                own_clock,
-                opponent_clock,
-                elapsed_seconds=elapsed_seconds_before_delay,
-                base_delay_seconds=0.0,
-                submission_reserve_seconds=submission_reserve_seconds,
-            )
-            delay = min(float(delay), safe_base_delay)
-        else:
-            delay = min(float(delay), 0.220)
+    # Clock-lead preservation governs optional multi-second pauses, not the
+    # ordinary randomized base delay. Applying the lead allowance here makes an
+    # equal-clock position produce a zero-second delay and defeats the opening
+    # fast-path cap below. Keep the base delay varied; the pause budget is checked
+    # separately before any discretionary thinking pause is added.
+    if own_clock is not None and opponent_clock is None:
+        # Without a readable opponent clock, use a conservative ordinary delay.
+        delay = min(float(delay), 0.220)
 
     # Forced/tactical replies should not consume an artificial pause budget.
     try:
