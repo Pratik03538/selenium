@@ -1020,7 +1020,7 @@ def _driver_major_version(driver_path: Path) -> int | None:
         )
     except Exception:
         return None
-    match = re.search(r"ChromeDriver\\s+(\\d+)", completed.stdout + " " + completed.stderr)
+    match = re.search(r"ChromeDriver\s+(\d+)", completed.stdout + " " + completed.stderr)
     return int(match.group(1)) if match else None
 
 
@@ -1074,8 +1074,7 @@ def _download_matching_chromedriver(browser_version: str) -> tuple[Path | None, 
         with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
             member = next(
                 (name for name in archive.namelist()
-                 if name.replace("\\\\", "/").endswith("/chromedriver.exe")
-                 or name == "chromedriver.exe"),
+                 if name.endswith("chromedriver.exe")),
                 None,
             )
             if member is None:
@@ -1099,7 +1098,7 @@ def _download_matching_chromedriver(browser_version: str) -> tuple[Path | None, 
 def resolve_chromedriver_with_timeout(timeout_seconds: float = 12.0, browser_version: str = ""):
     """Resolve a compatible ChromeDriver from cache, Selenium Manager, or official Chrome for Testing."""
     version = browser_version.rsplit("/", 1)[-1].strip()
-    major_match = re.match(r"(\\d+)", version)
+    major_match = re.match(r"(\d+)", version)
     if not major_match:
         return None, "browser_version_unavailable"
     browser_major = int(major_match.group(1))
