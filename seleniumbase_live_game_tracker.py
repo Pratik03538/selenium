@@ -972,12 +972,13 @@ def prepare_bot_components(args, allowed_host, installed):
         print("[INPUT] Cursor drag mode enabled for the configured test board; public competitive hosts remain blocked.", flush=True)
     else:
         print("[INPUT] Direct game API mode enabled.", flush=True)
-    print(
+    engine_status = (
         f"[ENGINE] Threads=2 | Hash=128 MB | depth=12 | "
-        f"MultiPV={strategy_module.TRAINING_MULTI_PV} | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s."
-        f"{f\" | AI difficulty Elo={configured_elo}\" if configured_elo is not None else \"\"}.",
-        flush=True,
+        f"MultiPV={strategy_module.TRAINING_MULTI_PV} | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s"
     )
+    if configured_elo is not None:
+        engine_status += f" | AI difficulty Elo={configured_elo}"
+    print(f"{engine_status}.", flush=True)
     return engine, book, strategy_module
 
 
