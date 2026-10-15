@@ -11,6 +11,7 @@ from seleniumbase_live_game_tracker import (
     PREMOVE_OPENING_MIN_BOT_EVAL_CP,
     PREMOVE_OPENING_FULLMOVE_MIN,
     PREMOVE_OPENING_FULLMOVE_MAX,
+    JS_INSTALL_OBSERVER,
     PlayerSideResolver,
     MoveAttemptRetryGate,
     normalize_api_bot_color,
@@ -73,6 +74,16 @@ class PlayerSideResolverTests(unittest.TestCase):
         self.assertEqual(normalize_api_bot_color(None, "black"), ("black", False))
 
 
+class BoardInputSourceGuardTests(unittest.TestCase):
+    def test_unreadable_dom_class_falls_back_to_authoritative_fen_after_side_check(self):
+        self.assertIn("sourceColor !== wantedColor", JS_INSTALL_OBSERVER)
+        self.assertIn(
+            "if (renderedColor && renderedColor !== sourceColor)",
+            JS_INSTALL_OBSERVER,
+        )
+        self.assertIn("unreadable-fen-verified", JS_INSTALL_OBSERVER)
+
+
 class MoveRetryGateTests(unittest.TestCase):
     def test_retry_same_fen_only_after_backoff_and_with_bounded_attempts(self):
         gate = MoveAttemptRetryGate()
@@ -113,6 +124,8 @@ class LateClockAndPremoveSafetyTests(unittest.TestCase):
     def test_clock_mode_uses_the_same_sampled_boundary_everywhere(self):
         self.assertFalse(is_low_clock_mode(8.5, 7.5))
         self.assertTrue(is_low_clock_mode(7.5, 7.5))
+        self.assertTrue(is_low_clock_mode(9.1, 9.79))
+        self.assertFalse(is_low_clock_mode(10.1, 9.79))
         self.assertTrue(is_low_clock_mode(8.5, 7.5, force_fast_mode=True))
         self.assertFalse(is_low_clock_mode(None, 7.5, force_fast_mode=True))
 
