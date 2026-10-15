@@ -2360,11 +2360,11 @@ def _perform_cursor_drag_once(
     driver, uci: str, expected_fen: str, expected_color: str | None,
     allow_premove: bool = False, low_clock_mode: bool = False,
 ) -> dict[str, object]:
-    """Drag a legal move with a short curved gesture and report actual latency.
+    """Drag a legal move with a short multi-waypoint gesture and report latency.
 
-    Normal and premove gestures share randomized square points and a two-segment
-    curve. Low-clock mode shortens movement and skips pre/hover waits. Premove
-    gestures are best-effort and use explicit queue signals when exposed.
+    Normal and premove gestures share randomized square points and a curved path
+    with 2-4 waypoints. All pointer waits are short, randomized millisecond values;
+    thinking time belongs before pickup, never during piece travel.
     """
     try:
         target = driver.execute_script(
@@ -2434,17 +2434,20 @@ def _perform_cursor_drag_once(
     control_x = min(max(2.0, control_x), width - 2.0)
     control_y = min(max(2.0, control_y), height - 2.0)
 
-    # Keep the physical piece travel in the requested 2-20ms range.
-    # Thinking happens before pickup; the path itself is one direct target with
-    # no mid-air pauses. Low-clock moves use the same short range.
-    waypoint_count = 1
+    # Keep the total configured piece-travel time in the 2-20ms range while
+    # retaining several path points. Give every segment at least 1ms so no
+    # pointer-move action gets a zero duration.
     total_drag_ms = rng.randint(2, 20)
-    pre_delay_ms = 0
-    base_duration, extra_ms = divmod(total_drag_ms, waypoint_count)
-    segment_durations = [base_duration] * waypoint_count
-    if extra_ms:
-        for index in rng.sample(range(waypoint_count), extra_ms):
-            segment_durations[index] += 1
+    waypoint_count = min(rng.randint(2, 4), total_drag_ms)
+    segment_durations = [1] * waypoint_count
+    remaining_drag_ms = total_drag_ms - waypoint_count
+    while remaining_drag_ms > 0:
+        segment_durations[rng.randrange(waypoint_count)] += 1
+        remaining_drag_ms -= 1
+
+    # Use tiny randomized waits rather than literal zero-duration waits.
+    pre_delay_ms = rng.randint(1, 5)
+    pickup_hold_ms = rng.randint(1, 3)
 
     path_points: list[tuple[float, float]] = []
     for index in range(1, waypoint_count + 1):
@@ -2471,12 +2474,12 @@ def _perform_cursor_drag_once(
         path_points.append((px, py))
 
     source_offset = (round(sx - width / 2.0), round(sy - height / 2.0))
-    hover_ms = 0
+    hover_ms = rng.randint(3, 8)
 
     action_elapsed_ms = 0.0
     try:
-        # Use W3C pointer actions with per-segment timing. Low-clock mode
-        # removes optional waits and keeps positioning/drag movement very short.
+        # Use W3C pointer actions with randomized per-segment timing. All waits
+        # remain small; there are no deliberate pauses while the piece is moving.
         if pre_delay_ms:
             time.sleep(pre_delay_ms / 1000.0)
 
@@ -2490,8 +2493,8 @@ def _perform_cursor_drag_once(
         )
         pointer.pause(hover_ms / 1000.0)
         pointer.pointer_down()
-        # Keep the lifted-piece hold minimal; thinking belongs before pickup.
-        pointer.pause(0.001)
+        # Keep the lifted-piece hold randomized but limited to 1-3ms.
+        pointer.pause(pickup_hold_ms / 1000.0)
 
         for point_index, ((px, py), segment_ms) in enumerate(zip(path_points, segment_durations)):
             pointer.source.create_pointer_move(
@@ -2500,7 +2503,7 @@ def _perform_cursor_drag_once(
                 x=round(px - width / 2.0),
                 y=round(py - height / 2.0),
             )
-            # One direct target point; no mid-air waypoint or pause.
+            # Intermediate points keep the path smooth without adding pauses.
 
         pointer.pointer_up()
         action_started_at = time.monotonic()
