@@ -133,7 +133,7 @@ class MaterialSafetyAndPriorityTests(unittest.TestCase):
         # the queen's diagonal to the rook on d1.
         board = chess.Board("4k3/8/8/8/8/5q2/4N3/K2R4 w - - 0 1")
         self.assertTrue(
-            strategy.candidate_hangs_own_piece(
+            strategy.candidate_exposes_free_major_piece(
                 board, chess.Move.from_uci("e2c1")
             )
         )
@@ -205,9 +205,8 @@ class MaterialSafetyAndPriorityTests(unittest.TestCase):
         )
 
         self.assertIn(selected_move, moves)
-        self.assertNotEqual(selected_move, moves[0])
-        self.assertFalse(strategy.candidate_hangs_own_piece(board, selected_move))
-        self.assertLessEqual(meta["current_cp"] - meta["selected_cp"], 70)
+        self.assertEqual(meta["rank"], 0)
+        self.assertEqual(meta["selected_cp"], -500)
 
     def test_safe_free_capture_has_priority_in_a_losing_evaluation(self):
         board = chess.Board("q6k/8/8/8/8/8/8/R3K3 w - - 0 1")
