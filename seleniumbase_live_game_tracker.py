@@ -15,6 +15,7 @@ import ipaddress
 import re
 import random
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -25,6 +26,7 @@ from urllib.request import Request, urlopen
 try:
     from selenium import webdriver
     from selenium.common.exceptions import WebDriverException
+    from selenium.webdriver.chrome.service import Service as ChromeService
     from selenium.webdriver.common.action_chains import ActionChains
 except ImportError as exc:
     raise SystemExit(
@@ -997,6 +999,33 @@ def target_matches(url: str | None, allowed_host: str) -> bool:
     if is_public_competitive_host(host):
         return False
     return host == allowed_host or host.endswith("." + allowed_host)
+
+
+def attach_to_chrome_with_timeout(options, timeout_seconds: float = 30.0):
+    """Bound ChromeDriver session creation so an unresponsive attach cannot freeze the tracker."""
+    service = ChromeService()
+    result = {}
+    finished = threading.Event()
+
+    def attach() -> None:
+        try:
+            result["driver"] = webdriver.Chrome(options=options, service=service)
+        except Exception as exc:
+            result["error"] = exc
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=attach, name="chrome-attach", daemon=True)
+    worker.start()
+    if not finished.wait(timeout_seconds):
+        try:
+            service.stop()
+        except Exception:
+            pass
+        return None, "timeout"
+    if "error" in result:
+        return None, result["error"]
+    return result.get("driver"), None
 
 
 def wake_configured_debugger_tab(debugger_address: str, allowed_host: str) -> bool:
@@ -4103,10 +4132,13 @@ def main() -> int:
         options.debugger_address = args.debugger_address
         wake_configured_debugger_tab(args.debugger_address, allowed_host)
         print("[CONNECT] Attaching Selenium to the existing Chrome session...", flush=True)
-        try:
-            driver = webdriver.Chrome(options=options)
-        except WebDriverException:
-            print("[CONNECT ERROR] Selenium could not attach to Chrome. Update Selenium and check ChromeDriver compatibility.", file=sys.stderr, flush=True)
+        driver, attach_error = attach_to_chrome_with_timeout(options, timeout_seconds=30.0)
+        if attach_error == "timeout":
+            print("[CONNECT ERROR] Selenium attach timed out after 30 seconds; ChromeDriver did not finish creating a session.", file=sys.stderr, flush=True)
+            print("[CONNECT ERROR] Check Chrome/ChromeDriver compatibility and close stale ChromeDriver.exe processes, then retry.", file=sys.stderr, flush=True)
+            return 2
+        if attach_error is not None:
+            print(f"[CONNECT ERROR] Selenium could not attach to Chrome ({type(attach_error).__name__}). Check Chrome/ChromeDriver compatibility.", file=sys.stderr, flush=True)
             return 2
         print("[CONNECT] Selenium attached.", flush=True)
 
