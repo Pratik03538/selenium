@@ -506,7 +506,7 @@ def _clock_deficit_forces_fast_pacing(
     if own is None or opponent is None:
         return False
     reference = initial if initial is not None and initial > 0.0 else max(own, opponent, 1.0)
-    deficit_threshold = max(2.0, min(12.0, reference * 0.025))
+    deficit_threshold = max(4.0, min(10.0, reference * 0.08))
     return (opponent - own) >= deficit_threshold
 
 
@@ -778,15 +778,19 @@ def natural_bot_move_delay(
         _last_bot_natural_delay = delay
         return max(0.010, float(delay))
 
-    # Protect clock parity: Selenium submission already has real overhead, so
-    # only spend discretionary thinking time when we have a meaningful safe lead.
-    # Keep a short randomized base delay when the opponent's clock is close.
+    # Clock parity by itself must not flatten healthy midgame timing to 35-220ms.
+    # Suppress pauses only when the clock is genuinely late or the deficit is
+    # material; otherwise allow the position-based pause gate to add longer thinks.
     if own_clock is not None and opponent_clock is not None:
         try:
             spendable_clock_lead = float(clock_spendable_lead)
         except (TypeError, ValueError):
             spendable_clock_lead = 0.0
-        if spendable_clock_lead < 4.0:
+        deficit_forces_fast = _clock_deficit_forces_fast_pacing(
+            own_clock, opponent_clock, initial_time_seconds
+        )
+        late_clock_fast = own_clock <= max(18.0, low_clock_threshold)
+        if spendable_clock_lead < 4.0 and (late_clock_fast or deficit_forces_fast):
             parity_delay = min(float(delay), random.uniform(0.035, 0.220))
             _last_bot_natural_delay = parity_delay
             clock_relation = (
@@ -794,12 +798,18 @@ def natural_bot_move_delay(
                 if own_clock < opponent_clock
                 else "protecting clock parity"
             )
+            fast_reason = "late clock" if late_clock_fast else "material clock deficit"
             print(
                 f"[BOT CLOCK] {clock_relation}; safe lead={spendable_clock_lead:.1f}s, "
-                f"optional pause suppressed, delay={parity_delay:.3f}s.",
+                f"{fast_reason}, optional pause suppressed, delay={parity_delay:.3f}s.",
                 flush=True,
             )
             return max(0.0, parity_delay)
+        if spendable_clock_lead < 4.0:
+            print(
+                "[BOT CLOCK] Clocks close; keeping randomized position-based timing.",
+                flush=True,
+            )
 
     # Sampled opening warm-up moves: no long pause.
     if _bot_timing_move_count <= int(_thinking_warmup_moves or BOT_THINKING_START_AFTER_MOVE):
