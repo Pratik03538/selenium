@@ -2314,6 +2314,96 @@ def candidate_hangs_own_piece(board, move):
         # Keep the selector operational if an unusual board adapter fails;
         # move legality and Stockfish scoring remain additional constraints.
         return False
+def find_fast_low_clock_capture(board, candidates=None):
+    """Choose a safe tactical capture without the deeper normal-mode scan.
+
+    Emergency mode must avoid spending a large nested legal-reply search on
+    every capture. This scans legal captures once, rejects moves that leave a
+    major/minor piece freely capturable, then prioritizes mate, free targets,
+    and material gain.
+    """
+    try:
+        candidate_map = {
+            item["move"]: item for item in (candidates or [])
+            if isinstance(item, dict) and item.get("move") is not None
+        }
+        choices = []
+        mover = board.turn
+        values = {
+            chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
+            chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 20000,
+        }
+        for move in board.legal_moves:
+            if not board.is_capture(move):
+                continue
+            victim_square = move.to_square
+            if board.is_en_passant(move):
+                victim_square = (
+                    move.to_square - 8 if mover == chess.WHITE
+                    else move.to_square + 8
+                )
+            victim = board.piece_at(victim_square)
+            attacker = board.piece_at(move.from_square)
+            if (
+                victim is None or victim.color == mover
+                or victim.piece_type == chess.KING or attacker is None
+            ):
+                continue
+            victim_value = values.get(victim.piece_type, 0)
+            attacker_value = values.get(attacker.piece_type, 0)
+            after = board.copy(stack=False)
+            after.push(move)
+            if after.is_checkmate():
+                item = candidate_map.get(move, {})
+                return {
+                    "move": move, "info": item.get("info"),
+                    "rank": item.get("rank", 0),
+                    "cp": item.get("cp", 0),
+                    "victim_value": victim_value / 100.0,
+                    "free": True, "reason_tag": "CHECKMATE CAPTURE",
+                }
+            if candidate_hangs_own_piece(board, move):
+                continue
+
+            immediate_replies = [
+                reply for reply in after.legal_moves
+                if reply.to_square == move.to_square
+            ]
+            free_capture = not immediate_replies
+            # If immediately recapturable, only keep a clear material win;
+            # a losing exchange is not an emergency-clock conversion.
+            if not free_capture and victim_value <= attacker_value:
+                continue
+            item = candidate_map.get(move, {})
+            choices.append({
+                "move": move,
+                "info": item.get("info"),
+                "rank": item.get("rank", 99),
+                "cp": item.get("cp", 0),
+                "victim_value": victim_value / 100.0,
+                "free": free_capture,
+                "reason_tag": "FREE CAPTURE" if free_capture else "SAFE WINNING EXCHANGE",
+                "_gain": victim_value - attacker_value,
+            })
+        if not choices:
+            return None
+        choices.sort(
+            key=lambda item: (
+                1 if item["free"] else 0,
+                item["_gain"],
+                item["victim_value"],
+                item["cp"],
+                -item["rank"],
+            ),
+            reverse=True,
+        )
+        result = choices[0]
+        result.pop("_gain", None)
+        return result
+    except Exception:
+        return None
+
+
 def _movable_piece_count_for_color(board, color) -> int:
     """Count the side's pieces with at least one legal move in a position copy."""
     try:
@@ -2527,13 +2617,7 @@ def choose_stockfish_move(
                 },
             )
 
-        safe_capture = find_priority_capture(
-            board,
-            candidates,
-            best_cp,
-            force_endgame=len(board.piece_map()) <= 10,
-            engine=None,
-        )
+        safe_capture = find_fast_low_clock_capture(board, candidates)
         if (
             safe_capture is not None
             and not candidate_hangs_own_piece(board, safe_capture["move"])
