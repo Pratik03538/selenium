@@ -5067,10 +5067,23 @@ def main() -> int:
                                         settings_window.pump()
                                     if not args.auto_play:
                                         submit = {"ok": False, "reason": "bot-disabled-in-settings"}
+                                    elif args.move_input == "cursor" and low_clock_mode:
+                                        # The configured site's validated move API avoids the
+                                        # 600-800ms Selenium ActionChains round-trip seen in
+                                        # low-clock logs. It still validates side, legal move,
+                                        # expected FEN, and confirmation before reporting success.
+                                        print(
+                                            "[LOW CLOCK INPUT] Using validated site move API; skipping slow cursor drag.",
+                                            flush=True,
+                                        )
+                                        submit = perform_api_move(
+                                            driver, chosen_move.uci(), fen, active_bot_color,
+                                            low_clock_mode=True, source="low-clock-fast-path",
+                                        )
                                     elif args.move_input == "cursor":
                                         submit = perform_cursor_drag(
                                             driver, chosen_move.uci(), fen, active_bot_color,
-                                            low_clock_mode=low_clock_mode,
+                                            low_clock_mode=False,
                                         )
                                     else:
                                         submit = perform_api_move(
@@ -5291,6 +5304,36 @@ def main() -> int:
                                             settings_window.pump()
                                         if not args.auto_play or not args.premove_enabled:
                                             premove_submit = {"ok": False, "reason": "bot-or-extra-premove-disabled-in-settings"}
+                                        elif args.move_input == "cursor" and low_clock_premove_mode:
+                                            # Prefer the site's explicit premove queue when exposed.
+                                            # Fall back to the guarded cursor gesture only when that
+                                            # API is absent; never repeat a rejected/stale premove.
+                                            premove_submit = perform_api_premove(
+                                                driver,
+                                                chosen_premove_uci,
+                                                fen,
+                                                active_bot_color,
+                                            )
+                                            if (
+                                                not premove_submit.get("ok")
+                                                and premove_submit.get("reason") in {
+                                                    "premove-api-unavailable",
+                                                    "reader-not-installed",
+                                                    "board-game-api-unavailable",
+                                                }
+                                            ):
+                                                print(
+                                                    "[PREMOVE] Site queue API unavailable; using guarded low-clock cursor fallback.",
+                                                    flush=True,
+                                                )
+                                                premove_submit = perform_cursor_drag(
+                                                    driver,
+                                                    chosen_premove_uci,
+                                                    fen,
+                                                    active_bot_color,
+                                                    allow_premove=True,
+                                                    low_clock_mode=True,
+                                                )
                                         elif args.move_input == "cursor":
                                             premove_submit = perform_cursor_drag(
                                                 driver,
@@ -5298,7 +5341,7 @@ def main() -> int:
                                                 fen,
                                                 active_bot_color,
                                                 allow_premove=True,
-                                                low_clock_mode=low_clock_premove_mode,
+                                                low_clock_mode=False,
                                             )
                                         else:
                                             premove_submit = perform_api_premove(
