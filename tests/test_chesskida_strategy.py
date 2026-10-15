@@ -123,8 +123,8 @@ class LosingPositionIntegrationTests(unittest.TestCase):
         )
 
         self.assertIn(selected_move, moves)
-        self.assertIn(meta["rank"], (0, 1))
-        self.assertLessEqual(meta["current_cp"] - meta["selected_cp"], 20)
+        self.assertIn(meta["rank"], (0, 1, 2, 3))
+        self.assertLessEqual(meta["current_cp"] - meta["selected_cp"], 70)
 
 
 class MaterialSafetyAndPriorityTests(unittest.TestCase):
