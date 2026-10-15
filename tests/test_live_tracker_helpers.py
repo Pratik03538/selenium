@@ -206,10 +206,10 @@ class LateClockAndPremoveSafetyTests(unittest.TestCase):
 
 
 class PremovePhaseTests(unittest.TestCase):
-    def test_opening_premove_window_is_sampled_between_three_and_six_fullmoves(self):
-        self.assertEqual(PREMOVE_OPENING_FULLMOVE_MIN, 3)
-        self.assertEqual(PREMOVE_OPENING_FULLMOVE_MAX, 6)
-        for opening_limit in range(3, 7):
+    def test_opening_premove_window_is_sampled_between_five_and_eight_fullmoves(self):
+        self.assertEqual(PREMOVE_OPENING_FULLMOVE_MIN, 5)
+        self.assertEqual(PREMOVE_OPENING_FULLMOVE_MAX, 8)
+        for opening_limit in range(5, 9):
             with self.subTest(opening_limit=opening_limit):
                 inside = chess.Board(
                     f"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 {opening_limit}"
