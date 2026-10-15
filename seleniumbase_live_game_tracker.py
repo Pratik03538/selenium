@@ -2662,8 +2662,8 @@ def perform_api_premove(
     return result if isinstance(result, dict) else {"ok": False, "reason": "invalid-premove-response"}
 
 
-PREMOVE_OPENING_FULLMOVE_MIN = 3
-PREMOVE_OPENING_FULLMOVE_MAX = 6
+PREMOVE_OPENING_FULLMOVE_MIN = 5
+PREMOVE_OPENING_FULLMOVE_MAX = 8
 PREMOVE_ENDGAME_MAX_PIECES = 10
 PREMOVE_MIN_BOT_EVAL_CP = -25
 PREMOVE_MAX_EVAL_DROP_CP = 40
