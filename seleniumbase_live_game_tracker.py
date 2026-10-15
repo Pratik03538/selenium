@@ -2434,11 +2434,11 @@ def _perform_cursor_drag_once(
     control_x = min(max(2.0, control_x), width - 2.0)
     control_y = min(max(2.0, control_y), height - 2.0)
 
-    # Two curved segments are enough to avoid a straight-line gesture while
-    # minimizing time spent holding the piece in the air.
-    waypoint_count = 2
-    total_drag_ms = rng.randint(3, 8) if low_clock_mode else rng.randint(6, 28)
-    pre_delay_ms = 0 if low_clock_mode else rng.randint(0, 12)
+    # The validated site API is preferred. If the cursor fallback is needed,
+    # make it a direct gesture: do not create a slow curved flight or pauses.
+    waypoint_count = 1
+    total_drag_ms = rng.randint(2, 5) if low_clock_mode else rng.randint(3, 7)
+    pre_delay_ms = 0
     base_duration, extra_ms = divmod(total_drag_ms, waypoint_count)
     segment_durations = [base_duration] * waypoint_count
     if extra_ms:
@@ -2470,7 +2470,7 @@ def _perform_cursor_drag_once(
         path_points.append((px, py))
 
     source_offset = (round(sx - width / 2.0), round(sy - height / 2.0))
-    hover_ms = 0 if low_clock_mode else rng.randint(2, 8)
+    hover_ms = 0
 
     action_elapsed_ms = 0.0
     try:
@@ -2483,16 +2483,14 @@ def _perform_cursor_drag_once(
         pointer = actions.w3c_actions.pointer_action
         pointer.source.create_pointer_move(
             origin=board_element,
-            duration=rng.randint(1, 4) if low_clock_mode else rng.randint(8, 18),
+            duration=rng.randint(1, 2) if low_clock_mode else rng.randint(2, 4),
             x=source_offset[0],
             y=source_offset[1],
         )
         pointer.pause(hover_ms / 1000.0)
         pointer.pointer_down()
         # Keep the lifted-piece hold minimal; thinking belongs before pickup.
-        pointer.pause(
-            rng.uniform(0.0005, 0.0015) if low_clock_mode else rng.uniform(0.001, 0.004)
-        )
+        pointer.pause(0.001)
 
         for point_index, ((px, py), segment_ms) in enumerate(zip(path_points, segment_durations)):
             pointer.source.create_pointer_move(
@@ -2501,12 +2499,7 @@ def _perform_cursor_drag_once(
                 x=round(px - width / 2.0),
                 y=round(py - height / 2.0),
             )
-            if point_index < len(path_points) - 1:
-                # Keep movement continuous; do not pause while the piece is held.
-                if low_clock_mode:
-                    pass
-                else:
-                    pointer.pause(rng.uniform(0.0002, 0.0010))
+            # One direct target point; no mid-air waypoint or pause.
 
         pointer.pointer_up()
         action_started_at = time.monotonic()
