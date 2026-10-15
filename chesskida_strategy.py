@@ -2694,6 +2694,7 @@ def choose_stockfish_move(
         if (
             improvement_fraction
             >= FORCE_BEST_IMPROVEMENT_FRACTION
+            and not candidate_hangs_own_piece(board, best["move"])
         ):
             selected = best
 
@@ -3612,10 +3613,39 @@ def choose_stockfish_move(
         if (
             c["cp"] >= near_equal_floor
             and c["rank"] <= adaptive_max_rank
+            and not candidate_hangs_own_piece(board, c["move"])
         )
     ]
 
     if not safe:
+        # Do not gift a piece merely because every near-equal candidate is
+        # outside the tight score band. Pick the best already-scored safe
+        # alternative before allowing a forced best-move fallback.
+        safe_alternatives = [
+            candidate for candidate in candidates
+            if candidate["rank"] <= adaptive_max_rank
+            and not candidate_hangs_own_piece(board, candidate["move"])
+        ]
+        if safe_alternatives:
+            selected = max(
+                safe_alternatives,
+                key=lambda candidate: (candidate["cp"], -candidate["rank"]),
+            )
+            return (
+                selected["move"],
+                selected["info"],
+                {
+                    "rank": selected["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": selected["cp"],
+                    "source": "PIECE_SAFETY_FALLBACK",
+                    "reason": (
+                        f"PIECE SAFETY FALLBACK | BEST={best_cp / 100:+.2f} "
+                        f"SELECTED={selected['cp'] / 100:+.2f} "
+                        f"RANK=#{selected['rank'] + 1}"
+                    ),
+                },
+            )
         safe = [best]
 
     rank_weights = {
