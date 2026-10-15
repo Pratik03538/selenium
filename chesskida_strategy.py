@@ -18,19 +18,22 @@ ANALYSIS_DEPTH = 8
 BOT_EVERY_MOVE_DELAY_MIN = 0.035
 BOT_EVERY_MOVE_DELAY_MAX = 2.100
 BOT_THINKING_ENABLED_DEFAULT = True
-BOT_THINKING_START_AFTER_MOVE = 5
+BOT_THINKING_START_AFTER_MOVE = 10
 BOT_BOOK_INSTANT_MOVES = 5
-BOT_ENDGAME_PAUSE_MIN = 0.25
-BOT_ENDGAME_PAUSE_MAX = 2.400
+BOT_ENDGAME_PAUSE_MIN = 1.0
+BOT_ENDGAME_PAUSE_MAX = 6.0
 BOT_ENDGAME_PAUSE_CHANCE = 0.20
-BOT_PAUSE_MOVE_COOLDOWN_MIN = 2
-BOT_PAUSE_MOVE_COOLDOWN_MAX = 12
+BOT_PAUSE_MOVE_COOLDOWN_MIN = 5
+BOT_PAUSE_MOVE_COOLDOWN_MAX = 10
 BOT_PAUSE_ELIGIBILITY_SCALE = 0.78
 BOT_POST_50_MOVE = 50
 BOT_MATE_PAUSE_MIN_MATE = 1
 BOT_MATE_PAUSE_MAX_MATE = 5
-BOT_THINK_PAUSE_MIN = 0.450
-BOT_THINK_PAUSE_MAX = 8.500
+BOT_THINK_PAUSE_MIN = 1.0
+BOT_THINK_PAUSE_MAX = 6.0
+BOT_NORMAL_DELAY_MIN = 0.20
+BOT_NORMAL_DELAY_MAX = 0.70
+CLOCK_PAUSE_PRESERVE_LEAD_SECONDS = 0.75
 BOT_MATE_PAUSE_MIN = 1.5
 BOT_MATE_PAUSE_MAX = 6.5
 BOT_THINK_BUDGET_MIN = 14.0
@@ -420,23 +423,23 @@ def _sample_base_move_delay(
                 + random.uniform(0.0, 0.080)),
         )
 
-    # Routine positions are usually quick, medium decisions receive a
-    # moderate base delay, and genuinely complex positions can receive a
-    # longer base delay. This is then scaled/capped by the live clock profile.
+    # Quiet/ordinary moves stay in the requested fast 0.20-0.70s range.
+    # Complexity shifts the sample within that range; longer pauses are handled
+    # separately by the position and clock-gated pause policy.
     if complexity < 0.30:
-        bands = ((0.60, 0.18, 0.42), (0.32, 0.55, 1.15), (0.08, 1.15, 1.80))
+        bands = ((0.68, 0.20, 0.34), (0.27, 0.34, 0.52), (0.05, 0.52, 0.70))
     elif complexity < 0.68:
-        bands = ((0.44, 0.18, 0.42), (0.38, 0.55, 1.30), (0.18, 1.15, 2.10))
+        bands = ((0.48, 0.20, 0.36), (0.37, 0.36, 0.55), (0.15, 0.55, 0.70))
     else:
-        bands = ((0.27, 0.18, 0.42), (0.42, 0.55, 1.35), (0.31, 1.15, 2.10))
+        bands = ((0.30, 0.20, 0.38), (0.40, 0.38, 0.56), (0.30, 0.56, 0.70))
     _weight, low, high = random.choices(
         bands, weights=[band[0] for band in bands], k=1
     )[0]
     base = random.uniform(low, high)
-    micro_jitter = random.uniform(0.0, 0.080)
+    micro_jitter = random.uniform(0.0, 0.035)
     return min(
-        BOT_EVERY_MOVE_DELAY_MAX,
-        max(BOT_EVERY_MOVE_DELAY_MIN, base + micro_jitter),
+        BOT_NORMAL_DELAY_MAX,
+        max(BOT_NORMAL_DELAY_MIN, base + micro_jitter),
     )
 
 def _sample_thinking_pause(pause_max: float, complexity: float = 0.0) -> float:
@@ -445,8 +448,9 @@ def _sample_thinking_pause(pause_max: float, complexity: float = 0.0) -> float:
     if high <= 0.0:
         return 0.0
     complexity = min(1.0, max(0.0, float(complexity)))
-    # One continuous per-call distribution replaces short/medium/long bins.
-    low = min(random.uniform(0.10, 0.42), high)
+    # Pause requests are longer thoughts (1-6s), not micro-delays.
+    # The live clock/budget caps the upper bound before sampling.
+    low = min(random.uniform(1.0, 1.40), high)
     mode_fraction = random.triangular(
         0.12, 0.82, min(0.82, max(0.12, 0.28 + 0.38 * complexity))
     )
@@ -555,6 +559,30 @@ def _clock_deficit_forces_fast_pacing(
     return (opponent - own) >= deficit_threshold
 
 
+
+def _clock_safe_pause_allowance(
+    own_seconds,
+    opponent_seconds,
+    elapsed_seconds=0.0,
+    base_delay_seconds=0.0,
+    submission_reserve_seconds=0.0,
+    preserve_lead_seconds=CLOCK_PAUSE_PRESERVE_LEAD_SECONDS,
+) -> float:
+    """Maximum optional pause that preserves a positive measured clock lead."""
+    try:
+        own = max(0.0, float(own_seconds))
+        opponent = max(0.0, float(opponent_seconds))
+        elapsed = max(0.0, float(elapsed_seconds))
+        base_delay = max(0.0, float(base_delay_seconds))
+        submission_reserve = max(0.0, float(submission_reserve_seconds))
+        preserve_lead = max(0.0, float(preserve_lead_seconds))
+    except (TypeError, ValueError):
+        return 0.0
+    return max(
+        0.0,
+        own - opponent - elapsed - base_delay - submission_reserve - preserve_lead,
+    )
+
 def natural_bot_move_delay(
     board,
     move,
@@ -596,7 +624,7 @@ def natural_bot_move_delay(
 
     if _thinking_budget_remaining is None or len(board.move_stack) <= 1:
         _bot_timing_move_count = 0
-        _thinking_warmup_moves = random.randint(2, BOT_THINKING_START_AFTER_MOVE)
+        _thinking_warmup_moves = random.randint(5, BOT_THINKING_START_AFTER_MOVE)
         _book_fast_move_limit = random.randint(2, min(5, BOT_BOOK_INSTANT_MOVES))
         _thinking_clock_reserve_fraction = 0.36
         think_fraction_range = (0.22, 0.34)
@@ -729,7 +757,10 @@ def natural_bot_move_delay(
     # Normal quiet moves scale with the clock's estimated per-decision allowance.
     # Book moves, captures/recaptures, checks and promotions still hit the fast path below.
     pace_scale = float(clock_profile["pace_scale"])
-    delay = min(BOT_EVERY_MOVE_DELAY_MAX * 1.75, delay * pace_scale)
+    delay = min(
+        BOT_NORMAL_DELAY_MAX,
+        max(BOT_NORMAL_DELAY_MIN, delay * pace_scale),
+    )
     # These are upper caps on the sampled delay, not fixed target delays.
     if own_clock is not None:
         if own_clock <= 18.0:
@@ -764,12 +795,11 @@ def natural_bot_move_delay(
     except Exception:
         pass
 
-    # Keep ordinary opening moves brisk even when the opening book has no
-    # matching line. This avoids adding discretionary thinking pauses during
-    # the first ten full moves; forced replies still use the same safe path.
+    # Keep ordinary opening moves brisk through the first five full moves;
+    # pause eligibility remains gated separately by the sampled 5-10 move warm-up.
     try:
         opening_fast_path = (
-            int(board.fullmove_number) <= 10
+            int(board.fullmove_number) <= 5
             and len(board.piece_map()) >= 26
             and not board.is_check()
             and not is_opening_book_move
@@ -777,10 +807,8 @@ def natural_bot_move_delay(
     except Exception:
         opening_fast_path = False
     if opening_fast_path:
-        # Keep the opening brisk without flattening every move to the same
-        # 120ms cap. Quiet developing moves receive a fresh, small cap;
-        # captures/checks/promotions and prepared book moves have separate paths.
-        opening_cap = random.uniform(0.055, 0.240)
+        # Opening quiet moves remain brisk with a per-move variation.
+        opening_cap = random.uniform(0.20, 0.45)
         delay = min(float(delay), opening_cap)
         _last_bot_natural_delay = delay
         return max(0.0, float(delay))
@@ -902,6 +930,14 @@ def natural_bot_move_delay(
             BOT_ENDGAME_PAUSE_MAX,
             float(_thinking_budget_remaining)
         )
+        safe_lead_pause = _clock_safe_pause_allowance(
+            own_clock,
+            opponent_clock,
+            elapsed_seconds=elapsed_seconds_before_delay,
+            base_delay_seconds=delay,
+            submission_reserve_seconds=submission_reserve_seconds,
+        )
+        pause_max = min(pause_max, safe_lead_pause)
         if clock_pace_seconds is not None:
             endgame_complexity_for_cap = _timing_position_complexity(
                 board, move, engine_result=engine_result, selection_meta=selection_meta
@@ -940,8 +976,13 @@ def natural_bot_move_delay(
         if pause_max < BOT_ENDGAME_PAUSE_MIN or random.random() >= pause_chance:
             return max(0.0, float(delay))
         pause_duration = _sample_thinking_pause(pause_max, endgame_complexity)
+        if pause_duration < BOT_ENDGAME_PAUSE_MIN:
+            return max(0.0, float(delay))
         _thinking_budget_remaining = max(
             0.0, float(_thinking_budget_remaining) - pause_duration
+        )
+        _thinking_move_cooldown_remaining = random.randint(
+            BOT_PAUSE_MOVE_COOLDOWN_MIN, BOT_PAUSE_MOVE_COOLDOWN_MAX
         )
         _last_bot_natural_delay = delay + pause_duration
         print(
@@ -1123,7 +1164,7 @@ def natural_bot_move_delay(
     # keep any discretionary pause short to protect the remaining clock.
     pause_max = min(
         BOT_THINK_PAUSE_MAX,
-        4.0,
+        6.0,
         float(_thinking_budget_remaining),
     )
     if clock_margin is not None and clock_margin < 0.0:
@@ -1165,6 +1206,14 @@ def natural_bot_move_delay(
         except (TypeError, ValueError):
             pass
 
+    safe_lead_pause = _clock_safe_pause_allowance(
+        own_clock,
+        opponent_clock,
+        elapsed_seconds=elapsed_seconds_before_delay,
+        base_delay_seconds=delay,
+        submission_reserve_seconds=submission_reserve_seconds,
+    )
+    pause_max = min(pause_max, safe_lead_pause)
     if pause_max < BOT_THINK_PAUSE_MIN:
         return max(0.0, float(delay))
 
@@ -1179,12 +1228,9 @@ def natural_bot_move_delay(
     # Only the randomized refractory minimum is set here. The next
     # pause is NOT scheduled for a specific move; after this block, the
     # current position must pass a fresh situation-based eligibility test.
-    if pause_duration >= 5.0:
-        _thinking_move_cooldown_remaining = random.randint(7, 14)
-    elif pause_duration >= 2.4:
-        _thinking_move_cooldown_remaining = random.randint(4, 10)
-    else:
-        _thinking_move_cooldown_remaining = random.randint(1, 7)
+    _thinking_move_cooldown_remaining = random.randint(
+        BOT_PAUSE_MOVE_COOLDOWN_MIN, BOT_PAUSE_MOVE_COOLDOWN_MAX
+    )
 
     delay += pause_duration
 
