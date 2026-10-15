@@ -5081,24 +5081,36 @@ def main() -> int:
                                         settings_window.pump()
                                     if not args.auto_play:
                                         submit = {"ok": False, "reason": "bot-disabled-in-settings"}
-                                    elif args.move_input == "cursor" and low_clock_mode:
-                                        # The configured site's validated move API avoids the
-                                        # 600-800ms Selenium ActionChains round-trip seen in
-                                        # low-clock logs. It still validates side, legal move,
-                                        # expected FEN, and confirmation before reporting success.
-                                        print(
-                                            "[LOW CLOCK INPUT] Using validated site move API; skipping slow cursor drag.",
-                                            flush=True,
-                                        )
+                                    elif args.move_input == "cursor":
+                                        # Prefer the configured site's guarded game API for ALL
+                                        # moves. Its playUci handler passes animate:false, so
+                                        # thinking happens before submission rather than while the
+                                        # piece visibly travels across the board.
                                         submit = perform_api_move(
                                             driver, chosen_move.uci(), fen, active_bot_color,
-                                            low_clock_mode=True, source="low-clock-fast-path",
+                                            low_clock_mode=low_clock_mode,
+                                            source="instant-site-api",
                                         )
-                                    elif args.move_input == "cursor":
-                                        submit = perform_cursor_drag(
-                                            driver, chosen_move.uci(), fen, active_bot_color,
-                                            low_clock_mode=False,
-                                        )
+                                        if (
+                                            not submit.get("ok")
+                                            and not submit.get("api_accepted")
+                                            and submit.get("reason") in {
+                                                "game-move-api-unavailable",
+                                                "reader-not-installed",
+                                                "legal-moves-unavailable",
+                                                "legal-move-not-found",
+                                                "promotion-choice-not-exposed",
+                                            }
+                                        ):
+                                            print(
+                                                "[MOVE INPUT] Guarded site API unavailable for this move; "
+                                                "falling back to a direct, no-pause cursor gesture.",
+                                                flush=True,
+                                            )
+                                            submit = perform_cursor_drag(
+                                                driver, chosen_move.uci(), fen, active_bot_color,
+                                                low_clock_mode=low_clock_mode,
+                                            )
                                     else:
                                         submit = perform_api_move(
                                             driver, chosen_move.uci(), fen, active_bot_color,
@@ -5114,9 +5126,15 @@ def main() -> int:
                                                 f"overrun={max(0.0, move_elapsed - low_clock_total_budget_seconds):.3f}s.",
                                                 flush=True,
                                             )
-                                        if args.move_input == "cursor":
+                                        if args.move_input == "cursor" and submit.get("source") == "instant-site-api":
                                             print(
-                                                f"[CURSOR] Drag accepted | configured-travel={int(submit.get('drag_ms', 0))} ms "
+                                                f"[MOVE INPUT] Site API applied {chosen_san} without board travel animation "
+                                                f"| confirmation={float(submit.get('confirm_elapsed_ms', 0.0)):.1f} ms.",
+                                                flush=True,
+                                            )
+                                        elif args.move_input == "cursor" and submit.get("drag_ms") is not None:
+                                            print(
+                                                f"[CURSOR] Direct gesture accepted | configured-travel={int(submit.get('drag_ms', 0))} ms "
                                                 f"| action-roundtrip={float(submit.get('action_elapsed_ms', 0.0)):.1f} ms "
                                                 f"| confirmation={float(submit.get('confirm_elapsed_ms', 0.0)):.1f} ms "
                                                 f"| pre-delay={int(submit.get('pre_delay_ms', 0))} ms "
