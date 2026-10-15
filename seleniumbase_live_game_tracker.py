@@ -26,15 +26,15 @@ try:
     from selenium import webdriver
     from selenium.common.exceptions import WebDriverException
     from selenium.webdriver.common.action_chains import ActionChains
+except ImportError as exc:
+    raise SystemExit(
+        "Missing Selenium. Install with: python -m pip install -U selenium"
+    ) from exc
 
 try:
     import websocket  # Selenium's websocket-client dependency, used for low-latency CDP input.
 except ImportError:
     websocket = None
-except ImportError as exc:
-    raise SystemExit(
-        "Missing Selenium. Install with: python -m pip install -U selenium"
-    ) from exc
 
 try:
     from seleniumbase import Driver as SeleniumBaseDriver
