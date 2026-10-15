@@ -207,6 +207,35 @@ class MaterialSafetyAndPriorityTests(unittest.TestCase):
         self.assertEqual(meta.get("source"), "QUEEN_PROMOTION")
 
 
+class ClockParityProtectionTests(unittest.TestCase):
+    def test_close_clocks_suppress_discretionary_delays(self):
+        board = chess.Board("4k3/8/8/8/8/8/R7/4K3 w - - 0 30")
+        move = chess.Move.from_uci("a2a3")
+        profile = {
+            "seconds_per_decision": 2.0,
+            "clock_margin": 0.0,
+            "lead_buffer": 2.0,
+            "spendable_lead": 0.0,
+            "pace_scale": 1.0,
+        }
+        strategy._thinking_budget_remaining = None
+        with patch.object(strategy, "_sample_base_move_delay", return_value=1.2):
+            with patch.object(strategy, "_clock_time_profile", return_value=profile):
+                delay = strategy.natural_bot_move_delay(
+                    board,
+                    move,
+                    thinking_enabled=True,
+                    initial_time_seconds=60.0,
+                    remaining_time_seconds=20.0,
+                    opponent_time_seconds=20.0,
+                    low_clock_trigger_seconds=7.3,
+                    low_clock_mode=False,
+                )
+        self.assertGreaterEqual(delay, 0.0)
+        self.assertLessEqual(delay, 0.22)
+        strategy._thinking_budget_remaining = None
+
+
 class FastClockProtectionTests(unittest.TestCase):
     def test_endgame_pauses_are_available_but_bounded(self):
         self.assertGreater(strategy.BOT_ENDGAME_PAUSE_CHANCE, 0.0)
