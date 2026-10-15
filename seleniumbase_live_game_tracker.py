@@ -4865,11 +4865,10 @@ def main() -> int:
                                                 depth=8 if low_clock_mode else 12,
                                                 time=limit_seconds,
                                             ),
-                                            multipv=(
-                                                min(3, strategy_module.TRAINING_MULTI_PV)
-                                                if low_clock_mode
-                                                else strategy_module.TRAINING_MULTI_PV
-                                            ),
+                                            # Keep the baseline MultiPV candidate width even at low clock;
+                                            # the tiny search-time cap controls speed, while selection still
+                                            # needs enough legal alternatives for its weighted baseline policy.
+                                            multipv=strategy_module.TRAINING_MULTI_PV,
                                         )
                                         if not isinstance(engine_result, list):
                                             engine_result = [engine_result]
