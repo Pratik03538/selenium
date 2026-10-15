@@ -2388,6 +2388,82 @@ def choose_stockfish_move(
     best = candidates[0]
     best_cp = best["cp"]
 
+    # Emergency clock path: do not spend the last seconds on human-like
+    # rank shuffling or multi-stage advantage shaping. First check exact mate,
+    # then safe queen promotion / safe captures, and otherwise play Stockfish's
+    # top legal line. The tracker uses a single-PV search for this path.
+    if low_clock_mode:
+        candidate_by_move = {candidate["move"]: candidate for candidate in candidates}
+
+        for legal_move in board.legal_moves:
+            try:
+                after_mate = board.copy(stack=False)
+                after_mate.push(legal_move)
+            except Exception:
+                continue
+            if after_mate.is_checkmate():
+                mate_candidate = candidate_by_move.get(legal_move)
+                return (
+                    legal_move,
+                    mate_candidate["info"] if mate_candidate else None,
+                    {
+                        "rank": mate_candidate["rank"] if mate_candidate else 0,
+                        "current_cp": best_cp,
+                        "selected_cp": mate_candidate["cp"] if mate_candidate else best_cp,
+                        "source": "LOW_CLOCK_TACTIC",
+                        "reason": "LOW CLOCK IMMEDIATE CHECKMATE",
+                    },
+                )
+
+        promotion = find_priority_queen_promotion(board, candidates, best_cp)
+        if promotion is not None:
+            return (
+                promotion["move"],
+                promotion["info"],
+                {
+                    "rank": promotion["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": promotion["cp"],
+                    "source": "LOW_CLOCK_TACTIC",
+                    "reason": f"LOW CLOCK SAFE QUEEN PROMOTION | {promotion['reason_tag']}",
+                },
+            )
+
+        safe_capture = find_priority_capture(
+            board,
+            candidates,
+            best_cp,
+            force_endgame=len(board.piece_map()) <= 10,
+            engine=None,
+        )
+        if safe_capture is not None:
+            return (
+                safe_capture["move"],
+                safe_capture["info"],
+                {
+                    "rank": safe_capture["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": safe_capture["cp"],
+                    "source": "LOW_CLOCK_TACTIC",
+                    "reason": (
+                        f"LOW CLOCK {safe_capture['reason_tag']} | "
+                        f"VICTIM={safe_capture['victim_value']:.1f}"
+                    ),
+                },
+            )
+
+        return (
+            best["move"],
+            best["info"],
+            {
+                "rank": best["rank"],
+                "current_cp": best_cp,
+                "selected_cp": best_cp,
+                "source": "LOW_CLOCK_BEST",
+                "reason": "LOW CLOCK FAST BEST LEGAL MOVE",
+            },
+        )
+
     profile = adaptive_accuracy_profile(
         opponent_accuracy,
         opponent_sample_count
