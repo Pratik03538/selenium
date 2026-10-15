@@ -955,11 +955,24 @@ def prepare_bot_components(args, allowed_host, installed):
         raise RuntimeError(
             "Stockfish executable was not found. Set stockfish_path in the TXT settings or use --stockfish-path."
         )
+    engine = None
     try:
         engine = chess.engine.SimpleEngine.popen_uci(str(engine_path))
         engine.configure({"Threads": 2, "Hash": 128})
         configured_elo = configure_optional_bot_elo(engine)
+    except RuntimeError:
+        if engine is not None:
+            try:
+                engine.quit()
+            except Exception:
+                pass
+        raise
     except Exception as exc:
+        if engine is not None:
+            try:
+                engine.quit()
+            except Exception:
+                pass
         raise RuntimeError("Stockfish could not be started or configured. Check the configured executable.") from exc
 
     book = GMBook(BASE_DIR / "Ultimate_GM_Bullet.bin")
