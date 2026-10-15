@@ -3695,7 +3695,7 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(auto_play=None)
     parser.add_argument("--stockfish-path", default="", help="Stockfish executable path; can also be set as stockfish_path=... in TXT settings.")
     parser.add_argument("--engine-time", type=float, default=0.75, help="Maximum Stockfish search time per move in seconds; effective time is adapted to the remaining clock.")
-    parser.add_argument("--move-input", choices=("api", "cursor"), default=None, help="Move submission method; can also be set with move_input=api|cursor in tracker_settings.txt.")
+    parser.add_argument("--move-input", choices=("api", "cursor"), default=None, help="Move submission method; defaults to cursor; can also be set with move_input=api|cursor in tracker_settings.txt.")
     premove_group = parser.add_mutually_exclusive_group()
     premove_group.add_argument("--premove", dest="premove_enabled", action="store_true", help="Try best-effort premoves on the configured authorized site.")
     premove_group.add_argument("--no-premove", dest="premove_enabled", action="store_false", help="Disable premove attempts.")
@@ -3734,7 +3734,7 @@ def main() -> int:
         auto_setting = load_optional_txt_setting("auto_play").strip().lower()
         args.auto_play = auto_setting in {"1", "true", "yes", "on", "enabled"}
     if args.move_input is None:
-        args.move_input = load_optional_txt_setting("move_input").strip().lower() or "api"
+        args.move_input = load_optional_txt_setting("move_input").strip().lower() or "cursor"
     if args.move_input not in {"api", "cursor"}:
         print("[CONFIG ERROR] move_input must be api or cursor.", file=sys.stderr, flush=True)
         return 2
