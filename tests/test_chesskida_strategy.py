@@ -205,8 +205,9 @@ class MaterialSafetyAndPriorityTests(unittest.TestCase):
         )
 
         self.assertIn(selected_move, moves)
-        self.assertEqual(meta["rank"], 0)
-        self.assertEqual(meta["selected_cp"], -500)
+        self.assertNotEqual(selected_move, moves[0])
+        self.assertFalse(strategy.candidate_hangs_own_piece(board, selected_move))
+        self.assertLessEqual(meta["current_cp"] - meta["selected_cp"], 70)
 
     def test_safe_free_capture_has_priority_in_a_losing_evaluation(self):
         board = chess.Board("q6k/8/8/8/8/8/8/R3K3 w - - 0 1")
