@@ -2684,15 +2684,16 @@ PREMOVE_OPENING_FULLMOVE_MIN = 5
 PREMOVE_OPENING_FULLMOVE_MAX = 10
 PREMOVE_ENDGAME_MAX_PIECES = 10
 PREMOVE_MIN_BOT_EVAL_CP = -25
-PREMOVE_MAX_EVAL_DROP_CP = 40
+PREMOVE_MAX_EVAL_DROP_CP = 50
 PREMOVE_OPENING_MIN_BOT_EVAL_CP = -50
 PREMOVE_OPENING_MAX_EVAL_DROP_CP = 60
 PREMOVE_MATE_REPLY_MULTIPV = 3
 PREMOVE_MATE_FOLLOWUP_MULTIPV = 8
-# Middlegame recaptures: accept a reasonably broad reply set, not every legal blunder.
-# Rank is zero-indexed, so 4 means the top five replies; 175cp is a permissive gap.
-PREMOVE_LIKELY_REPLY_MAX_RANK = 4
-PREMOVE_LIKELY_REPLY_MAX_CP_GAP = 175
+# Middlegame recaptures: widen plausible-reply coverage slightly, then keep
+# the all-outcomes legality/material/evaluation checks as the final safety gate.
+# Rank is zero-indexed, so 5 means the top six replies; 200cp remains bounded.
+PREMOVE_LIKELY_REPLY_MAX_RANK = 5
+PREMOVE_LIKELY_REPLY_MAX_CP_GAP = 200
 
 
 def premove_phase_allowed(
@@ -3659,7 +3660,7 @@ def choose_premove_candidate(
         # Weighted random choice avoids always queuing the first MultiPV line.
         best_safe_eval = max(score for _move, score in safe_candidates)
         candidate_weights = [
-            max(0.15, 1.0 - (best_safe_eval - score) / 150.0)
+            max(0.20, 1.0 - (best_safe_eval - score) / 200.0)
             for _move, score in safe_candidates
         ]
         selected, selected_eval = random.choices(
@@ -5205,7 +5206,7 @@ def main() -> int:
                                     premove_analysis_budget_seconds = (
                                         random.uniform(0.10, 0.18)
                                         if low_clock_premove_mode
-                                        else random.uniform(0.45, 0.75)
+                                        else random.uniform(0.55, 0.85)
                                     )
                                     premove_analysis_deadline = (
                                         premove_cycle_started_at + premove_analysis_budget_seconds
