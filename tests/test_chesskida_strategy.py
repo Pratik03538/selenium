@@ -276,6 +276,29 @@ class OpeningFastPathTests(unittest.TestCase):
         strategy._thinking_budget_remaining = None
 
 
+class MoveDelayBandTests(unittest.TestCase):
+    def test_quick_medium_and_long_base_delay_bands_are_available(self):
+        board = chess.Board()
+        move = chess.Move.from_uci("e2e4")
+        with patch.object(strategy, "_timing_position_complexity", return_value=0.10):
+            with patch("chesskida_strategy.random.choices", side_effect=lambda population, weights, k: [population[0]]):
+                quick = strategy._sample_base_move_delay(board, move)
+        self.assertGreaterEqual(quick, 0.18)
+        self.assertLess(quick, 0.51)
+
+        with patch.object(strategy, "_timing_position_complexity", return_value=0.45):
+            with patch("chesskida_strategy.random.choices", side_effect=lambda population, weights, k: [population[1]]):
+                medium = strategy._sample_base_move_delay(board, move)
+        self.assertGreaterEqual(medium, 0.55)
+        self.assertLess(medium, 1.44)
+
+        with patch.object(strategy, "_timing_position_complexity", return_value=0.90):
+            with patch("chesskida_strategy.random.choices", side_effect=lambda population, weights, k: [population[2]]):
+                long = strategy._sample_base_move_delay(board, move)
+        self.assertGreaterEqual(long, 1.15)
+        self.assertLessEqual(long, strategy.BOT_EVERY_MOVE_DELAY_MAX)
+
+
 class RandomizedTimingTests(unittest.TestCase):
     def test_base_move_delay_uses_continuous_samples(self):
         board = chess.Board()
