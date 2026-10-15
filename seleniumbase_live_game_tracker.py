@@ -2474,7 +2474,7 @@ def _perform_cursor_drag_once(
 
     try:
         # Use W3C pointer actions with per-segment timing. Low-clock mode
-        # removes optional positioning/hover waits and shortens the drag.
+        # removes optional waits and keeps positioning/drag movement very short.
         if pre_delay_ms:
             time.sleep(pre_delay_ms / 1000.0)
 
@@ -2482,7 +2482,7 @@ def _perform_cursor_drag_once(
         pointer = actions.w3c_actions.pointer_action
         pointer.source.create_pointer_move(
             origin=board_element,
-            duration=0 if low_clock_mode else rng.randint(15, 35),
+            duration=rng.randint(1, 7) if low_clock_mode else rng.randint(15, 35),
             x=source_offset[0],
             y=source_offset[1],
         )
