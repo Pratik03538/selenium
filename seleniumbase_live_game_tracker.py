@@ -5792,7 +5792,7 @@ def main() -> int:
                                 low_clock_premove_mode = is_low_clock_mode(
                                     bot_clock_for_premove,
                                     low_clock_trigger_seconds,
-                                    short_control_fast_mode,
+                                    False,
                                 )
                                 low_clock_premove_budget_seconds = (
                                     random.uniform(0.025, 0.045)
