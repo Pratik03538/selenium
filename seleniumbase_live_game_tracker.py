@@ -3369,7 +3369,7 @@ def choose_middle_game_premove(
         # not prevent another candidate from passing the material/eval guards.
         for candidate in ordered[:3]:
             if any(
-                strategy_module.candidate_hangs_own_piece(after_capture, candidate)
+                _premove_candidate_is_safe(strategy_module, after_capture, candidate)
                 for _reply, after_capture in outcomes
             ):
                 continue
@@ -3424,7 +3424,7 @@ def choose_middle_game_premove(
 
     for candidate in candidates[:4]:
         if any(
-            strategy_module.candidate_hangs_own_piece(after_reply, candidate)
+            _premove_candidate_is_safe(strategy_module, after_reply, candidate)
             for _reply, after_reply in response_boards
         ):
             continue
@@ -3442,6 +3442,20 @@ def choose_middle_game_premove(
 
 
 PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP = 50
+
+
+def _premove_candidate_is_safe(strategy_module, board, move) -> bool:
+    """Fail closed if a premove hangs its own piece or exposes a free major piece."""
+    try:
+        if chess is None or board is None or move not in board.legal_moves:
+            return False
+        hangs_checker = getattr(strategy_module, "candidate_hangs_own_piece", None)
+        major_piece_checker = getattr(strategy_module, "candidate_exposes_free_major_piece", None)
+        if not callable(hangs_checker) or not callable(major_piece_checker):
+            return False
+        return not hangs_checker(board, move) and not major_piece_checker(board, move)
+    except Exception:
+        return False
 
 
 def choose_low_clock_conversion_premove(
@@ -3580,7 +3594,7 @@ def choose_low_clock_conversion_premove(
         # long search. A move is accepted only if it stays winning enough.
         checked = set()
         for _kind, _value, move in tactical[:6]:
-            if strategy_module.candidate_hangs_own_piece(hypothetical, move):
+            if _premove_candidate_is_safe(strategy_module, hypothetical, move):
                 continue
             uci = move.uci()
             if uci in checked:
@@ -3627,7 +3641,10 @@ def choose_low_clock_likely_reply_premove(
     """
     if chess is None or engine is None or board is None or strategy_module is None:
         return None, None, "low-clock-fallback-prerequisites-unavailable"
-    if not callable(getattr(strategy_module, "candidate_hangs_own_piece", None)):
+    if (
+        not callable(getattr(strategy_module, "candidate_hangs_own_piece", None))
+        or not callable(getattr(strategy_module, "candidate_exposes_free_major_piece", None))
+    ):
         return None, None, "low-clock-fallback-safety-check-unavailable"
 
     bot_turn = chess.WHITE if bot_color == "white" else chess.BLACK
@@ -3679,7 +3696,7 @@ def choose_low_clock_likely_reply_premove(
                 continue
             # Guarded cursor promotion premoves are supported on the configured site.
             # Reject an immediate, uncompensated material loss after this premove.
-            if strategy_module.candidate_hangs_own_piece(hypothetical, move):
+            if _premove_candidate_is_safe(strategy_module, hypothetical, move):
                 continue
             candidates.append((move, info))
             seen.add(move.uci())
@@ -3873,8 +3890,142 @@ class _DeadlineBoundEngine:
         return result
 
 
+def choose_promotion_threat_response_premove(
+    engine, board, strategy_module, bot_color: str, args,
+    analysis_deadline: float | None = None,
+) -> tuple[object | None, object | None, str]:
+    """Queue only a guarded response to an immediate opponent pawn promotion."""
+    if chess is None or engine is None or board is None or strategy_module is None:
+        return None, None, "promotion-response-prerequisites-unavailable"
+    bot_turn = chess.WHITE if bot_color == "white" else chess.BLACK
+    if board.turn == bot_turn or board.is_game_over(claim_draw=True):
+        return None, None, "promotion-response-not-opponent-turn-or-game-over"
+
+    promotion_moves = [move for move in board.legal_moves if move.promotion is not None]
+    if not promotion_moves:
+        return None, None, "no-immediate-promotion-threat"
+
+    try:
+        search_time = max(0.003, min(float(args.engine_time), 0.010))
+        promotion_lines = engine.analyse(
+            board,
+            chess.engine.Limit(depth=8, time=search_time),
+            multipv=min(12, len(promotion_moves)),
+            root_moves=promotion_moves,
+        )
+        if not isinstance(promotion_lines, list):
+            promotion_lines = [promotion_lines]
+        scored_promotions = []
+        for info in promotion_lines:
+            pv = info.get("pv") if isinstance(info, dict) else None
+            if not pv or pv[0] not in promotion_moves:
+                continue
+            score = _premove_score_for_bot(info, bot_color)
+            if score is not None:
+                scored_promotions.append((score, pv[0]))
+        if not scored_promotions:
+            return None, None, "promotion-threat-analysis-unavailable"
+
+        # Analyze the most harmful legal promotion, not an unrelated quiet reply.
+        _promotion_score, predicted_reply = min(scored_promotions, key=lambda item: item[0])
+        hypothetical = board.copy(stack=True)
+        hypothetical.push(predicted_reply)
+        if hypothetical.turn != bot_turn or hypothetical.is_game_over(claim_draw=True):
+            return None, predicted_reply, "promotion-threat-has-no-safe-follow-up"
+
+        if analysis_deadline is not None and time.monotonic() >= float(analysis_deadline) - 0.012:
+            return None, predicted_reply, "premove-analysis-deadline-exceeded"
+
+        own_lines = engine.analyse(
+            hypothetical,
+            chess.engine.Limit(depth=8, time=search_time),
+            multipv=min(12, max(1, hypothetical.legal_moves.count())),
+        )
+        if not isinstance(own_lines, list):
+            own_lines = [own_lines]
+        scored_own_lines = []
+        for info in own_lines:
+            pv = info.get("pv") if isinstance(info, dict) else None
+            if not pv or pv[0] not in hypothetical.legal_moves:
+                continue
+            score = _premove_score_for_bot(info, bot_color)
+            if score is not None:
+                scored_own_lines.append((score, pv[0]))
+        if not scored_own_lines:
+            return None, predicted_reply, "promotion-response-evaluation-unavailable"
+
+        best_after_promotion_eval = max(score for score, _move in scored_own_lines)
+        target_square = predicted_reply.to_square
+        candidate_moves = []
+        seen = set()
+
+        # Try taking the newly promoted piece first, but only if the capture
+        # remains legal, materially safe, and close enough to the best response.
+        for move in hypothetical.legal_moves:
+            if (
+                hypothetical.is_capture(move)
+                and move.to_square == target_square
+                and move.uci() not in seen
+            ):
+                candidate_moves.append(move)
+                seen.add(move.uci())
+        for _score, move in sorted(scored_own_lines, key=lambda item: item[0], reverse=True):
+            if move.uci() not in seen:
+                candidate_moves.append(move)
+                seen.add(move.uci())
+            if len(candidate_moves) >= 10:
+                break
+
+        safe_candidates = []
+        for move in candidate_moves:
+            if (
+                analysis_deadline is not None
+                and time.monotonic() >= float(analysis_deadline) - 0.012
+            ):
+                break
+            if getattr(args, "move_input", "api") == "cursor" and move.promotion is not None:
+                continue
+            if not _premove_candidate_is_safe(strategy_module, hypothetical, move):
+                continue
+            final_info = _single_premove_info(
+                engine,
+                hypothetical.copy(stack=True),
+                chess.engine.Limit(depth=7, time=search_time),
+                root_moves=[move],
+            )
+            selected_eval = _premove_score_for_bot(final_info, bot_color)
+            if selected_eval is None:
+                continue
+            if best_after_promotion_eval - selected_eval > 125:
+                continue
+            safe_candidates.append((move, selected_eval))
+
+        if not safe_candidates:
+            return None, predicted_reply, "promotion-threat-no-safe-premove-response"
+
+        best_safe_eval = max(score for _move, score in safe_candidates)
+        safe_promotion_captures = [
+            (move, score) for move, score in safe_candidates
+            if hypothetical.is_capture(move)
+            and move.to_square == target_square
+            and score >= best_safe_eval - 150
+        ]
+        selected, selected_eval = max(
+            safe_promotion_captures or safe_candidates,
+            key=lambda item: item[1],
+        )
+        reason = (
+            "promotion-threat-safe-capture-response"
+            if safe_promotion_captures
+            else "promotion-threat-safe-response"
+        )
+        return selected, predicted_reply, f"{reason} eval={selected_eval / 100:+.2f}"
+    except (chess.engine.EngineError, ValueError, RuntimeError, TypeError, AttributeError):
+        return None, None, "promotion-threat-response-analysis-failed"
+
+
 def choose_premove_candidate(
-    engine, board, strategy_module, bot_color: str, args, book=None,
+    engine, board, strategy_module, bot_color: str, args,
     opponent_match_history: list[float] | None = None,
     low_clock_mode: bool = False,
     analysis_deadline: float | None = None,
@@ -3893,6 +4044,14 @@ def choose_premove_candidate(
         if time.monotonic() >= float(analysis_deadline):
             return None, None, "premove-analysis-deadline-exceeded"
         engine = _DeadlineBoundEngine(engine, float(analysis_deadline))
+
+    # Never queue a generic speculative premove when the opponent has an
+    # immediate promotion available; analyze a safe response to that promotion.
+    if any(move.promotion is not None for move in board.legal_moves):
+        return choose_promotion_threat_response_premove(
+            engine, board, strategy_module, bot_color, args,
+            analysis_deadline=analysis_deadline,
+        )
 
     # At low clock, prioritize tactical conversion immediately. In a small
     # endgame with a clear material lead or a pawn one step from promotion,
@@ -4044,7 +4203,7 @@ def choose_premove_candidate(
             if selected.promotion is not None and cursor_input:
                 continue
             # A bounded eval drop alone can miss a one-move hanging piece.
-            if strategy_module.candidate_hangs_own_piece(hypothetical, selected):
+            if _premove_candidate_is_safe(strategy_module, hypothetical, selected):
                 continue
 
             after_selected = hypothetical.copy(stack=True)
@@ -5230,13 +5389,6 @@ def main() -> int:
                                     )
                                     low_clock_total_budget_seconds = (
                                         random.uniform(0.025, 0.045)
-                                        if (
-                                            low_clock_mode
-                                            and remaining_clock_seconds is not None
-                                            and opponent_clock_seconds is not None
-                                            and remaining_clock_seconds <= opponent_clock_seconds
-                                        )
-                                        else random.uniform(0.030, 0.055)
                                         if low_clock_mode else None
                                     )
                                     if low_clock_mode:
@@ -5644,13 +5796,6 @@ def main() -> int:
                                 )
                                 low_clock_premove_budget_seconds = (
                                     random.uniform(0.025, 0.045)
-                                    if (
-                                        low_clock_premove_mode
-                                        and bot_clock_for_premove is not None
-                                        and opponent_clock_for_premove is not None
-                                        and bot_clock_for_premove <= opponent_clock_for_premove
-                                    )
-                                    else random.uniform(0.030, 0.055)
                                     if low_clock_premove_mode else None
                                 )
                                 if low_clock_premove_mode:
