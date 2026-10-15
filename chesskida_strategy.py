@@ -689,6 +689,22 @@ def natural_bot_move_delay(
             delay = min(delay, random.uniform(0.060, 0.400))
         elif own_clock <= 45.0:
             delay = min(delay, random.uniform(0.120, 0.720))
+    # Keep ordinary opening moves brisk even when the opening book has no
+    # matching line. This avoids adding discretionary thinking pauses during
+    # the first ten full moves; forced replies still use the same safe path.
+    try:
+        opening_fast_path = (
+            int(board.fullmove_number) <= 10
+            and len(board.piece_map()) >= 26
+            and not board.is_check()
+        )
+    except Exception:
+        opening_fast_path = False
+    if opening_fast_path:
+        delay = min(float(delay), 0.12)
+        _last_bot_natural_delay = delay
+        return max(0.0, float(delay))
+
     _last_bot_natural_delay = delay
 
     if own_clock is None:
