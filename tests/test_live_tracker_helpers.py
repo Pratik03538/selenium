@@ -158,6 +158,28 @@ class LateClockAndPremoveSafetyTests(unittest.TestCase):
                 self.assertLessEqual(limit, 0.035)
                 self.assertAlmostEqual(limit, min(0.035, remaining * 0.004))
 
+    def test_opening_engine_search_is_bounded_in_one_minute_controls(self):
+        limit = calculate_engine_search_limit(
+            base_seconds=0.75,
+            remaining_seconds=55.0,
+            initial_seconds=60.0,
+            increment_seconds=0.0,
+            board=chess.Board(),
+        )
+        self.assertGreater(limit, 0.0)
+        self.assertLessEqual(limit, 0.18)
+
+    def test_opening_engine_search_has_a_slightly_larger_three_minute_cap(self):
+        limit = calculate_engine_search_limit(
+            base_seconds=0.75,
+            remaining_seconds=170.0,
+            initial_seconds=180.0,
+            increment_seconds=0.0,
+            board=chess.Board(),
+        )
+        self.assertGreater(limit, 0.0)
+        self.assertLessEqual(limit, 0.30)
+
     def test_relative_clock_deficit_tightens_normal_search_budget(self):
         board = chess.Board()
         common = dict(
@@ -206,10 +228,10 @@ class LateClockAndPremoveSafetyTests(unittest.TestCase):
 
 
 class PremovePhaseTests(unittest.TestCase):
-    def test_opening_premove_window_is_sampled_between_five_and_eight_fullmoves(self):
+    def test_opening_premove_window_is_sampled_between_five_and_ten_fullmoves(self):
         self.assertEqual(PREMOVE_OPENING_FULLMOVE_MIN, 5)
-        self.assertEqual(PREMOVE_OPENING_FULLMOVE_MAX, 8)
-        for opening_limit in range(5, 9):
+        self.assertEqual(PREMOVE_OPENING_FULLMOVE_MAX, 10)
+        for opening_limit in range(5, 11):
             with self.subTest(opening_limit=opening_limit):
                 inside = chess.Board(
                     f"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b KQkq - 0 {opening_limit}"
