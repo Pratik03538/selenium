@@ -5018,9 +5018,9 @@ def main() -> int:
                                                 depth=8 if low_clock_mode else 12,
                                                 time=limit_seconds,
                                             ),
-                                            # Keep the baseline MultiPV candidate width even at low clock;
-                                            # the tiny search-time cap controls speed, while selection still
-                                            # needs enough legal alternatives for its weighted baseline policy.
+                                            # Emergency mode uses one principal variation; the strategy
+                                            # then checks mate, all legal queen promotions and safe captures
+                                            # directly without spending time on fuzzy rank shuffling.
                                             multipv=(
                                                 1 if low_clock_mode
                                                 else strategy_module.TRAINING_MULTI_PV
