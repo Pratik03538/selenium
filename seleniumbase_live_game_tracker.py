@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import quote, urlsplit
-from urllib.request import Request, urlopen
+from urllib.request import urlopen
 
 try:
     from selenium import webdriver
@@ -1046,11 +1046,10 @@ def wake_configured_debugger_tab(debugger_address: str, allowed_host: str) -> bo
         target_id = str((target or {}).get("id") or "").strip()
         if not target_id:
             return False
-        activate_request = Request(
+        with urlopen(
             f"{base_url}/json/activate/{quote(target_id, safe='')}",
-            method="PUT",
-        )
-        with urlopen(activate_request, timeout=2.0) as response:
+            timeout=2.0,
+        ) as response:
             response.read()
         return True
     except Exception:
