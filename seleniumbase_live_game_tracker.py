@@ -1720,10 +1720,11 @@ window.__liveGameApiReader = {
     const sourceY = rect.top + (boardRow + 0.5) * rect.height / 8;
     const renderedSource = deepElementFromPoint(sourceX, sourceY);
     const renderedColor = pieceColorFromNode(renderedSource, board);
-    if (!renderedColor) {
-      return {ok: false, reason: 'ui-source-piece-color-unreadable', bottomSide: orientation.side};
-    }
-    if (renderedColor !== sourceColor) {
+    // The authoritative game FEN above already proved that the source square
+    // contains a piece of the configured side. Some custom SVG/canvas boards do
+    // not expose a readable color class at elementFromPoint(); fail closed only
+    // when the rendered piece explicitly contradicts the authoritative FEN.
+    if (renderedColor && renderedColor !== sourceColor) {
       return {
         ok: false,
         reason: 'ui-source-piece-color-mismatch',
@@ -1741,6 +1742,7 @@ window.__liveGameApiReader = {
       fenTurn,
       sourceColor,
       sourcePiece,
+      renderedColor: renderedColor || 'unreadable-fen-verified',
       premoveOnly: isPremove
     };
   },
