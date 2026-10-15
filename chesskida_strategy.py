@@ -2511,7 +2511,10 @@ def choose_stockfish_move(
                 )
 
         promotion = find_priority_queen_promotion(board, candidates, best_cp)
-        if promotion is not None:
+        if (
+            promotion is not None
+            and not candidate_hangs_own_piece(board, promotion["move"])
+        ):
             return (
                 promotion["move"],
                 promotion["info"],
@@ -2531,7 +2534,10 @@ def choose_stockfish_move(
             force_endgame=len(board.piece_map()) <= 10,
             engine=None,
         )
-        if safe_capture is not None:
+        if (
+            safe_capture is not None
+            and not candidate_hangs_own_piece(board, safe_capture["move"])
+        ):
             return (
                 safe_capture["move"],
                 safe_capture["info"],
@@ -2924,7 +2930,10 @@ def choose_stockfish_move(
             best_cp
         )
 
-        if priority_promotion is not None:
+        if (
+            priority_promotion is not None
+            and not candidate_hangs_own_piece(board, priority_promotion["move"])
+        ):
             return (
                 priority_promotion["move"],
                 priority_promotion["info"],
@@ -2949,7 +2958,10 @@ def choose_stockfish_move(
             engine=engine
         )
 
-        if priority_capture is not None:
+        if (
+            priority_capture is not None
+            and not candidate_hangs_own_piece(board, priority_capture["move"])
+        ):
             return (
                 priority_capture["move"],
                 priority_capture["info"],
@@ -3152,9 +3164,34 @@ def choose_stockfish_move(
         ]
 
         if not safe:
-            safe = [best]
-
-        if not safe:
+            # If the evaluation/rank band contains only hanging-piece moves,
+            # search the already-scored alternatives for the best non-hanging
+            # line before falling back to Stockfish's top move.
+            safe_alternatives = [
+                candidate for candidate in candidates
+                if candidate["rank"] <= effective_rank_cap
+                and not candidate_hangs_own_piece(board, candidate["move"])
+            ]
+            if safe_alternatives:
+                selected = max(
+                    safe_alternatives,
+                    key=lambda candidate: (candidate["cp"], -candidate["rank"]),
+                )
+                return (
+                    selected["move"],
+                    selected["info"],
+                    {
+                        "rank": selected["rank"],
+                        "current_cp": best_cp,
+                        "selected_cp": selected["cp"],
+                        "source": "PIECE_SAFETY_FALLBACK",
+                        "reason": (
+                            f"PIECE SAFETY FALLBACK | BEST={best_cp / 100:+.2f} "
+                            f"SELECTED={selected['cp'] / 100:+.2f} "
+                            f"RANK=#{selected['rank'] + 1}"
+                        ),
+                    },
+                )
             safe = [best]
 
         non_best = [
