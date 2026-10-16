@@ -34,7 +34,7 @@ class ChessTutorCommentaryTests(unittest.TestCase):
             scored_info([
                 self.d4,
                 chess.Move.from_uci("e7e5"),
-                chess.Move.from_uci("d2d4"),
+                chess.Move.from_uci("g1f3"),
             ], cp=-180),
         ]
 
