@@ -266,13 +266,14 @@ _INSTALL_OVERLAY = r"""(() => {
     'position:fixed;right:12px;bottom:12px;z-index:2147483646;' +
     'width:min(326px,calc(100vw - 20px));max-width:calc(100vw - 20px);' +
     'font:13px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;' +
-    'color-scheme:dark;pointer-events:auto;';
+    'color-scheme:dark;pointer-events:none;';
   const shadow = host.attachShadow({mode: 'open'});
   shadow.innerHTML = `
     <style>
       :host { all: initial; }
       * { box-sizing: border-box; }
       .panel {
+        pointer-events:auto;
         width: 100%; max-height: min(45vh, 390px);
         display:flex; flex-direction:column; overflow:hidden;
         background:rgba(18,24,34,.96); color:#edf3fa;
@@ -329,6 +330,7 @@ _INSTALL_OVERLAY = r"""(() => {
       :host(.collapsed) .panel { width:auto; max-height:none; resize:none; }
       :host(.collapsed) .status, :host(.collapsed) #arrows { display:none; }
       .chip {
+        pointer-events:auto;
         display:none; border:1px solid rgba(180,200,225,.28);
         border-radius:999px;background:#17202d;color:#f1f6fd;
         box-shadow:0 4px 18px rgba(0,0,0,.3);padding:8px 12px;
