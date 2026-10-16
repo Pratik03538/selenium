@@ -54,6 +54,19 @@ try:
 except ImportError:
     chess = None  # FEN/DOM capture works; reconstruction/autoplay need python-chess.
 
+try:
+    from chess_tutor import (
+        CoachSpeaker,
+        build_coach_commentary,
+        build_opponent_move_commentary,
+        voice_summary,
+    )
+except ImportError:
+    CoachSpeaker = None
+    build_coach_commentary = None
+    build_opponent_move_commentary = None
+    voice_summary = None
+
 BASE_DIR = Path(__file__).resolve().parent
 BLOCKED_PLATFORMS_FILE = BASE_DIR / "blocked_platforms.txt"
 # Use a new private log so a prior CSV with raw URLs is not appended to.
@@ -4276,6 +4289,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--result-selector", default="#game-result, [data-result]")
     parser.add_argument("--csv", default=str(DEFAULT_CSV))
     parser.add_argument("--queue-read-interval", type=float, default=0.2)
+    coach_group = parser.add_mutually_exclusive_group()
+    coach_group.add_argument(
+        "--coach", dest="coach_enabled", action="store_true",
+        help="Explain selected moves, likely opponent replies, and risky alternatives (default: enabled).",
+    )
+    coach_group.add_argument(
+        "--no-coach", dest="coach_enabled", action="store_false",
+        help="Disable live tutoring commentary.",
+    )
+    coach_voice_group = parser.add_mutually_exclusive_group()
+    coach_voice_group.add_argument(
+        "--coach-voice", dest="coach_voice", action="store_true",
+        help="Speak short coach summaries asynchronously using a local Windows voice.",
+    )
+    coach_voice_group.add_argument(
+        "--no-coach-voice", dest="coach_voice", action="store_false",
+        help="Keep tutor output in the terminal without speech.",
+    )
+    parser.set_defaults(coach_enabled=None, coach_voice=None)
     auto_group = parser.add_mutually_exclusive_group()
     auto_group.add_argument(
         "--auto-play", dest="auto_play", action="store_true",
@@ -4308,6 +4340,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    coach_speaker = None
     try:
         blocked_platforms = load_blocked_platforms()
     except RuntimeError:
@@ -4394,6 +4427,29 @@ def main() -> int:
     if args.auto_play and configured_player_name:
         print("[CONFIG] Player-name side detection enabled; configured name is hidden.", flush=True)
     print(f"[CONFIG] Settings loaded from the {settings_source}.", flush=True)
+
+    if args.coach_enabled is None:
+        raw_coach = load_optional_txt_setting("coach_enabled").strip().lower()
+        args.coach_enabled = raw_coach in {"1", "true", "yes", "on", "enabled"} if raw_coach else True
+    if args.coach_voice is None:
+        raw_coach_voice = load_optional_txt_setting("coach_voice").strip().lower()
+        args.coach_voice = (
+            raw_coach_voice in {"1", "true", "yes", "on", "enabled"}
+            if raw_coach_voice else True
+        )
+    if args.coach_enabled and build_coach_commentary is None:
+        print("[COACH] Tutor module unavailable; install the project files and dependencies.", flush=True)
+    elif args.coach_enabled:
+        if args.coach_voice and CoachSpeaker is not None:
+            coach_speaker = CoachSpeaker(enabled=True)
+        print(
+            f"[CONFIG] Chess tutor: enabled | voice: "
+            f"{'enabled' if coach_speaker is not None else 'disabled'}; "
+            "speech runs asynchronously and does not hold up move submission.",
+            flush=True,
+        )
+    else:
+        print("[CONFIG] Chess tutor: disabled.", flush=True)
 
     # Attach mode is unchanged; UC mode launches a dedicated SeleniumBase-managed browser.
     driver = None
@@ -5500,6 +5556,30 @@ def main() -> int:
                                                                 f"| score={move_quality:.1f}/100.",
                                                                 flush=True,
                                                             )
+                                                            if (
+                                                                args.coach_enabled
+                                                                and build_opponent_move_commentary is not None
+                                                            ):
+                                                                try:
+                                                                    opponent_coach_lines = build_opponent_move_commentary(
+                                                                        engine_board, estimated_cpl
+                                                                    )
+                                                                    for coach_line in opponent_coach_lines:
+                                                                        print(coach_line, flush=True)
+                                                                    if (
+                                                                        coach_speaker is not None
+                                                                        and voice_summary is not None
+                                                                        and not low_clock_mode
+                                                                    ):
+                                                                        coach_speaker.speak(
+                                                                            voice_summary(opponent_coach_lines)
+                                                                        )
+                                                                except Exception:
+                                                                    print(
+                                                                        "[COACH] Opponent-move explanation skipped; "
+                                                                        "the engine decision is unchanged.",
+                                                                        flush=True,
+                                                                    )
                                             except (chess.engine.EngineError, ValueError, TypeError, AttributeError, RuntimeError):
                                                 print("[OPPONENT QUALITY] Sample skipped; comparable evaluation unavailable.", flush=True)
                                             finally:
@@ -5590,6 +5670,30 @@ def main() -> int:
                                             status="Selected",
                                         )
                                     print(f"[STRATEGY] selected={chosen_san} | rank={rank_text} | {reason}", flush=True)
+
+                                    if args.coach_enabled and build_coach_commentary is not None:
+                                        try:
+                                            coach_lines = build_coach_commentary(
+                                                engine_board,
+                                                engine_result,
+                                                chosen_move,
+                                                selected_info=selected_info,
+                                                selection_meta=selection_meta,
+                                                max_alternatives=2,
+                                            )
+                                            for coach_line in coach_lines:
+                                                print(coach_line, flush=True)
+                                            if (
+                                                coach_speaker is not None
+                                                and voice_summary is not None
+                                                and not low_clock_mode
+                                            ):
+                                                coach_speaker.speak(voice_summary(coach_lines))
+                                        except Exception:
+                                            print(
+                                                "[COACH] Commentary skipped; selected move and timing are unchanged.",
+                                                flush=True,
+                                            )
 
                                     if low_clock_mode:
                                         wait_for_manual_verification(driver, allowed_host, cfg)
@@ -5997,6 +6101,11 @@ def main() -> int:
         print("[ERROR] Browser session or site-tab selection failed. Site details were not logged.", file=sys.stderr, flush=True)
         return 2
     finally:
+        if coach_speaker is not None:
+            try:
+                coach_speaker.close()
+            except Exception:
+                pass
         if book is not None:
             try:
                 book.close()
