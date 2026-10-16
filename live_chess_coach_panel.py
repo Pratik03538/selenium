@@ -1239,32 +1239,39 @@ def _launch_wrapped_bot() -> int:
         expected_color: str | None,
         *args,
         **kwargs,
-    ) -> None:
+    ) -> dict[str, object]:
+        """Show fresh commentary before this move and remember arrows for cleanup."""
         nonlocal tutor_engine
+        context: dict[str, object] = {
+            "cdp": None,
+            "orientation": "white",
+            "native_paths": [],
+        }
         if kwargs.get("allow_premove", False):
-            # A premove is queued for a future position; its final tactical line
-            # cannot be honestly explained as if it were already a legal move.
-            return
-        # Emergency mode still gets the instant arrow/text overlay below, but
-        # it skips the added engine search and intentional pause.
+            # A premove is queued for a future position, not an immediate move.
+            return context
+
         try:
             board = chess.Board(str(expected_fen))
             move = chess.Move.from_uci(str(uci))
         except (ValueError, TypeError):
-            return
+            return context
         if move not in board.legal_moves:
-            return
+            return context
 
         try:
             cdp_factory = tracker_globals.get("_direct_cdp_page_for_driver")
             cdp = cdp_factory(driver) if callable(cdp_factory) else None
             if cdp is None:
-                return
+                print("[COACH LIVE] Could not attach to the selected browser tab; move unchanged.", flush=True)
+                return context
+            context["cdp"] = cdp
             state = cdp.evaluate(_STATE_EXPRESSION, timeout=0.6)
             state = state if isinstance(state, dict) else {}
             orientation = str(state.get("bottomSide") or "white")
             if orientation not in {"white", "black"}:
                 orientation = "white"
+            context["orientation"] = orientation
 
             own_clock, gap = _side_clock_gap(state, expected_color)
             bot_color = (
@@ -1272,8 +1279,6 @@ def _launch_wrapped_bot() -> int:
                 else chess.BLACK if expected_color == "black"
                 else None
             )
-            # Draw the selected-move arrow and a short basic explanation first.
-            # Detailed calculation follows only when the clocks show a safe lead.
             quick_lines, quick_arrows, quick_highlights = _move_commentary(
                 board, move, bot_color, None, options.coach_engine_time
             )
@@ -1287,8 +1292,12 @@ def _launch_wrapped_bot() -> int:
                     selected_arrow.get("to", ""), orientation
                 )
             )
-            # Use the SVG arrow only when the site's actual board did not accept
-            # a native right-click drag. Destination square highlights stay visible.
+            if selected_arrow_drawn and selected_arrow:
+                context["native_paths"].append({
+                    "from": selected_arrow.get("from", ""),
+                    "to": selected_arrow.get("to", ""),
+                })
+
             quick_overlay_arrows = [] if selected_arrow_drawn else quick_arrows
             can_spend_analysis = (
                 not options.coach_no_engine
@@ -1302,32 +1311,32 @@ def _launch_wrapped_bot() -> int:
                 quick_lines.append({
                     "kind": "info",
                     "label": "FAST COMMENTARY",
-                    "text": "Extra Stockfish analysis disabled hai; selected move ka arrow aur available tactical note hi dikhaya jayega.",
+                    "text": "Extra Stockfish analysis disabled hai; selected move ka board arrow aur tactical note dikhaya ja raha hai.",
                 })
             elif not can_spend_analysis:
                 quick_lines.append({
                     "kind": "info",
                     "label": "CLOCK-SAFE MODE",
                     "text": (
-                        "Clock lead chhota hai ya clock data unavailable hai; "
-                        "extra engine calculation skip ki. Agar measured lead allow kare "
-                        "to sirf bounded short pause use hogi."
+                        "Clock lead chhota ya unreadable hai; is move par extra engine search skip ki gayi. "
+                        "Selected move aur basic explanation dikh rahe hain."
                     ),
                 })
 
             cdp.evaluate(_INSTALL_OVERLAY, timeout=0.8)
             _ui_update(cdp, {
-                "status": "Explaining selected move before execution",
-                "mode": "SELECTED MOVE • READ-ONLY COACH",
+                "status": f"Live analysis • {board.san(move)}",
+                "mode": "FRESH PRE-MOVE ANALYSIS",
                 "clock": (
                     f"W {state.get('whiteClock') or '—'}  ·  B {state.get('blackClock') or '—'}"
                 ),
-                "footnote": "Existing move selector and selected UCI remain unchanged.",
+                "footnote": "Right-click arrows clear after confirmed submission; next selected move is analysed afresh.",
                 "messages": quick_lines[-MAX_FEED_LINES:],
                 "arrows": quick_overlay_arrows,
                 "highlights": quick_highlights,
                 "orientation": orientation,
             })
+            print(f"[COACH LIVE] Fresh pre-move analysis: {board.san(move)} ({uci}).", flush=True)
 
             active_engine = None
             if can_spend_analysis:
@@ -1343,18 +1352,24 @@ def _launch_wrapped_bot() -> int:
                 if arrows and not selected_arrow_drawn:
                     overlay_arrows.append(arrows[0])
                 for reply_arrow in arrows[1:]:
-                    if not _draw_right_click_board_arrow(
+                    reply_drawn = _draw_right_click_board_arrow(
                         driver, reply_arrow.get("from", ""),
                         reply_arrow.get("to", ""), orientation
-                    ):
+                    )
+                    if reply_drawn:
+                        context["native_paths"].append({
+                            "from": reply_arrow.get("from", ""),
+                            "to": reply_arrow.get("to", ""),
+                        })
+                    else:
                         overlay_arrows.append(reply_arrow)
                 _ui_update(cdp, {
-                    "status": "Explained • executing selected move next",
-                    "mode": "SELECTED MOVE • READ-ONLY COACH",
+                    "status": f"Live analysis • {board.san(move)}",
+                    "mode": "FRESH PRE-MOVE ANALYSIS",
                     "clock": (
                         f"W {state.get('whiteClock') or '—'}  ·  B {state.get('blackClock') or '—'}"
                     ),
-                    "footnote": "Native right-click arrows on the board; the selected UCI stays unchanged.",
+                    "footnote": "Fresh engine line is for explanation only; existing selected UCI stays unchanged.",
                     "messages": detailed_lines[-MAX_FEED_LINES:],
                     "arrows": overlay_arrows,
                     "highlights": highlights,
@@ -1364,12 +1379,12 @@ def _launch_wrapped_bot() -> int:
                 no_engine_lines = quick_lines + [{
                     "kind": "info",
                     "label": "ENGINE UNAVAILABLE",
-                    "text": "Stockfish tutor analysis start nahi ho saka; selected move unchanged hai, basic commentary hi dikhayi ja rahi hai.",
+                    "text": "Tutor Stockfish start nahi hua; selected move unchanged hai, basic commentary dikhayi ja rahi hai.",
                 }]
                 explanation_lines = no_engine_lines
                 _ui_update(cdp, {
-                    "status": "Quick explanation • executing selected move next",
-                    "mode": "SELECTED MOVE • READ-ONLY COACH",
+                    "status": f"Quick live explanation • {board.san(move)}",
+                    "mode": "FRESH PRE-MOVE ANALYSIS",
                     "clock": (
                         f"W {state.get('whiteClock') or '—'}  ·  B {state.get('blackClock') or '—'}"
                     ),
@@ -1379,20 +1394,21 @@ def _launch_wrapped_bot() -> int:
                     "orientation": orientation,
                 })
 
-            # Re-read clocks after analysis and rendering. Pause only by the amount
-            # that still preserves the configured measured lead; unknown clocks mean no wait.
+            # Don't wait when clocks are unreadable or this is an emergency move.
             if options.explain_pause <= 0 or kwargs.get("low_clock_mode", False):
-                return
+                return context
             latest = cdp.evaluate(_STATE_EXPRESSION, timeout=0.5)
             if not isinstance(latest, dict):
-                return
+                return context
             _, latest_gap = _side_clock_gap(latest, expected_color)
             if latest_gap is None:
-                return
+                return context
+
             has_critical_warning = any(
                 str(line.get("kind", "")) == "warning"
                 or any(token in str(line.get("label", "")).upper()
                        for token in ("WARNING", "MATE", "TACTICAL REPLY"))
+                or "mate in" in str(line.get("text", "")).lower()
                 for line in explanation_lines
             )
             if has_critical_warning:
@@ -1401,35 +1417,67 @@ def _launch_wrapped_bot() -> int:
                 requested_pause = min(options.explain_pause, 1.2)
             else:
                 requested_pause = min(options.explain_pause, 0.9)
-            allowed_pause = min(
-                requested_pause,
-                max(0.0, latest_gap - options.clock_margin),
-            )
+            allowed_pause = min(requested_pause, max(0.0, latest_gap - options.clock_margin))
+            if allowed_pause >= 0.75:
+                _ui_update(cdp, {
+                    "speak": _voice_commentary(
+                        board, move, bot_color, explanation_lines, allowed_pause
+                    )
+                })
             if allowed_pause > 0:
-                if allowed_pause >= 0.75:
-                    _ui_update(cdp, {
-                        "speak": _voice_commentary(
-                            board, move, bot_color, explanation_lines, allowed_pause
-                        )
-                    })
-                print(f"[COACH] Explanation pause={allowed_pause:.2f}s "
-                      f"(critical={has_critical_warning}, measured_clock_gap={latest_gap:.2f}s).",
-                      flush=True)
+                print(
+                    f"[COACH LIVE] Explanation pause={allowed_pause:.2f}s "
+                    f"(critical={has_critical_warning}, measured_clock_gap={latest_gap:.2f}s).",
+                    flush=True,
+                )
                 time.sleep(allowed_pause)
+            # Do not cancel speech at the end of this pause; let the short line finish.
+            return context
+        except Exception as exc:
+            print(
+                f"[COACH LIVE] Analysis hiccup ({type(exc).__name__}: {exc}); "
+                "the original selected move will continue unchanged.",
+                flush=True,
+            )
+            return context
+
+    def finish_coach_after_move(driver, context, submit_result) -> None:
+        """Clear this move's annotations only after the original tracker confirms it."""
+        if not isinstance(submit_result, dict) or not submit_result.get("ok"):
+            return
+        if not isinstance(context, dict):
+            return
+
+        orientation = str(context.get("orientation") or "white")
+        if orientation not in {"white", "black"}:
+            orientation = "white"
+        native_paths = context.get("native_paths")
+        if isinstance(native_paths, list):
+            # Most chess boards toggle a right-drag annotation when the same
+            # arrow is drawn a second time. Reverse order avoids overlapping cases.
+            for path_item in reversed(native_paths):
+                if not isinstance(path_item, dict):
+                    continue
                 try:
-                    cdp.evaluate(
-                        "window.__liveChessCoachPanel && window.__liveChessCoachPanel.stopSpeech()",
-                        timeout=0.35,
+                    _draw_right_click_board_arrow(
+                        driver, str(path_item.get("from", "")),
+                        str(path_item.get("to", "")), orientation
                     )
                 except Exception:
                     pass
-        except Exception as exc:
-            # Coaching failure must not replace, cancel, or alter the chosen move.
-            print(
-                f"[COACH] Pre-move explanation skipped ({type(exc).__name__}); "
-                "continuing with the existing selected move.",
-                flush=True,
-            )
+
+        cdp = context.get("cdp")
+        if cdp is not None:
+            try:
+                _ui_update(cdp, {
+                    "status": "Move played • waiting for next move",
+                    "arrows": [],
+                    "highlights": [],
+                    "footnote": "Previous arrows cleared. The next selected move will be analysed live.",
+                })
+            except Exception:
+                pass
+        print("[COACH LIVE] Confirmed move submitted; previous arrows/highlights cleared.", flush=True)
 
     try:
         tracker_globals = runpy.run_path(
@@ -1446,28 +1494,34 @@ def _launch_wrapped_bot() -> int:
 
         def wrapped_cursor(driver, uci, expected_fen, expected_color,
                            allow_premove=False, low_clock_mode=False):
+            context = None
             if not allow_premove:
-                explain_before_submit(
+                context = explain_before_submit(
                     driver, uci, expected_fen, expected_color,
                     allow_premove=False, low_clock_mode=low_clock_mode,
                 )
-            return original_cursor(
+            result = original_cursor(
                 driver, uci, expected_fen, expected_color,
                 allow_premove=allow_premove,
                 low_clock_mode=low_clock_mode,
             )
+            if not allow_premove:
+                finish_coach_after_move(driver, context, result)
+            return result
 
         def wrapped_api(driver, uci, expected_fen, expected_color, *,
                         low_clock_mode=False, source="api"):
-            explain_before_submit(
+            context = explain_before_submit(
                 driver, uci, expected_fen, expected_color,
                 allow_premove=False, low_clock_mode=low_clock_mode,
             )
-            return original_api(
+            result = original_api(
                 driver, uci, expected_fen, expected_color,
                 low_clock_mode=low_clock_mode,
                 source=source,
             )
+            finish_coach_after_move(driver, context, result)
+            return result
 
         tracker_globals["perform_cursor_drag"] = wrapped_cursor
         tracker_globals["perform_api_move"] = wrapped_api
