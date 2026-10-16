@@ -1,0 +1,7 @@
+# Domains blocked by the live tracker and Stockfish autoplay.
+# One hostname per line; subdomains of each hostname are blocked too.
+# Add or remove entries here instead of editing Python code.
+chess.com
+lichess.org
+chess24.com
+chessclub.com

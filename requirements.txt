@@ -1,0 +1,4 @@
+# Python dependencies for seleniumbase_live_game_tracker.py
+selenium>=4.51.0
+python-chess>=1.999
+seleniumbase>=4.56.1

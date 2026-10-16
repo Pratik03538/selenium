@@ -1,0 +1,3745 @@
+"""ChessKida fast-main-baseline move-selection logic, separated from board I/O.
+
+This module retains Stockfish candidate selection, mate/capture/promotion handling,
+evaluation helpers, adaptive accuracy state, and the original thinking-delay policy.
+It deliberately contains no screen capture, scrcpy, Selenium, or mouse code.
+"""
+from __future__ import annotations
+
+import random
+import time
+
+import chess
+import chess.engine
+
+# Constants used by the extracted strategy/timing functions.
+ANALYSIS_TIME = 0.010
+ANALYSIS_DEPTH = 8
+BOT_EVERY_MOVE_DELAY_MIN = 0.035
+BOT_EVERY_MOVE_DELAY_MAX = 2.100
+BOT_THINKING_ENABLED_DEFAULT = True
+BOT_THINKING_START_AFTER_MOVE = 5
+BOT_BOOK_INSTANT_MOVES = 5
+BOT_ENDGAME_PAUSE_MIN = 0.25
+BOT_ENDGAME_PAUSE_MAX = 2.400
+BOT_ENDGAME_PAUSE_CHANCE = 0.20
+BOT_PAUSE_MOVE_COOLDOWN_MIN = 2
+BOT_PAUSE_MOVE_COOLDOWN_MAX = 12
+BOT_PAUSE_ELIGIBILITY_SCALE = 0.78
+BOT_POST_50_MOVE = 50
+BOT_MATE_PAUSE_MIN_MATE = 1
+BOT_MATE_PAUSE_MAX_MATE = 5
+BOT_THINK_PAUSE_MIN = 0.450
+BOT_THINK_PAUSE_MAX = 8.500
+BOT_MATE_PAUSE_MIN = 1.5
+BOT_MATE_PAUSE_MAX = 6.5
+BOT_THINK_BUDGET_MIN = 14.0
+BOT_THINK_BUDGET_MAX = 26.0
+BOT_THINK_ELIGIBILITY_MIN = 0.16
+BOT_THINK_ELIGIBILITY_MAX = 0.82
+BOT_THINK_REASONABLE_CP = 60
+BOT_THINK_UNCERTAINTY_CP = 75
+BOT_THINK_SHARP_EVAL_CP = 80
+BOT_THINK_STRATEGIC_LEGAL_MOVES = 24
+HUMAN_SELECTION_DIVERSITY_EXTRA_DROP = 0.04
+TRAINING_MULTI_PV = 15
+FORCE_BEST_MIN_CP = 200
+FORCE_BEST_IMPROVEMENT_FRACTION = 0.65
+HUMAN_ADVANTAGE_START_CP = 400
+HUMAN_ADVANTAGE_MAINTAIN_BAND_CP = 30
+HUMAN_ADVANTAGE_PROTECT_BAND_CP = 30
+HUMAN_ADVANTAGE_HOLD_MIN_MOVES = 1
+HUMAN_ADVANTAGE_HOLD_MAX_MOVES = 3
+HUMAN_ADVANTAGE_GROWTH_STEP_MIN_CP = 20
+HUMAN_ADVANTAGE_GROWTH_STEP_MAX_CP = 45
+HUMAN_ADVANTAGE_GROWTH_TRIGGER_CP = 15
+HUMAN_ADVANTAGE_GROWTH_PREFERENCE_MIN_CP = 10
+HUMAN_ADVANTAGE_GROWTH_PREFERENCE_MAX_CP = 35
+HUMAN_WINNING_GUARD_START_CP = 60
+HUMAN_WINNING_GUARD_MAX_DROP_CP = 45
+# Restore the fast-main-baseline rank limits for winning positions.
+# Evaluation and hanging-piece guards still gate every candidate.
+HUMAN_WINNING_GUARD_RANK_CAP = 5
+HUMAN_STRONG_WINNING_CP = 300
+HUMAN_STRONG_WINNING_RANK_CAP = 3
+HUMAN_WINNING_NON_BEST_CHANCE = 0.45
+HUMAN_STRONG_WINNING_NON_BEST_CHANCE = 0.25
+FREE_CAPTURE_MIN_VALUE = 3
+FREE_CAPTURE_MAX_CP_DROP = 100
+FREE_CAPTURE_SAFETY_DEPTH = 10
+FREE_CAPTURE_SAFETY_MAX_CP_DROP = 250
+FREE_CAPTURE_SAFETY_MAX_PLY = 4
+MATE_FORCE_FAST_MAX = 5
+MATE_GRACE_MIN = 6
+MATE_GRACE_MAX = 15
+MATE_SUSTAIN_MIN_MOVES = 2
+MATE_SUSTAIN_MAX_MOVES = 3
+MATE_SLOWER_LINE_CHANCE = 0.35
+HUMAN_SELECTION_EXTRA_DROP_CP = 70
+HUMAN_SELECTION_DISTANCE_CP = 80.0
+HUMAN_SELECTION_NON_BEST_CHANCE = 0.88
+HUMAN_SELECTION_TOP12_MAX_CHANCE = 0.10
+# Normal/equal positions should prefer ranks #3+ when safe alternatives exist.
+NON_ADVANTAGE_TOP12_MAX_CHANCE = 0.05
+# Avoid recently used MultiPV ranks when other safe choices exist.
+RANK_DIVERSITY_WINDOW = 4
+MATE_CLEANUP_MAX_REMAINING_PIECES = 1
+MATE_CLEANUP_MIN_VALUE = 1
+MIN_POSITIVE_CP = 5
+# Controlled eval tolerance for non-winning positions.
+NON_ADVANTAGE_SELECTION_MAX_DROP_CP = 70
+MAX_CONSECUTIVE_RANK1_SELECTIONS = 2
+OPPONENT_ACCURACY_WINDOW = 12
+OPPONENT_MIN_SAMPLES = 5
+ADAPTIVE_MIN_TARGET = 80.0
+ADAPTIVE_MAX_TARGET = 95.0
+ADAPTIVE_SAFETY_MARGIN = 1.0
+ADAPTIVE_STRONG_THRESHOLD = 90.0
+ADAPTIVE_VERY_STRONG_THRESHOLD = 94.0
+
+# Stateful strategy and timing values retained across moves in a game.
+_mate_progress_target_mate = None
+_mate_progress_hold_moves = 0
+_mate_progress_hold_limit = 2
+_advantage_progress_target_cp = None
+_advantage_target_cp = None
+_advantage_hold_moves = 0
+_advantage_hold_limit = 2
+_advantage_last_selected_cp = None
+_advantage_light_drop_used = False
+_advantage_down_streak = 0
+_advantage_progress_hold_moves = 0
+_advantage_progress_hold_limit = 2
+_advantage_progress_side = None
+_last_bot_natural_delay = None
+_bot_timing_move_count = 0
+_thinking_budget_remaining = None
+_thinking_budget_total = None
+_thinking_move_cooldown_remaining = 0
+_mate_pause_used = False
+_rank1_selection_streak = 0
+_recent_selected_ranks = []
+_thinking_warmup_moves = None
+_book_fast_move_limit = None
+_thinking_clock_reserve_fraction = None
+_quick_only_clock_threshold = None
+
+
+def _near_equal_selection_pool(candidates, best_cp, rank_cap):
+    """Build a bounded fallback pool: wider before a clear +4.0 advantage."""
+    drop_cap = NON_ADVANTAGE_SELECTION_MAX_DROP_CP if best_cp < HUMAN_ADVANTAGE_START_CP else 20
+    floor_cp = best_cp - drop_cap
+    pool = [candidate for candidate in candidates if candidate["cp"] >= floor_cp and candidate["rank"] <= rank_cap]
+    return pool, floor_cp, drop_cap
+
+
+def _limit_rank1_streak_pool(candidates, consecutive_rank1):
+    """After two #1 choices, prefer an eligible alternative when available."""
+    pool = list(candidates)
+    if consecutive_rank1 < MAX_CONSECUTIVE_RANK1_SELECTIONS:
+        return pool, False
+    alternatives = [candidate for candidate in pool if int(candidate["rank"]) > 0]
+    if alternatives and any(int(candidate["rank"]) == 0 for candidate in pool):
+        return alternatives, True
+    return pool, False
+
+
+def _diversify_rank_pool(candidates, recent_ranks=None, window=RANK_DIVERSITY_WINDOW):
+    """Avoid ranks used in recent turns whenever another safe rank is available."""
+    pool = list(candidates)
+    if len(pool) <= 1:
+        return pool, []
+
+    try:
+        window = max(1, int(window))
+    except (TypeError, ValueError):
+        window = RANK_DIVERSITY_WINDOW
+    try:
+        recent = [int(rank) for rank in list(recent_ranks or [])[-window:] if rank is not None]
+    except (TypeError, ValueError):
+        recent = []
+
+    if not recent:
+        return pool, []
+
+    used = set(recent)
+    alternatives = [c for c in pool if int(c["rank"]) not in used]
+    if alternatives:
+        return alternatives, sorted(used)
+
+    # When the safe choices are few, relax older history but avoid an immediate
+    # repeat whenever another candidate is available.
+    last_rank = recent[-1]
+    alternatives = [c for c in pool if int(c["rank"]) != last_rank]
+    if alternatives:
+        return alternatives, [last_rank]
+    return pool, []
+
+
+def _record_rank_selection(rank):
+    global _rank1_selection_streak, _recent_selected_ranks
+    try:
+        rank = int(rank)
+    except (TypeError, ValueError):
+        return
+    if rank < 0:
+        return
+    _rank1_selection_streak = _rank1_selection_streak + 1 if rank == 0 else 0
+    _recent_selected_ranks.append(rank)
+    del _recent_selected_ranks[:-RANK_DIVERSITY_WINDOW]
+
+
+def score_to_cp(score):
+    if score.is_mate():
+        mate = score.mate()
+
+        if mate is None:
+            return 0
+
+        return (
+            100000
+            if mate > 0
+            else -100000
+        )
+
+    value = score.score(
+        mate_score=100000
+    )
+
+    return (
+        0
+        if value is None
+        else int(value)
+    )
+
+def format_eval(cp):
+    if cp >= 100000:
+        return "MATE WHITE"
+
+    if cp <= -100000:
+        return "MATE BLACK"
+
+    return f"{cp / 100.0:+.2f}"
+
+def favor_text(cp):
+    if cp >= 100000:
+        return "WHITE MATE"
+
+    if cp <= -100000:
+        return "BLACK MATE"
+
+    if abs(cp) <= 8:
+        return "EQUAL"
+
+    side = (
+        "WHITE"
+        if cp > 0
+        else "BLACK"
+    )
+
+    return (
+        f"{side} "
+        f"+{abs(cp) / 100.0:.2f}"
+    )
+
+def material_value(
+    piece_type
+):
+    return {
+        chess.PAWN: 100,
+        chess.KNIGHT: 320,
+        chess.BISHOP: 330,
+        chess.ROOK: 500,
+        chess.QUEEN: 900,
+        chess.KING: 0,
+    }.get(
+        piece_type,
+        0
+    )
+
+def side_material(
+    board,
+    color
+):
+    total = 0
+
+    for square, piece in board.piece_map().items():
+        if piece.color == color:
+            total += material_value(
+                piece.piece_type
+            )
+
+    return total
+
+def classify_move_quality(
+    before_board,
+    after_board,
+    move,
+    mover_color,
+    best_move,
+    best_eval_cp,
+    after_eval_cp
+):
+    if move == best_move:
+        if (
+            before_board.is_castling(move)
+            or move.promotion is not None
+            or before_board.gives_check(move)
+        ):
+            return "BEST"
+
+        return "EXCELLENT"
+
+    if best_eval_cp >= 100000:
+        if after_eval_cp >= 100000:
+            return "BRILLIANT*"
+
+        return "BLUNDER"
+
+    loss = max(
+        0,
+        best_eval_cp - after_eval_cp
+    )
+
+    material_before = side_material(
+        before_board,
+        mover_color
+    )
+
+    material_after = side_material(
+        after_board,
+        mover_color
+    )
+
+    sacrifice = (
+        material_after
+        < material_before
+    )
+
+    if loss <= 10 and sacrifice:
+        return "BRILLIANT*"
+
+    if loss <= 10:
+        return "EXCELLENT"
+
+    if loss <= 25:
+        return "GREAT"
+    if loss <= 70:
+        return "GOOD"
+
+    if loss <= 150:
+        return "INACCURACY"
+
+    if loss <= 300:
+        return "MISTAKE"
+
+    return "BLUNDER"
+
+def _timing_position_complexity(
+    board,
+    move,
+    engine_result=None,
+    selection_meta=None,
+) -> float:
+    """Estimate decision complexity from the actual position and candidate spread."""
+    complexity = 0.0
+    try:
+        legal_count = board.legal_moves.count()
+        complexity += min(0.28, max(0, legal_count - 12) * 0.009)
+    except Exception:
+        pass
+    try:
+        if board.is_check():
+            complexity += 0.16
+        if board.gives_check(move):
+            complexity += 0.12
+        if board.is_capture(move):
+            complexity += 0.08
+        if move.promotion is not None:
+            complexity += 0.18
+        if len(board.piece_map()) <= 12:
+            complexity += 0.10
+    except Exception:
+        pass
+
+    scores = []
+    if isinstance(engine_result, list):
+        for info in engine_result[:TRAINING_MULTI_PV]:
+            try:
+                score_obj = info.get("score")
+                if score_obj is None:
+                    continue
+                cp = score_to_cp(score_obj.pov(board.turn))
+                if cp is not None:
+                    scores.append(int(cp))
+            except Exception:
+                continue
+    if len(scores) >= 2:
+        gap = abs(scores[0] - scores[1])
+        if gap <= BOT_THINK_UNCERTAINTY_CP:
+            complexity += 0.18
+        if sum(abs(score - scores[0]) <= BOT_THINK_REASONABLE_CP for score in scores) >= 3:
+            complexity += 0.12
+
+    if isinstance(selection_meta, dict):
+        try:
+            rank = int(selection_meta.get("rank", 0))
+            if rank >= 2:
+                complexity += min(0.10, rank * 0.018)
+        except (TypeError, ValueError):
+            pass
+        reason = str(selection_meta.get("reason", "")).lower()
+        if any(token in reason for token in ("controlled shuffle", "advantage maintain", "mate")):
+            complexity += 0.06
+
+    return min(1.0, max(0.0, complexity))
+
+
+def _sample_base_move_delay(
+    board,
+    move,
+    engine_result=None,
+    selection_meta=None,
+    forced=False,
+    opening_book=False,
+) -> float:
+    """Sample a complexity-aware delay; clock management applies the final budget."""
+    complexity = _timing_position_complexity(
+        board, move, engine_result=engine_result, selection_meta=selection_meta
+    )
+    if forced or opening_book:
+        # Forced/book moves are already prepared; keep their handling quick.
+        low = random.uniform(0.012, 0.040)
+        high = random.uniform(0.075, 0.300)
+        mode_fraction = random.uniform(0.18, 0.48)
+        mode = low + (high - low) * min(0.88, mode_fraction)
+        base = random.triangular(low, high, mode)
+        return min(
+            BOT_EVERY_MOVE_DELAY_MAX,
+            max(BOT_EVERY_MOVE_DELAY_MIN, base * (0.82 + 0.35 * complexity)
+                + random.uniform(0.0, 0.080)),
+        )
+
+    # Routine positions are usually quick, medium decisions receive a
+    # moderate base delay, and genuinely complex positions can receive a
+    # longer base delay. This is then scaled/capped by the live clock profile.
+    if complexity < 0.30:
+        bands = ((0.60, 0.18, 0.42), (0.32, 0.55, 1.15), (0.08, 1.15, 1.80))
+    elif complexity < 0.68:
+        bands = ((0.44, 0.18, 0.42), (0.38, 0.55, 1.30), (0.18, 1.15, 2.10))
+    else:
+        bands = ((0.27, 0.18, 0.42), (0.42, 0.55, 1.35), (0.31, 1.15, 2.10))
+    _weight, low, high = random.choices(
+        bands, weights=[band[0] for band in bands], k=1
+    )[0]
+    base = random.uniform(low, high)
+    micro_jitter = random.uniform(0.0, 0.080)
+    return min(
+        BOT_EVERY_MOVE_DELAY_MAX,
+        max(BOT_EVERY_MOVE_DELAY_MIN, base + micro_jitter),
+    )
+
+def _sample_thinking_pause(pause_max: float, complexity: float = 0.0) -> float:
+    """Sample a continuous thinking pause, bounded by available clock and budget."""
+    high = max(0.0, float(pause_max))
+    if high <= 0.0:
+        return 0.0
+    complexity = min(1.0, max(0.0, float(complexity)))
+    # One continuous per-call distribution replaces short/medium/long bins.
+    low = min(random.uniform(0.10, 0.42), high)
+    mode_fraction = random.triangular(
+        0.12, 0.82, min(0.82, max(0.12, 0.28 + 0.38 * complexity))
+    )
+    mode = low + (high - low) * mode_fraction
+    if high <= low:
+        return max(0.0, high)
+    return random.triangular(low, high, min(high, max(low, mode)))
+
+
+def _estimate_remaining_decisions(board) -> int:
+    """Estimate our remaining decisions from the phase, not a fixed move number."""
+    try:
+        pieces = len(board.piece_map())
+    except Exception:
+        pieces = 32
+    if pieces <= 6:
+        return 14
+    if pieces <= 12:
+        return 20
+    if pieces <= 20:
+        return 28
+    return 36
+
+
+def _clock_time_profile(
+    board,
+    remaining_seconds=None,
+    initial_seconds=None,
+    increment_seconds=0.0,
+    opponent_seconds=None,
+):
+    """Return a per-decision allowance and delay scale based on live clocks.
+
+    This is a timing budget only. It reserves clock for actual moves and uses
+    increment as future time, while allowing extra discretionary time only when
+    the position/time situation safely supports it.
+    """
+    try:
+        own = max(0.0, float(remaining_seconds)) if remaining_seconds is not None else None
+    except (TypeError, ValueError):
+        own = None
+    try:
+        opponent = max(0.0, float(opponent_seconds)) if opponent_seconds is not None else None
+    except (TypeError, ValueError):
+        opponent = None
+    try:
+        initial = max(0.0, float(initial_seconds)) if initial_seconds is not None else None
+    except (TypeError, ValueError):
+        initial = None
+    try:
+        increment = max(0.0, min(60.0, float(increment_seconds or 0.0)))
+    except (TypeError, ValueError):
+        increment = 0.0
+
+    if own is None:
+        return {
+            "own_clock": None, "opponent_clock": opponent, "clock_margin": None,
+            "expected_decisions": _estimate_remaining_decisions(board),
+            "seconds_per_decision": None, "pace_scale": 1.0,
+            "lead_buffer": 0.0, "spendable_lead": 0.0,
+        }
+
+    expected = _estimate_remaining_decisions(board)
+    reference = initial if initial and initial > 0.0 else own
+    reserve = max(0.35, min(reference * 0.08, own * 0.18))
+    future_increment = increment * expected
+    available = max(0.0, own + future_increment - reserve)
+    seconds_per_decision = available / max(1, expected)
+    pace_scale = min(1.90, max(0.25, seconds_per_decision / 2.75))
+
+    margin = own - opponent if opponent is not None else None
+    lead_buffer = max(1.5, min(4.0, reference * 0.04))
+    spendable_lead = max(0.0, margin - lead_buffer) if margin is not None else 0.0
+    if margin is not None:
+        if margin < 0.0:
+            # Gradually accelerate as the deficit grows; a 0.1s deficit should
+            # not cause the same pacing jump as a 10s deficit.
+            deficit_scale = min(1.0, abs(margin) / max(1.5, reference * 0.05))
+            pace_scale *= 1.0 - 0.30 * deficit_scale
+        elif spendable_lead > 0.0:
+            # Spend only a small share of the safe clock lead on normal pacing.
+            pace_scale *= 1.0 + min(0.18, spendable_lead * 0.006)
+    pace_scale = min(1.90, max(0.25, pace_scale))
+    return {
+        "own_clock": own, "opponent_clock": opponent, "clock_margin": margin,
+        "expected_decisions": expected,
+        "seconds_per_decision": seconds_per_decision, "pace_scale": pace_scale,
+        "lead_buffer": lead_buffer, "spendable_lead": spendable_lead,
+    }
+
+
+def _clock_deficit_forces_fast_pacing(
+    own_seconds, opponent_seconds, initial_seconds=None
+) -> bool:
+    """Whether a meaningful clock deficit should suppress discretionary thinking."""
+    try:
+        own = max(0.0, float(own_seconds)) if own_seconds is not None else None
+        opponent = max(0.0, float(opponent_seconds)) if opponent_seconds is not None else None
+        initial = max(0.0, float(initial_seconds)) if initial_seconds is not None else None
+    except (TypeError, ValueError):
+        return False
+    if own is None or opponent is None:
+        return False
+    reference = initial if initial is not None and initial > 0.0 else max(own, opponent, 1.0)
+    deficit_threshold = max(4.0, min(10.0, reference * 0.08))
+    return (opponent - own) >= deficit_threshold
+
+
+def natural_bot_move_delay(
+    board,
+    move,
+    engine_result=None,
+    selection_meta=None,
+    moves_since_buffer=0,
+    thinking_enabled=BOT_THINKING_ENABLED_DEFAULT,
+    previous_eval_white_cp=None,
+    initial_time_seconds=None,
+    remaining_time_seconds=None,
+    opponent_time_seconds=None,
+    increment_seconds=0.0,
+    is_opening_book_move=False,
+    low_clock_trigger_seconds=10.0,
+    low_clock_total_budget_seconds=None,
+    elapsed_seconds_before_delay=0.0,
+    submission_reserve_seconds=0.0,
+    low_clock_mode=None,
+):
+    """Return a move delay; low-clock waits fit inside one total latency budget.
+
+    Timing policy:
+      * routine move delays vary with position complexity
+      * book/tactical moves stay relatively quick but are not always zero-delay
+      * thinking pauses use a skewed short/medium/long distribution
+      * optional pauses remain clock-bounded and consume a finite game budget
+      * the sampled opening warm-up avoids multi-second pauses
+    """
+    global _last_bot_natural_delay
+    global _bot_timing_move_count
+    global _thinking_budget_remaining
+    global _thinking_budget_total
+    global _thinking_move_cooldown_remaining
+    global _mate_pause_used
+    global _thinking_warmup_moves
+    global _book_fast_move_limit
+    global _thinking_clock_reserve_fraction
+    global _quick_only_clock_threshold
+
+    if _thinking_budget_remaining is None or len(board.move_stack) <= 1:
+        _bot_timing_move_count = 0
+        _thinking_warmup_moves = random.randint(2, BOT_THINKING_START_AFTER_MOVE)
+        _book_fast_move_limit = random.randint(2, min(5, BOT_BOOK_INSTANT_MOVES))
+        _thinking_clock_reserve_fraction = 0.36
+        think_fraction_range = (0.22, 0.34)
+        increment_share_range = (0.10, 0.18)
+        if initial_time_seconds is not None and float(initial_time_seconds) > 0:
+            initial_clock = float(initial_time_seconds)
+            if initial_clock <= 60.0:
+                _thinking_clock_reserve_fraction = random.uniform(0.42, 0.50)
+                think_fraction_range = (0.12, 0.20)
+                increment_share_range = (0.10, 0.18)
+            elif initial_clock <= 180.0:
+                _thinking_clock_reserve_fraction = random.uniform(0.35, 0.44)
+                think_fraction_range = (0.18, 0.27)
+                increment_share_range = (0.10, 0.18)
+            else:
+                _thinking_clock_reserve_fraction = random.uniform(0.30, 0.40)
+            if initial_clock <= 90.0:
+                # Keep normal position-based thinking available until the
+                # actual late-clock window in blitz/bullet-sized controls.
+                _quick_only_clock_threshold = min(
+                    10.0, max(5.0, initial_clock * random.uniform(0.10, 0.18))
+                )
+            else:
+                # Longer controls can still switch to quick-only mode later,
+                # while preserving more time for complex decisions earlier.
+                _quick_only_clock_threshold = min(
+                    25.0, max(10.0, initial_clock * random.uniform(0.06, 0.10))
+                )
+            # Sample a fresh game budget while protecting time for later turns.
+            expected = _estimate_remaining_decisions(board)
+            increment = max(0.0, float(increment_seconds or 0.0))
+            reserve = initial_clock * _thinking_clock_reserve_fraction
+            think_fraction = random.uniform(*think_fraction_range)
+            increment_share = random.uniform(*increment_share_range)
+            _thinking_budget_total = min(
+                max(0.0, initial_clock - reserve),
+                initial_clock * think_fraction + increment * expected * increment_share,
+            )
+        else:
+            _quick_only_clock_threshold = random.uniform(8.0, 25.0)
+            _thinking_budget_total = random.uniform(
+                BOT_THINK_BUDGET_MIN, BOT_THINK_BUDGET_MAX
+            )
+        _thinking_budget_remaining = _thinking_budget_total
+        _thinking_move_cooldown_remaining = 0
+        _mate_pause_used = False
+
+    _bot_timing_move_count += 1
+
+    own_clock = None
+    try:
+        own_clock = (
+            max(0.0, float(remaining_time_seconds))
+            if remaining_time_seconds is not None else None
+        )
+    except (TypeError, ValueError):
+        pass
+
+    opponent_clock = None
+    try:
+        opponent_clock = (
+            max(0.0, float(opponent_time_seconds))
+            if opponent_time_seconds is not None else None
+        )
+    except (TypeError, ValueError):
+        pass
+
+    clock_profile = _clock_time_profile(
+        board,
+        remaining_seconds=own_clock,
+        initial_seconds=initial_time_seconds,
+        increment_seconds=increment_seconds,
+        opponent_seconds=opponent_clock,
+    )
+    clock_pace_seconds = clock_profile["seconds_per_decision"]
+    clock_margin = clock_profile["clock_margin"]
+    clock_lead_buffer = clock_profile["lead_buffer"]
+    clock_spendable_lead = clock_profile["spendable_lead"]
+
+    # Late-clock threshold is sampled once per game by the caller.
+    # Only the final 5-10s window changes; all regular-clock timing stays intact.
+    try:
+        low_clock_threshold = min(10.0, max(5.0, float(low_clock_trigger_seconds)))
+    except (TypeError, ValueError):
+        low_clock_threshold = 10.0
+    use_low_clock_path = (
+        bool(low_clock_mode)
+        if low_clock_mode is not None
+        else own_clock is not None and own_clock <= low_clock_threshold
+    )
+    if own_clock is not None and use_low_clock_path:
+        try:
+            total_budget = (
+                random.choice((0.030, 0.040, 0.050))
+                if low_clock_total_budget_seconds is None
+                else min(0.060, max(0.020, float(low_clock_total_budget_seconds)))
+            )
+        except (TypeError, ValueError):
+            total_budget = random.choice((0.030, 0.040, 0.050))
+        try:
+            elapsed_before = max(0.0, float(elapsed_seconds_before_delay))
+        except (TypeError, ValueError):
+            elapsed_before = 0.0
+        try:
+            reserve = min(0.080, max(0.0, float(submission_reserve_seconds)))
+        except (TypeError, ValueError):
+            reserve = 0.0
+        # The engine work and any earlier handling have already consumed part
+        # of the end-to-end budget. Sleep only the unspent portion; cursor/API
+        # submission has a reserved allowance instead of adding another delay.
+        quick_delay = max(0.0, total_budget - elapsed_before - reserve)
+        _last_bot_natural_delay = quick_delay
+        print(
+            f"[CLOCK MODE] own={own_clock:.2f}s threshold={low_clock_threshold:.2f}s "
+            f"target={total_budget:.3f}s elapsed={elapsed_before:.3f}s "
+            f"reserve={reserve:.3f}s wait={quick_delay:.3f}s",
+            flush=True,
+        )
+        return quick_delay
+
+    # Short per-move delay depends on complexity, with broad independent bands.
+    base_delay = _sample_base_move_delay(
+        board,
+        move,
+        engine_result=engine_result,
+        selection_meta=selection_meta,
+        opening_book=is_opening_book_move,
+    )
+    delay = base_delay
+    # Normal quiet moves scale with the clock's estimated per-decision allowance.
+    # Book moves, captures/recaptures, checks and promotions still hit the fast path below.
+    pace_scale = float(clock_profile["pace_scale"])
+    delay = min(BOT_EVERY_MOVE_DELAY_MAX * 1.75, delay * pace_scale)
+    # These are upper caps on the sampled delay, not fixed target delays.
+    if own_clock is not None:
+        if own_clock <= 18.0:
+            delay = min(delay, random.choice((
+                random.uniform(0.025, 0.080),
+                random.uniform(0.050, 0.145),
+                random.uniform(0.085, 0.240),
+            )))
+        elif own_clock <= 30.0:
+            delay = min(delay, random.uniform(0.060, 0.400))
+        elif own_clock <= 45.0:
+            delay = min(delay, random.uniform(0.120, 0.720))
+    # Forced/tactical replies should not consume an artificial pause budget.
+    try:
+        if (
+            board.is_check()
+            or board.is_capture(move)
+            or board.is_castling(move)
+            or move.promotion is not None
+            or board.gives_check(move)
+        ):
+            quick_delay = _sample_base_move_delay(
+                board,
+                move,
+                engine_result=engine_result,
+                selection_meta=selection_meta,
+                forced=True,
+            )
+            quick_delay = min(quick_delay, delay)
+            _last_bot_natural_delay = quick_delay
+            return quick_delay
+    except Exception:
+        pass
+
+    # Keep ordinary opening moves brisk even when the opening book has no
+    # matching line. This avoids adding discretionary thinking pauses during
+    # the first ten full moves; forced replies still use the same safe path.
+    try:
+        opening_fast_path = (
+            int(board.fullmove_number) <= 10
+            and len(board.piece_map()) >= 26
+            and not board.is_check()
+            and not is_opening_book_move
+        )
+    except Exception:
+        opening_fast_path = False
+    if opening_fast_path:
+        # Keep the opening brisk without flattening every move to the same
+        # 120ms cap. Quiet developing moves receive a fresh, small cap;
+        # captures/checks/promotions and prepared book moves have separate paths.
+        opening_cap = random.uniform(0.055, 0.240)
+        delay = min(float(delay), opening_cap)
+        _last_bot_natural_delay = delay
+        return max(0.0, float(delay))
+
+    _last_bot_natural_delay = delay
+
+    if own_clock is None:
+        # Unknown own clock means there is no reliable pause budget. Keep a short
+        # base delay only; never add discretionary multi-second thinking pauses.
+        conservative_delay = min(float(delay), random.uniform(0.035, 0.220))
+        _last_bot_natural_delay = conservative_delay
+        print(
+            "[BOT CLOCK] Own clock unavailable; optional thinking pause suppressed.",
+            flush=True,
+        )
+        return max(0.0, conservative_delay)
+
+    # Never let optional pauses consume the clock reserve needed to finish and
+    # confirm a move. The remaining clock is an observation, not a fake timer.
+    if remaining_time_seconds is not None and _thinking_budget_remaining is not None:
+        try:
+            remaining_clock = max(0.0, float(remaining_time_seconds))
+            if initial_time_seconds is not None and float(initial_time_seconds) > 0:
+                clock_reserve = max(1.0, float(initial_time_seconds) * float(_thinking_clock_reserve_fraction or 0.36))
+            else:
+                clock_reserve = max(0.25, min(2.0, remaining_clock * 0.08))
+            safe_pause_budget = max(0.0, remaining_clock - clock_reserve)
+            _thinking_budget_remaining = min(
+                float(_thinking_budget_remaining), safe_pause_budget
+            )
+        except (TypeError, ValueError):
+            pass
+
+    # Opening-book moves are already known; do not wait unnecessarily on the
+    # first eight book selections. The site must still confirm the move.
+    if is_opening_book_move and _bot_timing_move_count <= int(_book_fast_move_limit or BOT_BOOK_INSTANT_MOVES):
+        # A book choice is already prepared; keep it quick regardless of the
+        # larger discretionary allowance available in a long time control.
+        delay = min(base_delay, delay, 0.185)
+        _last_bot_natural_delay = delay
+        return max(0.010, float(delay))
+
+    # Clock parity by itself must not flatten healthy midgame timing to 35-220ms.
+    # Suppress pauses only when the clock is genuinely late or the deficit is
+    # material; otherwise allow the position-based pause gate to add longer thinks.
+    if own_clock is not None and opponent_clock is not None:
+        try:
+            spendable_clock_lead = float(clock_spendable_lead)
+        except (TypeError, ValueError):
+            spendable_clock_lead = 0.0
+        deficit_forces_fast = _clock_deficit_forces_fast_pacing(
+            own_clock, opponent_clock, initial_time_seconds
+        )
+        late_clock_fast = own_clock <= low_clock_threshold
+        if spendable_clock_lead < 4.0 and (late_clock_fast or deficit_forces_fast):
+            parity_delay = min(float(delay), random.uniform(0.035, 0.220))
+            _last_bot_natural_delay = parity_delay
+            clock_relation = (
+                "behind opponent"
+                if own_clock < opponent_clock
+                else "protecting clock parity"
+            )
+            fast_reason = "late clock" if late_clock_fast else "material clock deficit"
+            print(
+                f"[BOT CLOCK] {clock_relation}; safe lead={spendable_clock_lead:.1f}s, "
+                f"{fast_reason}, optional pause suppressed, delay={parity_delay:.3f}s.",
+                flush=True,
+            )
+            return max(0.0, parity_delay)
+        if spendable_clock_lead < 4.0:
+            print(
+                "[BOT CLOCK] Clocks close; keeping randomized position-based timing.",
+                flush=True,
+            )
+
+    # Sampled opening warm-up moves: no long pause.
+    if _bot_timing_move_count <= int(_thinking_warmup_moves or BOT_THINKING_START_AFTER_MOVE):
+        return max(0.0, float(delay))
+
+    if not thinking_enabled:
+        return max(0.0, float(delay))
+
+    # Under 25s on our own clock, use quick moves and avoid discretionary pauses.
+    if (
+        own_clock is not None
+        and own_clock <= float(_quick_only_clock_threshold or 25.0)
+    ):
+        return max(0.0, float(delay))
+
+    # If we have materially less time than the opponent, do not add a long
+    # optional thinking pause. Keep only a short, situation-shaped move delay.
+    if _clock_deficit_forces_fast_pacing(
+        own_clock, opponent_clock, initial_time_seconds
+    ):
+        deficit = max(0.0, float(opponent_clock) - float(own_clock))
+        accelerated_delay = min(float(delay), random.uniform(0.035, 0.220))
+        _last_bot_natural_delay = accelerated_delay
+        print(
+            f"[BOT CLOCK] Behind opponent by {deficit:.1f}s; "
+            f"skipping discretionary pause, delay={accelerated_delay:.3f}s.",
+            flush=True,
+        )
+        return max(0.0, accelerated_delay)
+
+    # Late/endgame positions use occasional short pauses rather than the
+    # regular multi-second pause. Piece count complements move-count detection.
+    try:
+        endgame_mode = (
+            _bot_timing_move_count > BOT_POST_50_MOVE
+            or len(board.piece_map()) <= 10
+        )
+    except Exception:
+        endgame_mode = _bot_timing_move_count > BOT_POST_50_MOVE
+
+    if endgame_mode:
+        if _thinking_budget_remaining is None or _thinking_budget_remaining <= 0.05:
+            return max(0.0, float(delay))
+        pause_max = min(
+            BOT_ENDGAME_PAUSE_MAX,
+            float(_thinking_budget_remaining)
+        )
+        if clock_pace_seconds is not None:
+            endgame_complexity_for_cap = _timing_position_complexity(
+                board, move, engine_result=engine_result, selection_meta=selection_meta
+            )
+            pace_pause_cap = clock_pace_seconds * (
+                0.90 + 1.40 * endgame_complexity_for_cap
+            )
+            try:
+                already_spent = max(0.0, float(elapsed_seconds_before_delay)) + max(0.0, float(delay))
+            except (TypeError, ValueError):
+                already_spent = max(0.0, float(delay))
+            pace_pause_cap = max(0.0, pace_pause_cap - already_spent)
+            if clock_margin is not None:
+                if clock_margin < 0.0:
+                    pace_pause_cap *= 0.62
+                elif clock_spendable_lead > 0.0:
+                    pace_pause_cap += min(1.25, clock_spendable_lead * 0.08)
+            pause_max = min(pause_max, max(0.0, pace_pause_cap))
+        if remaining_time_seconds is not None:
+            try:
+                remaining_clock = max(0.0, float(remaining_time_seconds))
+                if initial_time_seconds is not None and float(initial_time_seconds) > 0:
+                    reserve = max(1.0, float(initial_time_seconds) * float(_thinking_clock_reserve_fraction or 0.36))
+                else:
+                    reserve = max(0.25, min(1.0, remaining_clock * 0.10))
+                pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
+            except (TypeError, ValueError):
+                pass
+        endgame_complexity = _timing_position_complexity(
+            board, move, engine_result=engine_result, selection_meta=selection_meta
+        )
+        pause_chance = min(
+            BOT_ENDGAME_PAUSE_CHANCE,
+            0.06 + 0.14 * endgame_complexity,
+        )
+        if pause_max < BOT_ENDGAME_PAUSE_MIN or random.random() >= pause_chance:
+            return max(0.0, float(delay))
+        pause_duration = _sample_thinking_pause(pause_max, endgame_complexity)
+        _thinking_budget_remaining = max(
+            0.0, float(_thinking_budget_remaining) - pause_duration
+        )
+        _last_bot_natural_delay = delay + pause_duration
+        print(
+            f"[BOT PAUSE] duration={pause_duration:.3f}s "
+            f"reason=ENDGAME_SHORT remaining_budget={_thinking_budget_remaining:.3f}s "
+            f"moves={_bot_timing_move_count}",
+            flush=True
+        )
+        return max(0.0, float(delay + pause_duration))
+
+    if (
+        _thinking_budget_remaining is None
+        or _thinking_budget_remaining <= BOT_THINK_PAUSE_MIN
+    ):
+        return max(0.0, float(delay))
+
+    # Minimum move gap after every real pause.
+    # The refractory length itself is randomized from 5-12 moves. This is
+    # only a hard minimum; once it expires, the current position must still
+    # pass the situation-based stochastic eligibility gate below.
+    if _thinking_move_cooldown_remaining > 0:
+        _thinking_move_cooldown_remaining -= 1
+        return max(0.0, float(delay))
+
+    signal_score = 0.0
+
+    # Multiple reasonable moves / evaluation uncertainty from MultiPV.
+    scores = []
+    if isinstance(engine_result, list):
+        for info in engine_result[:TRAINING_MULTI_PV]:
+            try:
+                score_obj = info.get("score")
+                if score_obj is None:
+                    continue
+
+                cp = score_to_cp(
+                    score_obj.pov(board.turn)
+                )
+
+                if cp is not None:
+                    scores.append(int(cp))
+            except Exception:
+                continue
+
+    if len(scores) >= 2:
+        top_cp = scores[0]
+
+        reasonable_count = sum(
+            1
+            for cp in scores
+            if abs(cp - top_cp) <= BOT_THINK_REASONABLE_CP
+        )
+
+        if reasonable_count >= 2:
+            signal_score += 0.34
+
+        second_gap = abs(scores[1] - top_cp)
+
+        if second_gap <= BOT_THINK_UNCERTAINTY_CP:
+            signal_score += 0.24
+
+    # Position immediately after a tactical/forcing change.
+    if board.move_stack:
+        try:
+            previous_board = board.copy(stack=True)
+            last_move = previous_board.pop()
+
+            previous_was_tactical = (
+                previous_board.is_capture(last_move)
+                or previous_board.is_castling(last_move)
+                or last_move.promotion is not None
+                or previous_board.gives_check(last_move)
+            )
+
+            if previous_was_tactical:
+                signal_score += 0.22
+        except Exception:
+            pass
+
+    # Sharp evaluation change relative to the previous completed analysis.
+    if (
+        previous_eval_white_cp is not None
+        and scores
+    ):
+        try:
+            current_eval_white_cp = score_to_cp(
+                engine_result[0]["score"].pov(chess.WHITE)
+            )
+
+            if (
+                current_eval_white_cp is not None
+                and abs(
+                    int(current_eval_white_cp)
+                    - int(previous_eval_white_cp)
+                ) >= BOT_THINK_SHARP_EVAL_CP
+            ):
+                signal_score += 0.22
+        except Exception:
+            pass
+
+    # Strategic decision point: many legal choices.
+    try:
+        legal_count = board.legal_moves.count()
+    except Exception:
+        legal_count = 0
+
+    if legal_count >= BOT_THINK_STRATEGIC_LEGAL_MOVES:
+        signal_score += 0.14
+
+    # Include the overall position's calculated complexity so a genuinely
+    # difficult quiet decision can earn a little more thinking time. Tactical
+    # captures/checks still return through the fast path above.
+    try:
+        complexity = _timing_position_complexity(
+            board, move, engine_result=engine_result, selection_meta=selection_meta
+        )
+        signal_score += min(0.30, complexity * 0.35)
+    except Exception:
+        pass
+
+    # Strongly forcing current moves are poor pause candidates.
+    try:
+        forced_move = (
+            board.is_check()
+            or board.is_capture(move)
+            or board.is_castling(move)
+            or move.promotion is not None
+            or board.gives_check(move)
+        )
+    except Exception:
+        forced_move = False
+
+    if forced_move:
+        signal_score *= 0.35
+
+    if signal_score <= 0.0:
+        return max(0.0, float(delay))
+
+    # Position-dependent random eligibility.
+    #
+    # Important: there is NO target like "pause again at move 8/10/12".
+    # The sampled opening block above is only a hard minimum. Once it expires, this
+    # stochastic position gate is evaluated independently on each move.
+    # Weak/quiet positions tend to wait longer; genuinely rich positions
+    # can pause soon after the minimum block.
+    eligibility = min(
+        BOT_THINK_ELIGIBILITY_MAX,
+        max(
+            BOT_THINK_ELIGIBILITY_MIN,
+            (
+                BOT_THINK_ELIGIBILITY_MIN
+                + signal_score * BOT_PAUSE_ELIGIBILITY_SCALE
+            )
+        )
+    )
+    if clock_margin is not None:
+        if clock_margin < 0.0:
+            reference_clock = (
+                max(1.0, float(initial_time_seconds))
+                if initial_time_seconds is not None else max(1.0, own_clock)
+            )
+            deficit_scale = min(
+                1.0, abs(clock_margin) / max(2.0, reference_clock * 0.12)
+            )
+            eligibility *= 1.0 - 0.28 * deficit_scale
+        elif clock_spendable_lead > 0.0:
+            eligibility = min(BOT_THINK_ELIGIBILITY_MAX, eligibility * 1.10)
+
+    if random.random() >= eligibility:
+        return max(0.0, float(delay))
+
+    # Budget safety.
+    if _thinking_budget_remaining <= BOT_THINK_PAUSE_MIN:
+        return max(0.0, float(delay))
+
+    pause_complexity_for_cap = min(1.0, max(0.0, signal_score / 1.55))
+    # A single long think is capped at 4s. Use the 3-4s end of the range only
+    # for genuinely complex positions with a level/ahead clock; if behind,
+    # keep any discretionary pause short to protect the remaining clock.
+    pause_max = min(
+        BOT_THINK_PAUSE_MAX,
+        4.0,
+        float(_thinking_budget_remaining),
+    )
+    if clock_margin is not None and clock_margin < 0.0:
+        pause_max = min(pause_max, 1.25)
+    elif pause_complexity_for_cap < 0.58:
+        pause_max = min(pause_max, 2.0)
+    if clock_pace_seconds is not None:
+        # Allocate extra time from position complexity, but subtract engine
+        # processing and the base delay already spent on this decision.
+        pace_pause_cap = clock_pace_seconds * (
+            1.05 + 1.75 * pause_complexity_for_cap
+        )
+        try:
+            already_spent = max(0.0, float(elapsed_seconds_before_delay)) + max(0.0, float(delay))
+        except (TypeError, ValueError):
+            already_spent = max(0.0, float(delay))
+        pace_pause_cap = max(0.0, pace_pause_cap - already_spent)
+        if clock_margin is not None:
+            if clock_margin < 0.0:
+                reference_clock = (
+                    max(1.0, float(initial_time_seconds))
+                    if initial_time_seconds is not None else max(1.0, own_clock)
+                )
+                deficit_scale = min(
+                    1.0, abs(clock_margin) / max(2.0, reference_clock * 0.12)
+                )
+                pace_pause_cap *= 1.0 - 0.35 * deficit_scale
+            elif clock_spendable_lead > 0.0:
+                pace_pause_cap += min(1.5, clock_spendable_lead * 0.10)
+        pause_max = min(pause_max, max(0.0, pace_pause_cap))
+    if remaining_time_seconds is not None:
+        try:
+            remaining_clock = max(0.0, float(remaining_time_seconds))
+            if initial_time_seconds is not None and float(initial_time_seconds) > 0:
+                reserve = max(1.0, float(initial_time_seconds) * float(_thinking_clock_reserve_fraction or 0.36))
+            else:
+                reserve = max(0.25, min(2.0, remaining_clock * 0.08))
+            pause_max = min(pause_max, max(0.0, remaining_clock - reserve))
+        except (TypeError, ValueError):
+            pass
+
+    if pause_max < BOT_THINK_PAUSE_MIN:
+        return max(0.0, float(delay))
+
+    pause_complexity = min(1.0, max(0.0, signal_score / 1.55))
+    pause_duration = _sample_thinking_pause(pause_max, pause_complexity)
+
+    _thinking_budget_remaining = max(
+        0.0,
+        float(_thinking_budget_remaining) - pause_duration
+    )
+
+    # Only the randomized refractory minimum is set here. The next
+    # pause is NOT scheduled for a specific move; after this block, the
+    # current position must pass a fresh situation-based eligibility test.
+    if pause_duration >= 5.0:
+        _thinking_move_cooldown_remaining = random.randint(7, 14)
+    elif pause_duration >= 2.4:
+        _thinking_move_cooldown_remaining = random.randint(4, 10)
+    else:
+        _thinking_move_cooldown_remaining = random.randint(1, 7)
+
+    delay += pause_duration
+
+    print(
+        "[BOT PAUSE] "
+        f"duration={pause_duration:.3f}s "
+        f"remaining_budget={_thinking_budget_remaining:.3f}s "
+        f"next_pause_block={_thinking_move_cooldown_remaining} moves "
+        f"eligibility={eligibility:.2f} "
+        f"move={_bot_timing_move_count}",
+        flush=True
+    )
+
+    return max(0.0, float(delay))
+
+def build_analysis(
+    engine,
+    before_board,
+    after_board,
+    move,
+    best_info=None
+):
+    mover_color = before_board.turn
+
+    try:
+        if best_info is None:
+            best_info = engine.analyse(
+                before_board,
+                chess.engine.Limit(
+                    depth=ANALYSIS_DEPTH,
+                    time=ANALYSIS_TIME
+                )
+            )
+
+        best_score_obj = best_info.get(
+            "score"
+        )
+
+        if best_score_obj is None:
+            return None
+
+        best_score_white = (
+            best_score_obj.pov(
+                chess.WHITE
+            )
+        )
+
+        best_eval_cp = score_to_cp(
+            best_score_white
+        )
+
+        best_move = best_info.get(
+            "pv",
+            [None]
+        )[0]
+
+        after_info = engine.analyse(
+            after_board,
+            chess.engine.Limit(
+                depth=ANALYSIS_DEPTH,
+                time=ANALYSIS_TIME
+            )
+        )
+
+        after_score_obj = after_info.get(
+            "score"
+        )
+
+        if after_score_obj is None:
+            return None
+
+        after_score_white = (
+            after_score_obj.pov(
+                chess.WHITE
+            )
+        )
+
+        after_eval_cp = score_to_cp(
+            after_score_white
+        )
+
+        quality = classify_move_quality(
+            before_board,
+            after_board,
+            move,
+            mover_color,
+            best_move,
+            score_to_cp(
+                best_score_obj.pov(
+                    mover_color
+                )
+            ),
+            score_to_cp(
+                after_score_obj.pov(
+                    mover_color
+                )
+            )
+        )
+
+        next_reply_best_move = after_info.get("pv", [None])[0]
+        if next_reply_best_move not in after_board.legal_moves:
+            next_reply_best_move = None
+        next_reply_eval_cp = score_to_cp(
+            after_score_obj.pov(after_board.turn)
+        )
+
+        pv = []
+        temp = after_board.copy()
+
+        for pv_move in after_info.get(
+            "pv",
+            []
+        )[:6]:
+            if pv_move not in temp.legal_moves:
+                break
+
+            pv.append(
+                temp.san(
+                    pv_move
+                )
+            )
+
+            temp.push(
+                pv_move
+            )
+
+        return {
+            "eval_cp": after_eval_cp,
+            "eval_text": format_eval(
+                after_eval_cp
+            ),
+            "favor": favor_text(
+                after_eval_cp
+            ),
+            "quality": quality,
+            "last_move": (
+                after_board.peek().uci()
+                if after_board.move_stack
+                else move.uci()
+            ),
+            "best_move": (
+                best_move.uci()
+                if best_move is not None
+                else "-"
+            ),
+            "next_reply_best_move": (
+                next_reply_best_move.uci()
+                if next_reply_best_move is not None
+                else "-"
+            ),
+            "next_reply_eval_cp": next_reply_eval_cp,
+            "depth": after_info.get(
+                "depth",
+                ANALYSIS_DEPTH
+            ),
+            "pv": (
+                " ".join(pv)
+                if pv
+                else "-"
+            )
+        }
+
+    except Exception as exc:
+        print(
+            f"[ANALYSIS ERROR] {exc}"
+        )
+
+        return None
+
+
+# ============================================================
+# STOCKFISH MOVE SELECTION: #1 - #8
+# ============================================================
+
+def safe_drop_fraction(
+    current_cp
+):
+    current_eval = (
+        current_cp / 100.0
+    )
+
+    if current_eval < 2.0:
+        return 0.10
+
+    if current_eval < 3.0:
+        return 0.15
+
+    if current_eval < 4.0:
+        return 0.20
+
+    if current_eval < 5.0:
+        return 0.25
+
+    return 0.30
+
+def opponent_recent_accuracy(
+    match_history
+):
+    if not match_history:
+        return None, 0
+
+    recent = match_history[
+        -OPPONENT_ACCURACY_WINDOW:
+    ]
+
+    n = len(recent)
+
+    weights = list(
+        range(1, n + 1)
+    )
+
+    total_weight = float(
+        sum(weights)
+    )
+
+    weighted = sum(
+        score * weight
+        for score, weight
+        in zip(
+            recent,
+            weights
+        )
+    )
+
+    return (
+        weighted / total_weight,
+        n
+    )
+
+
+def opponent_move_centipawn_loss(expected_best_cp, played_position_cp):
+    """Return non-negative centipawn loss only when both evaluations are usable."""
+    try:
+        if expected_best_cp is None or played_position_cp is None:
+            return None
+        return max(
+            0.0,
+            min(400.0, float(expected_best_cp) - float(played_position_cp)),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def opponent_quality_from_centipawn_loss(centipawn_loss):
+    """Map estimated centipawn loss to a bounded 0-100 move-quality score."""
+    try:
+        loss = max(0.0, min(400.0, float(centipawn_loss)))
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(100.0, 100.0 - 0.25 * loss))
+
+
+def adaptive_accuracy_profile(
+    opponent_accuracy,
+    sample_count
+):
+    max_rank = TRAINING_MULTI_PV - 1
+
+    if (
+        opponent_accuracy is None
+        or sample_count < OPPONENT_MIN_SAMPLES
+    ):
+        return {
+            "opponent_accuracy": opponent_accuracy,
+            "target_accuracy": 88.0,
+            "max_rank": max_rank,
+            "max_eval_drop": 0.12,
+            "state": (
+                f"WARMUP "
+                f"{sample_count}/"
+                f"{OPPONENT_MIN_SAMPLES}"
+            ),
+        }
+
+    score = float(
+        opponent_accuracy
+    )
+
+    target = min(
+        ADAPTIVE_MAX_TARGET,
+        max(
+            ADAPTIVE_MIN_TARGET,
+            score + ADAPTIVE_SAFETY_MARGIN
+        )
+    )
+
+    if score < 70.0:
+        max_eval_drop = 0.18
+        state = "OPPONENT LIGHT"
+
+    elif score < 80.0:
+        max_eval_drop = 0.14
+        state = "OPPONENT MEDIUM"
+
+    elif score < 88.0:
+        max_eval_drop = 0.10
+        state = "OPPONENT STRONG"
+
+    elif score < ADAPTIVE_STRONG_THRESHOLD:
+        max_eval_drop = 0.075
+        state = "OPPONENT VERY STRONG"
+
+    elif score < ADAPTIVE_VERY_STRONG_THRESHOLD:
+        max_eval_drop = 0.050
+        state = "OPPONENT ELITE"
+
+    else:
+        max_eval_drop = 0.035
+        state = "OPPONENT EXTREME"
+
+    return {
+        "opponent_accuracy": score,
+        "target_accuracy": target,
+        "max_rank": max_rank,
+        "max_eval_drop": max_eval_drop,
+        "state": state,
+    }
+
+def find_free_mate_cleanup_capture(board, candidates):
+    """Find a safe capture of free opponent material during mate play.
+
+    A capture qualifies when the target contains a non-king opponent piece,
+    the capturing piece cannot be legally recaptured on the destination
+    square immediately after the capture, and the opponent still has more
+    than one non-king piece overall. Prefer higher-value free material; for
+    equal values prefer a move that is already present in MultiPV.
+    """
+    mover = board.turn
+    candidate_map = {
+        candidate["move"]: candidate
+        for candidate in candidates
+    }
+
+    opponent_material = sum(
+        1
+        for piece in board.piece_map().values()
+        if (
+            piece.color != mover
+            and piece.piece_type != chess.KING
+        )
+    )
+
+    if (
+        opponent_material
+        <= MATE_CLEANUP_MAX_REMAINING_PIECES
+    ):
+        return None
+
+    piece_values = {
+        chess.PAWN: 1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK: 5,
+        chess.QUEEN: 9,
+    }
+
+    captures = []
+
+    for move in board.legal_moves:
+        victim = board.piece_at(
+            move.to_square
+        )
+
+        if victim is None:
+            continue
+
+        if victim.color == mover:
+            continue
+
+        victim_value = piece_values.get(
+            victim.piece_type,
+            0
+        )
+
+        if victim_value < MATE_CLEANUP_MIN_VALUE:
+            continue
+
+        trial = board.copy(
+            stack=False
+        )
+
+        trial.push(move)
+
+        # "Free" means the capturing piece is not immediately capturable
+        # by any legal reply on the destination square.
+        immediately_recapturable = any(
+            reply.to_square == move.to_square
+            for reply in trial.legal_moves
+        )
+
+        if immediately_recapturable:
+            continue
+
+        candidate = candidate_map.get(
+            move
+        )
+
+        captures.append(
+            {
+                "move": move,
+                "victim": victim,
+                "victim_value": victim_value,
+                "candidate": candidate,
+                "rank": (
+                    candidate["rank"]
+                    if candidate is not None
+                    else None
+                ),
+                "cp": (
+                    candidate["cp"]
+                    if candidate is not None
+                    else None
+                ),
+            }
+        )
+
+    if not captures:
+        return None
+
+    max_value = max(
+        item["victim_value"]
+        for item in captures
+    )
+
+    best_value_captures = [
+        item
+        for item in captures
+        if item["victim_value"] == max_value
+    ]
+
+    candidate_captures = [
+        item
+        for item in best_value_captures
+        if item["candidate"] is not None
+    ]
+
+    if candidate_captures:
+        selected = max(
+            candidate_captures,
+            key=lambda item: (
+                item["cp"],
+                -item["rank"]
+            )
+        )
+    else:
+        selected = random.choice(
+            best_value_captures
+        )
+
+    return selected
+
+def find_priority_queen_promotion(
+    board,
+    candidates,
+    best_cp
+):
+    """Prefer a safe QUEEN promotion whenever promotion is available.
+
+    Queen promotion is the default conversion choice. Underpromotion is left
+    to the engine only when no legal queen promotion exists or the queen move
+    is clearly unsafe and a better engine-backed promotion is available.
+    """
+    candidate_map = {
+        candidate["move"]: candidate
+        for candidate in candidates
+    }
+
+    queen_promotions = [
+        move
+        for move in board.legal_moves
+        if move.promotion == chess.QUEEN
+    ]
+
+    if not queen_promotions:
+        return None
+
+    choices = []
+
+    for move in queen_promotions:
+        candidate = candidate_map.get(move)
+
+        try:
+            after = board.copy(stack=False)
+            after.push(move)
+        except Exception:
+            continue
+
+        if after.is_checkmate():
+            return {
+                "move": move,
+                "info": candidate["info"] if candidate else None,
+                "rank": candidate["rank"] if candidate else 0,
+                "cp": candidate["cp"] if candidate else best_cp,
+                "reason_tag": "QUEEN PROMOTION MATE"
+            }
+
+        # Never force a queen promotion when the newly promoted queen can be
+        # immediately captured and the engine did not consider the move.
+        if candidate is None:
+            immediate_queen_loss = any(
+                reply.to_square == move.to_square
+                for reply in after.legal_moves
+            )
+            if immediate_queen_loss:
+                continue
+
+        candidate_cp = (
+            int(candidate["cp"])
+            if candidate is not None
+            else best_cp
+        )
+
+        if candidate is not None and candidate_cp < best_cp - FREE_CAPTURE_MAX_CP_DROP:
+            continue
+
+        choices.append(
+            {
+                "move": move,
+                "info": candidate["info"] if candidate else None,
+                "rank": candidate["rank"] if candidate else 0,
+                "cp": candidate_cp,
+                "reason_tag": "QUEEN PROMOTION"
+            }
+        )
+
+    if not choices:
+        return None
+
+    choices.sort(
+        key=lambda item: (
+            item["cp"],
+            -item["rank"]
+        ),
+        reverse=True
+    )
+
+    return choices[0]
+def free_capture_position_safe(
+    board,
+    move
+):
+    """Check that a free capture does not immediately expose our position.
+
+    The capture is accepted only when the resulting position does not give the
+    opponent a mate-in-one and does not leave a major/minor own piece hanging
+    for a free immediate capture. This protects the rest of our material while
+    still allowing genuinely free captures.
+    """
+    try:
+        after = board.copy(stack=False)
+        after.push(move)
+
+        # Never choose a free capture that walks into an immediate checkmate.
+        for reply in after.legal_moves:
+            trial = after.copy(stack=False)
+            trial.push(reply)
+
+            if trial.is_checkmate():
+                return False
+
+        piece_values = {
+            chess.PAWN: 1,
+            chess.KNIGHT: 3,
+            chess.BISHOP: 3,
+            chess.ROOK: 5,
+            chess.QUEEN: 9,
+            chess.KING: 100,
+        }
+
+        # After our free capture, reject any immediate opponent capture that
+        # wins one of our major/minor pieces without an immediate recapture.
+        for reply in after.legal_moves:
+            victim = after.piece_at(reply.to_square)
+
+            if victim is None or victim.color != board.turn:
+                continue
+
+            victim_value = piece_values.get(
+                victim.piece_type,
+                0
+            )
+
+            # Pawns are allowed to remain tactically loose; the requested
+            # protection is for the rest of our important pieces.
+            if victim_value < 3:
+                continue
+
+            after_reply = after.copy(stack=False)
+            after_reply.push(reply)
+
+            can_recapture = any(
+                response.to_square == reply.to_square
+                for response in after_reply.legal_moves
+            )
+
+            if can_recapture:
+                continue
+
+            return False
+
+        return True
+
+    except Exception:
+        # Safety-first: if the position cannot be checked reliably, do not
+        # promote this move to a "free capture" automatically.
+        return False
+
+def free_capture_engine_safe(
+    board,
+    move,
+    engine,
+    reference_cp
+):
+    """Second-stage safety check for a genuinely free capture.
+
+    Uses a shallow engine line after the capture to reject:
+    - forced mate against us in M1-M5;
+    - a large evaluation collapse;
+    - a major/minor own piece being lost in the first ~2 opponent moves
+      without an immediate recapture in the principal variation.
+
+    This is only applied to free-capture candidates, not ordinary engine
+    captures, so normal move selection stays fast.
+    """
+    if engine is None:
+        return True
+
+    try:
+        after = board.copy(stack=False)
+        after.push(move)
+
+        info = engine.analyse(
+            after,
+            chess.engine.Limit(
+                depth=FREE_CAPTURE_SAFETY_DEPTH
+            )
+        )
+
+        score_obj = info.get("score")
+        if score_obj is not None:
+            our_score = score_obj.pov(board.turn)
+            mate = our_score.mate()
+
+            # Never enter a forced mate M1-M5 after grabbing a "free" piece.
+            if (
+                mate is not None
+                and mate < 0
+                and abs(int(mate)) <= 5
+            ):
+                return False
+
+            cp = our_score.score(
+                mate_score=100000
+            )
+            if (
+                cp is not None
+                and reference_cp is not None
+                and cp < int(reference_cp) - FREE_CAPTURE_SAFETY_MAX_CP_DROP
+            ):
+                return False
+
+        # Tactical material safety over the first 1-2 opponent moves.
+        # Look only at the engine PV, keeping this check bounded and fast.
+        pv = info.get("pv", [])
+        probe = after
+
+        for ply_index, reply in enumerate(
+            pv[:FREE_CAPTURE_SAFETY_MAX_PLY]
+        ):
+            if reply not in probe.legal_moves:
+                break
+
+            mover = probe.turn
+            victim_square = reply.to_square
+
+            if probe.is_en_passant(reply):
+                victim_square = (
+                    reply.to_square - 8
+                    if mover == chess.WHITE
+                    else reply.to_square + 8
+                )
+
+            victim = probe.piece_at(victim_square)
+
+            if (
+                mover != board.turn
+                and victim is not None
+                and victim.color == board.turn
+                and victim.piece_type in {
+                    chess.KNIGHT,
+                    chess.BISHOP,
+                    chess.ROOK,
+                    chess.QUEEN,
+                }
+            ):
+                victim_value = material_value(
+                    victim.piece_type
+                )
+
+                after_opponent_capture = probe.copy(
+                    stack=False
+                )
+                after_opponent_capture.push(reply)
+
+                recaptured = any(
+                    response.to_square == reply.to_square
+                    for response in after_opponent_capture.legal_moves
+                )
+
+                if not recaptured and victim_value >= 300:
+                    return False
+
+            probe.push(reply)
+
+        return True
+
+    except Exception:
+        # Safety-first for this optional second-stage check: when the engine
+        # cannot evaluate the candidate reliably, do not elevate it as a safe
+        # free capture.
+        return False
+def find_priority_capture(
+    board,
+    candidates,
+    best_cp,
+    force_endgame=False,
+    engine=None
+):
+    """Prefer safe captures before human-like wandering.
+
+    A capture can come from MultiPV=15 or, for a genuinely free piece, from
+    the complete legal move list. This applies to captures by every piece
+    type, including king captures; the king itself is never a legal victim.
+    """
+    candidate_map = {
+        candidate["move"]: candidate
+        for candidate in candidates
+    }
+
+    own_material = side_material(board, board.turn)
+    enemy_material = side_material(board, not board.turn)
+
+    non_king_pieces = sum(
+        1
+        for piece in board.piece_map().values()
+        if piece.piece_type != chess.KING
+    )
+
+    winning_material = own_material > enemy_material
+    endgame = force_endgame or non_king_pieces <= 10
+
+    choices = []
+
+    for move in board.legal_moves:
+        if not board.is_capture(move):
+            continue
+
+        victim_square = move.to_square
+        if board.is_en_passant(move):
+            victim_square = (
+                move.to_square - 8
+                if board.turn == chess.WHITE
+                else move.to_square + 8
+            )
+
+        victim = board.piece_at(victim_square)
+        if victim is None or victim.color == board.turn:
+            continue
+
+        victim_value = material_value(victim.piece_type)
+        if victim_value <= 0:
+            continue
+
+        mover_piece = board.piece_at(move.from_square)
+        mover_value = (
+            material_value(mover_piece.piece_type)
+            if mover_piece is not None
+            else 0
+        )
+
+        try:
+            after = board.copy(stack=False)
+            after.push(move)
+        except Exception:
+            continue
+
+        if after.is_checkmate():
+            return {
+                "move": move,
+                "info": candidate_map.get(move, {}).get("info")
+                    if move in candidate_map
+                    else None,
+                "rank": (
+                    candidate_map[move]["rank"]
+                    if move in candidate_map
+                    else 0
+                ),
+                "cp": (
+                    candidate_map[move]["cp"]
+                    if move in candidate_map
+                    else best_cp
+                ),
+                "victim_value": victim_value,
+                "reason_tag": "CHECKMATE CAPTURE"
+            }
+
+        immediate_replies = [
+            reply
+            for reply in after.legal_moves
+            if reply.to_square == move.to_square
+        ]
+
+        # A truly free capture: no opponent piece can immediately take the
+        # capturing piece. The deeper engine safety pass is applied later
+        # after candidates are ranked, so normal move selection stays fast.
+        free_capture = (
+            not immediate_replies
+            and free_capture_position_safe(board, move)
+        )
+
+        candidate = candidate_map.get(move)
+        candidate_cp = (
+            int(candidate["cp"])
+            if candidate is not None
+            else best_cp
+        )
+
+        # Candidate captures from MultiPV are trusted inside a reasonable
+        # engine-score band. Non-MultiPV captures are used only when they are
+        # genuinely free; this prevents forcing poisoned captures.
+        if candidate is None:
+            if not free_capture:
+                continue
+        else:
+            if candidate_cp < best_cp - FREE_CAPTURE_MAX_CP_DROP:
+                continue
+
+            # Do not trade a high-value piece for a lower-value victim simply
+            # because it happens to be a capture, unless the engine itself
+            # selected it inside the normal safety band.
+            if (
+                not free_capture
+                and victim_value < mover_value
+                and winning_material
+            ):
+                continue
+
+        # In a winning endgame, free captures get an even stronger priority.
+        # Otherwise, only take them ahead of the fuzzy shuffle when the
+        # position is materially/evaluationally favorable.
+        if not free_capture:
+            if endgame and winning_material:
+                # Equal-or-better trades are acceptable in liquidation mode.
+                if victim_value < mover_value:
+                    continue
+            elif candidate is None:
+                continue
+
+        choices.append(
+            {
+                "move": move,
+                "info": (
+                    candidate["info"]
+                    if candidate is not None
+                    else None
+                ),
+                "rank": (
+                    candidate["rank"]
+                    if candidate is not None
+                    else 99
+                ),
+                "cp": candidate_cp,
+                "victim_value": victim_value,
+                "free": free_capture,
+                "mover_value": mover_value,
+                "reason_tag": (
+                    "FREE CAPTURE"
+                    if free_capture
+                    else "SAFE LIQUIDATION CAPTURE"
+                )
+            }
+        )
+
+    if not choices:
+        return None
+
+    # First take the highest-value free target. In endgames, also prefer
+    # favorable liquidation captures over wandering moves.
+    choices.sort(
+        key=lambda item: (
+            1 if item["free"] else 0,
+            item["victim_value"],
+            item["cp"],
+            -item["rank"]
+        ),
+        reverse=True
+    )
+
+    # Free pieces remain the highest capture priority, but only after
+    # the candidate survives the 1-2 move material / M1-M5 mate safety test.
+    free_choices = [
+        item
+        for item in choices
+        if item["free"]
+    ]
+
+    if free_choices and engine is not None:
+        free_choices.sort(
+            key=lambda item: (
+                item["victim_value"],
+                item["cp"],
+                -item["rank"]
+            ),
+            reverse=True
+        )
+
+        for free_choice in free_choices:
+            if free_capture_engine_safe(
+                board,
+                free_choice["move"],
+                engine,
+                best_cp
+            ):
+                return free_choice
+    elif free_choices:
+        return free_choices[0]
+
+    selected = choices[0]
+
+    if (
+        selected["free"]
+        or endgame
+        or winning_material
+    ):
+        # A free capture that failed the deeper safety check must not be
+        # re-selected as a fallback. Prefer the best ordinary capture instead.
+        if selected["free"] and engine is not None:
+            safe_alternatives = [
+                item
+                for item in choices
+                if not item["free"]
+            ]
+            if safe_alternatives:
+                return max(
+                    safe_alternatives,
+                    key=lambda item: (
+                        item["cp"],
+                        -item["rank"]
+                    )
+                )
+            return None
+        return selected
+
+    return None
+def find_safe_free_capture(
+    board,
+    candidates,
+    best_cp
+):
+    """Find a genuinely free major/minor piece to capture.
+
+    A capture is "free" here only when the captured piece is worth at least a
+    minor piece and the capturing piece cannot be immediately taken back.
+    The candidate must still be reasonably close to the current best engine
+    score so a poisoned/tactical capture is not forced.
+    """
+    choices = []
+
+    for candidate in candidates:
+        move = candidate["move"]
+        victim_square = move.to_square
+
+        if board.is_en_passant(move):
+            victim_square = (
+                move.to_square - 8
+                if board.turn == chess.WHITE
+                else move.to_square + 8
+            )
+
+        victim = board.piece_at(victim_square)
+
+        if victim is None or victim.color == board.turn:
+            continue
+
+        victim_value = material_value(victim.piece_type)
+        if victim_value < FREE_CAPTURE_MIN_VALUE * 100:
+            continue
+
+        try:
+            after = board.copy(stack=False)
+            after.push(move)
+        except Exception:
+            continue
+
+        # No legal reply may capture the moved piece. That is the key
+        # distinction between a genuinely free piece and an ordinary exchange.
+        immediate_take = any(
+            reply.to_square == move.to_square
+            for reply in after.legal_moves
+        )
+
+        if immediate_take:
+            continue
+
+        if not free_capture_position_safe(board, move):
+            continue
+
+        candidate_cp = int(candidate.get("cp", best_cp))
+        if candidate_cp < best_cp - FREE_CAPTURE_MAX_CP_DROP:
+            continue
+
+        choices.append(
+            (
+                victim_value,
+                candidate_cp,
+                -int(candidate.get("rank", 99)),
+                candidate
+            )
+        )
+
+    if not choices:
+        return None
+
+    choices.sort(reverse=True, key=lambda item: item[:3])
+    return choices[0][3]
+
+def candidate_hangs_own_piece(
+    board,
+    move
+):
+    """Reject obvious one-move giveaways.
+
+    This is intentionally conservative: a check/mate or a materially winning
+    capture can still be a deliberate sacrifice. Otherwise a moved piece that
+    can be taken next move without a recapture is rejected when that sequence
+    loses material.
+    """
+    try:
+        if board.gives_check(move):
+            return False
+
+        before_victim = board.piece_at(move.to_square)
+        victim_value = (
+            material_value(before_victim.piece_type)
+            if before_victim is not None
+            and before_victim.color != board.turn
+            else 0
+        )
+
+        moved_piece = board.piece_at(move.from_square)
+        if moved_piece is None:
+            return True
+
+        moved_value = material_value(moved_piece.piece_type)
+
+        after = board.copy(stack=False)
+        after.push(move)
+
+        if after.is_checkmate():
+            return False
+
+        for reply in after.legal_moves:
+            if reply.to_square != move.to_square:
+                continue
+
+            reply_piece = after.piece_at(reply.from_square)
+            if reply_piece is None:
+                continue
+
+            after_reply = after.copy(stack=False)
+            after_reply.push(reply)
+
+            recaptured = any(
+                response.to_square == reply.to_square
+                for response in after_reply.legal_moves
+            )
+
+            if recaptured:
+                continue
+
+            # Net material swing after the opponent takes our moved piece.
+            # Negative means the move simply gave material away.
+            net = victim_value - moved_value
+
+            if net < 0 and moved_value >= 100:
+                return True
+
+        return False
+
+    except Exception:
+        # Safety-first fallback: unknown candidates are not rejected here;
+        # the existing engine score and physical verification remain in force.
+        return False
+
+def candidate_exposes_free_major_piece(board, move):
+    """Detect a move that leaves an unrelated important own piece freely capturable.
+
+    Inspect every legal opponent capture after the move, not only captures
+    landing on the moved piece. This catches discovered attacks on rooks,
+    bishops, knights and queens. A capture of the moved piece is tolerated
+    only when the move itself wins at least equivalent material. Immediate
+    checkmate is never rejected by this guard.
+    """
+    try:
+        if move not in board.legal_moves:
+            return True
+
+        mover_color = board.turn
+        moved_piece = board.piece_at(move.from_square)
+        if moved_piece is None or moved_piece.color != mover_color:
+            return True
+
+        captured_value = 0
+        captured_piece = board.piece_at(move.to_square)
+        if captured_piece is not None and captured_piece.color != mover_color:
+            captured_value = material_value(captured_piece.piece_type)
+        elif board.is_en_passant(move):
+            captured_square = (
+                move.to_square - 8 if mover_color == chess.WHITE
+                else move.to_square + 8
+            )
+            captured_piece = board.piece_at(captured_square)
+            if captured_piece is not None and captured_piece.color != mover_color:
+                captured_value = material_value(captured_piece.piece_type)
+
+        promotion_gain = 0
+        if move.promotion is not None:
+            promotion_gain = max(
+                0, material_value(move.promotion) - material_value(chess.PAWN)
+            )
+        immediate_gain = captured_value + promotion_gain
+
+        after = board.copy(stack=False)
+        after.push(move)
+        if after.is_checkmate():
+            return False
+
+        for reply in after.legal_moves:
+            if not after.is_capture(reply):
+                continue
+
+            if after.is_en_passant(reply):
+                victim_square = (
+                    reply.to_square - 8 if after.turn == chess.WHITE
+                    else reply.to_square + 8
+                )
+            else:
+                victim_square = reply.to_square
+            victim = after.piece_at(victim_square)
+            if victim is None or victim.color != mover_color:
+                continue
+            if victim.piece_type == chess.KING:
+                continue
+
+            victim_value = material_value(victim.piece_type)
+            after_reply = after.copy(stack=False)
+            after_reply.push(reply)
+
+            # Legal recapture on the capture square means it is not a free loss.
+            recaptured = any(
+                response.to_square == reply.to_square
+                and (
+                    (attacker := after_reply.piece_at(response.from_square))
+                    is not None
+                    and attacker.color == mover_color
+                )
+                for response in after_reply.legal_moves
+            )
+            if recaptured:
+                continue
+
+            # A direct recapture of the moved piece may be a sound exchange.
+            if victim_square == move.to_square:
+                if immediate_gain >= victim_value:
+                    continue
+                return True
+
+            # An unrelated own piece becoming freely capturable is not excused
+            # by a capture elsewhere: avoid leaving a second piece en prise.
+            if victim_value >= material_value(chess.KNIGHT):
+                return True
+
+        return False
+    except Exception:
+        # Keep the selector operational if an unusual board adapter fails;
+        # move legality and Stockfish scoring remain additional constraints.
+        return False
+def find_fast_low_clock_capture(board, candidates=None):
+    """Choose a safe tactical capture without the deeper normal-mode scan.
+
+    Emergency mode must avoid spending a large nested legal-reply search on
+    every capture. This scans legal captures once, rejects moves that leave a
+    major/minor piece freely capturable, then prioritizes mate, free targets,
+    and material gain.
+    """
+    try:
+        candidate_map = {
+            item["move"]: item for item in (candidates or [])
+            if isinstance(item, dict) and item.get("move") is not None
+        }
+        choices = []
+        mover = board.turn
+        values = {
+            chess.PAWN: 100, chess.KNIGHT: 320, chess.BISHOP: 330,
+            chess.ROOK: 500, chess.QUEEN: 900, chess.KING: 20000,
+        }
+        for move in board.legal_moves:
+            if not board.is_capture(move):
+                continue
+            victim_square = move.to_square
+            if board.is_en_passant(move):
+                victim_square = (
+                    move.to_square - 8 if mover == chess.WHITE
+                    else move.to_square + 8
+                )
+            victim = board.piece_at(victim_square)
+            attacker = board.piece_at(move.from_square)
+            if (
+                victim is None or victim.color == mover
+                or victim.piece_type == chess.KING or attacker is None
+            ):
+                continue
+            victim_value = values.get(victim.piece_type, 0)
+            attacker_value = values.get(attacker.piece_type, 0)
+            after = board.copy(stack=False)
+            after.push(move)
+            if after.is_checkmate():
+                item = candidate_map.get(move, {})
+                return {
+                    "move": move, "info": item.get("info"),
+                    "rank": item.get("rank", 0),
+                    "cp": item.get("cp", 0),
+                    "victim_value": victim_value / 100.0,
+                    "free": True, "reason_tag": "CHECKMATE CAPTURE",
+                }
+            if candidate_exposes_free_major_piece(board, move):
+                continue
+
+            immediate_replies = [
+                reply for reply in after.legal_moves
+                if reply.to_square == move.to_square
+            ]
+            free_capture = not immediate_replies
+            # If immediately recapturable, only keep a clear material win;
+            # a losing exchange is not an emergency-clock conversion.
+            if not free_capture and victim_value <= attacker_value:
+                continue
+            item = candidate_map.get(move, {})
+            choices.append({
+                "move": move,
+                "info": item.get("info"),
+                "rank": item.get("rank", 99),
+                "cp": item.get("cp", 0),
+                "victim_value": victim_value / 100.0,
+                "free": free_capture,
+                "reason_tag": "FREE CAPTURE" if free_capture else "SAFE WINNING EXCHANGE",
+                "_gain": victim_value - attacker_value,
+            })
+        if not choices:
+            return None
+        choices.sort(
+            key=lambda item: (
+                1 if item["free"] else 0,
+                item["_gain"],
+                item["victim_value"],
+                item["cp"],
+                -item["rank"],
+            ),
+            reverse=True,
+        )
+        result = choices[0]
+        result.pop("_gain", None)
+        return result
+    except Exception:
+        return None
+
+
+def _movable_piece_count_for_color(board, color) -> int:
+    """Count the side's pieces with at least one legal move in a position copy."""
+    try:
+        probe = board.copy(stack=False)
+        probe.turn = color
+        return len({
+            move.from_square
+            for move in probe.legal_moves
+            if (
+                (piece := probe.piece_at(move.from_square)) is not None
+                and piece.color == color
+            )
+        })
+    except Exception:
+        return 99
+
+
+def choose_stockfish_move(
+    board,
+    multipv_infos,
+    previous_eval_white_cp=None,
+    opponent_accuracy=None,
+    opponent_sample_count=0,
+    opponent_pressure=False,
+    engine=None,
+    bot_color=None,
+    low_clock_mode=False
+):
+    # Reset the historical fuzzy state at a fresh match/new game.
+    # This is retained from the fast-main-match-controls branch so a previous
+    # game's advantage/mate progression never leaks into the next game.
+    global _advantage_target_cp
+    global _advantage_hold_moves
+    global _advantage_hold_limit
+    global _advantage_last_selected_cp
+    global _advantage_light_drop_used
+    global _advantage_down_streak
+    global _mate_progress_target_mate
+    global _mate_progress_hold_moves
+    global _mate_progress_hold_limit
+    global _rank1_selection_streak
+    global _recent_selected_ranks
+
+    if len(board.move_stack) <= 1:
+        _rank1_selection_streak = 0
+        _recent_selected_ranks = []
+        _advantage_target_cp = None
+        _advantage_hold_moves = 0
+        _advantage_hold_limit = random.randint(
+            HUMAN_ADVANTAGE_HOLD_MIN_MOVES,
+            HUMAN_ADVANTAGE_HOLD_MAX_MOVES
+        )
+        _advantage_last_selected_cp = None
+        _advantage_light_drop_used = False
+        _advantage_down_streak = 0
+        _mate_progress_target_mate = None
+        _mate_progress_hold_moves = 0
+        _mate_progress_hold_limit = random.randint(
+            MATE_SUSTAIN_MIN_MOVES,
+            MATE_SUSTAIN_MAX_MOVES
+        )
+    if not multipv_infos:
+        return (
+            None,
+            None,
+            {
+                "rank": 0,
+                "current_cp": 0,
+                "selected_cp": 0,
+                "reason": "no MultiPV candidates"
+            }
+        )
+
+    mover = board.turn
+    candidates = []
+
+    for rank, info in enumerate(
+        multipv_infos[
+            :TRAINING_MULTI_PV
+        ]
+    ):
+        pv = info.get(
+            "pv",
+            []
+        )
+
+        if not pv:
+            continue
+
+        move = pv[0]
+
+        if move not in board.legal_moves:
+            continue
+
+        score_obj = info.get(
+            "score"
+        )
+
+        if score_obj is None:
+            continue
+
+        pov_score = score_obj.pov(
+            mover
+        )
+
+        cp = pov_score.score(
+            mate_score=100000
+        )
+
+        if cp is None:
+            cp = 0
+
+        candidates.append({
+            "rank": rank,
+            "move": move,
+            "info": info,
+            "cp": int(cp),
+            "mate": pov_score.mate(),
+        })
+
+    if not candidates:
+        return (
+            None,
+            None,
+            {
+                "rank": 0,
+                "current_cp": 0,
+                "selected_cp": 0,
+                "reason": "no legal MultiPV candidates"
+            }
+        )
+
+    # Keep the baseline selector's move distribution, but never choose for an
+    # unverified side or when it is not that side's turn.
+    if bot_color not in (chess.WHITE, chess.BLACK):
+        return (
+            None, None,
+            {
+                "rank": 0, "current_cp": 0, "selected_cp": 0,
+                "reason": "BOT COLOR GUARD | verified bot side is unknown",
+            },
+        )
+    if board.turn != bot_color:
+        return (
+            None, None,
+            {
+                "rank": 0, "current_cp": 0, "selected_cp": 0,
+                "reason": "BOT COLOR GUARD | position is not the verified bot's turn",
+            },
+        )
+
+    best = candidates[0]
+    best_cp = best["cp"]
+    # Emergency clock mode is the only intentional selection exception to the
+    # restored fast-main-baseline policy: mate, safe promotion, safe capture,
+    # then the top scored legal move, with no human-like rank shuffle.
+    if low_clock_mode:
+        candidate_by_move = {candidate["move"]: candidate for candidate in candidates}
+        if best["mate"] is not None and 0 < best["mate"] <= MATE_FORCE_FAST_MAX:
+            _record_rank_selection(best["rank"])
+            return (
+                best["move"], best["info"],
+                {
+                    "rank": best["rank"], "current_cp": best_cp,
+                    "selected_cp": best_cp, "source": "LOW_CLOCK_TACTIC",
+                    "reason": f"LOW CLOCK FORCED MATE M{best['mate']}",
+                },
+            )
+        for legal_move in board.legal_moves:
+            try:
+                after_mate = board.copy(stack=False)
+                after_mate.push(legal_move)
+            except Exception:
+                continue
+            if after_mate.is_checkmate():
+                item = candidate_by_move.get(legal_move, {})
+                _record_rank_selection(item.get("rank"))
+                return (
+                    legal_move, item.get("info"),
+                    {
+                        "rank": item.get("rank", 0), "current_cp": best_cp,
+                        "selected_cp": item.get("cp", best_cp),
+                        "source": "LOW_CLOCK_TACTIC",
+                        "reason": "LOW CLOCK IMMEDIATE CHECKMATE",
+                    },
+                )
+        promotion = find_priority_queen_promotion(board, candidates, best_cp)
+        if (
+            promotion is not None
+            and not candidate_exposes_free_major_piece(board, promotion["move"])
+        ):
+            _record_rank_selection(promotion["rank"])
+            return (
+                promotion["move"], promotion["info"],
+                {
+                    "rank": promotion["rank"], "current_cp": best_cp,
+                    "selected_cp": promotion["cp"], "source": "LOW_CLOCK_TACTIC",
+                    "reason": f"LOW CLOCK SAFE QUEEN PROMOTION | {promotion['reason_tag']}",
+                },
+            )
+        safe_capture = find_fast_low_clock_capture(board, candidates)
+        if safe_capture is not None:
+            _record_rank_selection(safe_capture["rank"])
+            return (
+                safe_capture["move"], safe_capture["info"],
+                {
+                    "rank": safe_capture["rank"], "current_cp": best_cp,
+                    "selected_cp": safe_capture["cp"], "source": "LOW_CLOCK_TACTIC",
+                    "reason": (
+                        f"LOW CLOCK {safe_capture['reason_tag']} | "
+                        f"VICTIM={safe_capture['victim_value']:.1f}"
+                    ),
+                },
+            )
+        _record_rank_selection(best["rank"])
+        return (
+            best["move"], best["info"],
+            {
+                "rank": best["rank"], "current_cp": best_cp, "selected_cp": best_cp,
+                "source": "LOW_CLOCK_BEST", "reason": "LOW CLOCK FAST BEST LEGAL MOVE",
+            },
+        )
+
+
+    profile = adaptive_accuracy_profile(
+        opponent_accuracy,
+        opponent_sample_count
+    )
+
+    adaptive_max_rank = int(
+        profile["max_rank"]
+    )
+
+    adaptive_max_drop = float(
+        profile["max_eval_drop"]
+    )
+
+    reference_cp = None
+
+    if previous_eval_white_cp is not None:
+        reference_cp = (
+            previous_eval_white_cp
+            if mover == chess.WHITE
+            else -previous_eval_white_cp
+        )
+
+    if (
+        reference_cp is not None
+        and reference_cp >= FORCE_BEST_MIN_CP
+        and not (
+            best["mate"] is not None
+            and best["mate"] > 0
+            and best["mate"] <= MATE_GRACE_MAX
+        )
+    ):
+        improvement_fraction = (
+            (
+                best_cp
+                - reference_cp
+            )
+            / max(
+                1,
+                abs(reference_cp)
+            )
+        )
+
+        if (
+            improvement_fraction
+            >= FORCE_BEST_IMPROVEMENT_FRACTION
+        ):
+            selected = best
+            _record_rank_selection(selected["rank"])
+
+            return (
+                selected["move"],
+                selected["info"],
+                {
+                    "rank": selected["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": selected["cp"],
+                    "reason": (
+                        f"FORCED #1 | "
+                        f"reference="
+                        f"+{reference_cp/100:.2f} "
+                        f"best="
+                        f"+{best_cp/100:.2f} "
+                        f"improvement="
+                        f"{improvement_fraction*100:.0f}%"
+                    )
+                }
+            )
+
+    if (
+        best["mate"] is not None
+        and best["mate"] > 0
+    ):
+        # During the human-like mating window, clear genuinely free
+        # material first. This is intentionally before the M4 force rule:
+        # if the opponent blunders a queen/rook/minor/pawn and it is safely
+        # capturable, take it before closing the game. When only one
+        # non-king piece remains, proceed with the normal mate plan.
+        if (
+            MATE_GRACE_MIN
+            <= best["mate"]
+            <= MATE_GRACE_MAX
+        ):
+            cleanup = find_free_mate_cleanup_capture(
+                board,
+                candidates
+            )
+
+            if cleanup is not None:
+                _record_rank_selection(cleanup["rank"])
+                selected = cleanup["candidate"]
+
+                if selected is None:
+                    selected = {
+                        "move": cleanup["move"],
+                        "info": best["info"],
+                        "rank": None,
+                        "cp": best_cp,
+                        "mate": None,
+                    }
+                else:
+                    selected = dict(
+                        selected
+                    )
+                    selected["move"] = cleanup["move"]
+
+                victim_name = chess.piece_name(
+                    cleanup["victim"].piece_type
+                ).upper()
+
+                rank_text = (
+                    f"#{cleanup['rank'] + 1}"
+                    if cleanup["rank"] is not None
+                    else "FREE"
+                )
+
+                return (
+                    selected["move"],
+                    selected["info"],
+                    {
+                        "rank": cleanup["rank"],
+                        "current_cp": best_cp,
+                        "selected_cp": cleanup["cp"],
+                        "source": "MATE_CLEANUP",
+                        "reason": (
+                            f"MATE CLEANUP | "
+                            f"FREE {victim_name} "
+                            f"TARGET="
+                            f"{chess.square_name(selected['move'].to_square)} "
+                            f"RANK={rank_text}"
+                        )
+                    }
+                )
+
+        # M4 or closer: stop humanizing and take the fastest mate immediately.
+        if best["mate"] <= MATE_FORCE_FAST_MAX:
+            _record_rank_selection(best["rank"])
+            _mate_progress_target_mate = None
+            _mate_progress_hold_moves = 0
+            _mate_progress_hold_limit = MATE_SUSTAIN_MIN_MOVES
+
+            selected = best
+
+            return (
+                selected["move"],
+                selected["info"],
+                {
+                    "rank": selected["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": selected["cp"],
+                    "reason": (
+                        f"MATE FORCE | "
+                        f"M{selected['mate']} "
+                        f"RANK=#"
+                        f"{selected['rank'] + 1}"
+                    )
+                }
+            )
+
+        # The human-like mate window remains M5-M15. Outside that window,
+        # keep the existing direct #1 behavior.
+        if not (
+            MATE_GRACE_MIN
+            <= best["mate"]
+            <= MATE_GRACE_MAX
+        ):
+            _record_rank_selection(best["rank"])
+            _mate_progress_target_mate = None
+            _mate_progress_hold_moves = 0
+            _mate_progress_hold_limit = MATE_SUSTAIN_MIN_MOVES
+
+            selected = best
+
+            return (
+                selected["move"],
+                selected["info"],
+                {
+                    "rank": selected["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": selected["cp"],
+                    "reason": (
+                        f"MATE #1 | "
+                        f"M{selected['mate']} "
+                        f"RANK=#"
+                        f"{selected['rank'] + 1}"
+                    )
+                }
+            )
+
+        # Start/recover the sustained mate target. The target represents the
+        # mate level the bot is currently willing to play around. It can move
+        # faster only one step at a time; it may move slower when the actual
+        # engine mate itself has become slower because the opponent defended.
+        if _mate_progress_target_mate is None:
+            _mate_progress_target_mate = best["mate"]
+            _mate_progress_hold_moves = 0
+            _mate_progress_hold_limit = random.randint(
+                MATE_SUSTAIN_MIN_MOVES,
+                MATE_SUSTAIN_MAX_MOVES
+            )
+        elif best["mate"] > _mate_progress_target_mate:
+            _mate_progress_target_mate = best["mate"]
+            _mate_progress_hold_moves = 0
+            _mate_progress_hold_limit = random.randint(
+                MATE_SUSTAIN_MIN_MOVES,
+                MATE_SUSTAIN_MAX_MOVES
+            )
+        elif best["mate"] < _mate_progress_target_mate:
+            # Do not follow M10 -> M9 -> M8 immediately. Hold the current
+            # target for a few moves first, then improve it by exactly one.
+            _mate_progress_hold_moves += 1
+
+            if (
+                _mate_progress_hold_moves
+                >= _mate_progress_hold_limit
+            ):
+                _mate_progress_target_mate = max(
+                    MATE_GRACE_MIN,
+                    _mate_progress_target_mate - 1
+                )
+                _mate_progress_hold_moves = 0
+                _mate_progress_hold_limit = random.randint(
+                    MATE_SUSTAIN_MIN_MOVES,
+                    MATE_SUSTAIN_MAX_MOVES
+                )
+
+        target_mate = int(
+            _mate_progress_target_mate
+        )
+
+        # Never jump multiple mate steps in a single decision. The active
+        # target is the anchor; one slower line is allowed to preserve a
+        # natural sustain feel, but it cannot become an accumulating +5 cap.
+        allowed_mate_max = target_mate + 1
+
+        mate_candidates = [
+            c
+            for c in candidates
+            if (
+                c["mate"] is not None
+                and c["mate"] > 0
+                and target_mate
+                <= c["mate"]
+                <= allowed_mate_max
+            )
+        ]
+
+        # If the engine's current best mate is already faster than the target
+        # but no exact target line exists, allow the current best only when
+        # the target has caught up to that one-step improvement. Otherwise
+        # keep the slower candidate to sustain the plan.
+        if not mate_candidates:
+            exact_best = [
+                c
+                for c in candidates
+                if (
+                    c["mate"] is not None
+                    and c["mate"] == best["mate"]
+                )
+            ]
+
+            if exact_best:
+                selected = max(
+                    exact_best,
+                    key=lambda c: c["rank"]
+                )
+                _record_rank_selection(selected["rank"])
+
+                return (
+                    selected["move"],
+                    selected["info"],
+                    {
+                        "rank": selected["rank"],
+                        "current_cp": best_cp,
+                        "selected_cp": selected["cp"],
+                        "reason": (
+                            f"MATE ADAPT | "
+                            f"TARGET=M{target_mate} "
+                            f"BEST=M{best['mate']} "
+                            f"SELECTED=M{selected['mate']} "
+                            f"RANK=#"
+                            f"{selected['rank'] + 1}"
+                        )
+                    }
+                )
+
+            selected = best
+
+            _record_rank_selection(selected["rank"])
+            return (
+                selected["move"],
+                selected["info"],
+                {
+                    "rank": selected["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": selected["cp"],
+                    "reason": (
+                        f"MATE BEST | "
+                        f"TARGET=M{target_mate} "
+                        f"BEST=M{best['mate']} "
+                        f"RANK=#"
+                        f"{selected['rank'] + 1}"
+                    )
+                }
+            )
+
+        exact_target = [
+            c
+            for c in mate_candidates
+            if c["mate"] == target_mate
+        ]
+
+        slower_target = [
+            c
+            for c in mate_candidates
+            if c["mate"] == allowed_mate_max
+        ]
+
+        if exact_target:
+            # Same mate distance: keep the earlier rule—take the lowest
+            # MultiPV line, e.g. #1 M6/#2 M6/#3 M6 -> #3.
+            selected = max(
+                exact_target,
+                key=lambda c: c["rank"]
+            )
+
+            # Occasionally sustain with the one-step slower mate when it is
+            # available, but never jump several mate moves at once.
+            if (
+                slower_target
+                and random.random() < MATE_SLOWER_LINE_CHANCE
+            ):
+                selected = max(
+                    slower_target,
+                    key=lambda c: c["rank"]
+                )
+        else:
+            selected = max(
+                slower_target,
+                key=lambda c: c["rank"]
+            )
+
+        _record_rank_selection(selected["rank"])
+        return (
+            selected["move"],
+            selected["info"],
+            {
+                "rank": selected["rank"],
+                "current_cp": best_cp,
+                "selected_cp": selected["cp"],
+                "reason": (
+                    f"MATE SUSTAIN | "
+                    f"TARGET=M{target_mate} "
+                    f"BEST=M{best['mate']} "
+                    f"SELECTED=M{selected['mate']} "
+                    f"HOLD={_mate_progress_hold_moves}/"
+                    f"{_mate_progress_hold_limit} "
+                    f"RANK=#"
+                    f"{selected['rank'] + 1}"
+                )
+            }
+        )
+
+    if best_cp > MIN_POSITIVE_CP:
+        # Convert an extra pawn when a queen promotion is genuinely
+        # available. Promotion is a stronger conversion priority than
+        # wandering/shuffling in a winning position.
+        priority_promotion = find_priority_queen_promotion(
+            board,
+            candidates,
+            best_cp
+        )
+
+        if priority_promotion is not None:
+            _record_rank_selection(priority_promotion["rank"])
+            return (
+                priority_promotion["move"],
+                priority_promotion["info"],
+                {
+                    "rank": priority_promotion["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": priority_promotion["cp"],
+                    "source": "QUEEN_PROMOTION",
+                    "reason": (
+                        f"{priority_promotion['reason_tag']} | "
+                        f"TARGET={chess.square_name(priority_promotion['move'].to_square)}"
+                    )
+                }
+            )
+
+        # Before normal fuzzy selection, prefer safe captures so "human-like"
+        # does not become "wander around while a free piece is hanging".
+        priority_capture = find_priority_capture(
+            board,
+            candidates,
+            best_cp,
+            engine=engine
+        )
+
+        if priority_capture is not None:
+            _record_rank_selection(priority_capture["rank"])
+            return (
+                priority_capture["move"],
+                priority_capture["info"],
+                {
+                    "rank": priority_capture["rank"],
+                    "current_cp": best_cp,
+                    "selected_cp": priority_capture["cp"],
+                    "source": "CAPTURE_PRIORITY",
+                    "reason": (
+                        f"{priority_capture['reason_tag']} | "
+                        f"TARGET={chess.square_name(priority_capture['move'].to_square)} "
+                        f"VICTIM={priority_capture['victim_value']/100:.1f} "
+                        f"{'FREE' if priority_capture['free'] else 'LIQUIDATION'}"
+                    )
+                }
+            )
+
+        normal_max_drop = safe_drop_fraction(
+            best_cp
+        )
+
+        max_drop = min(
+            normal_max_drop,
+            adaptive_max_drop
+        )
+
+        floor_cp = max(
+            5,
+            int(
+                best_cp
+                * (
+                    1.0
+                    - max_drop
+                )
+            )
+        )
+
+        global _advantage_progress_target_cp
+        global _advantage_progress_hold_moves
+        global _advantage_progress_hold_limit
+        global _advantage_progress_side
+
+        advantage_mode = False
+        advantage_maintain = False
+        advantage_growth = False
+        advantage_target_cp = None
+
+        if best_cp < HUMAN_ADVANTAGE_START_CP:
+            _advantage_progress_target_cp = None
+            _advantage_progress_hold_moves = 0
+            _advantage_progress_hold_limit = random.randint(
+                HUMAN_ADVANTAGE_HOLD_MIN_MOVES,
+                HUMAN_ADVANTAGE_HOLD_MAX_MOVES
+            )
+            _advantage_progress_side = None
+
+        else:
+            if _advantage_progress_side != mover:
+                _advantage_progress_target_cp = None
+                _advantage_progress_hold_moves = 0
+                _advantage_progress_hold_limit = random.randint(
+                    HUMAN_ADVANTAGE_HOLD_MIN_MOVES,
+                    HUMAN_ADVANTAGE_HOLD_MAX_MOVES
+                )
+                _advantage_progress_side = mover
+
+            if _advantage_progress_target_cp is None:
+                _advantage_progress_target_cp = best_cp
+                _advantage_progress_hold_moves = 0
+                _advantage_progress_hold_limit = random.randint(
+                    HUMAN_ADVANTAGE_HOLD_MIN_MOVES,
+                    HUMAN_ADVANTAGE_HOLD_MAX_MOVES
+                )
+
+            # Do not lower the stored winning target for a small evaluation
+            # fluctuation. Only reset it when the engine's best itself has
+            # fallen materially below the protected winning level.
+            if (
+                best_cp
+                < _advantage_progress_target_cp
+                - HUMAN_ADVANTAGE_PROTECT_BAND_CP
+            ):
+                _advantage_progress_target_cp = best_cp
+                _advantage_progress_hold_moves = 0
+
+            advantage_target_cp = int(
+                _advantage_progress_target_cp
+            )
+
+            advantage_mode = True
+
+            # Every few actual Stockfish moves, make a progress move. This is
+            # independent of whether the evaluation changed on the previous
+            # move, so the bot cannot sit on +6.0 for dozens of moves simply
+            # because the short engine scores happen to repeat.
+            _advantage_progress_hold_moves += 1
+
+            progress_due = (
+                _advantage_progress_hold_moves
+                >= _advantage_progress_hold_limit
+                or
+                best_cp
+                >= advantage_target_cp
+                + HUMAN_ADVANTAGE_GROWTH_TRIGGER_CP
+                or
+                opponent_pressure
+            )
+
+            if progress_due:
+                # If the position genuinely improved, advance only a small
+                # step toward the new best instead of jumping straight there.
+                if best_cp > advantage_target_cp + 10:
+                    growth_step = random.randint(
+                        HUMAN_ADVANTAGE_GROWTH_STEP_MIN_CP,
+                        HUMAN_ADVANTAGE_GROWTH_STEP_MAX_CP
+                    )
+
+                    _advantage_progress_target_cp = min(
+                        best_cp,
+                        advantage_target_cp + growth_step
+                    )
+                    advantage_target_cp = int(
+                        _advantage_progress_target_cp
+                    )
+                    advantage_growth = True
+
+                else:
+                    # Even without a visible CP jump, deliberately use a
+                    # stronger move from the current safe top end so the game
+                    # keeps developing instead of repeating a passive hold.
+                    advantage_growth = True
+
+                _advantage_progress_hold_moves = 0
+                _advantage_progress_hold_limit = random.randint(
+                    HUMAN_ADVANTAGE_HOLD_MIN_MOVES,
+                    HUMAN_ADVANTAGE_HOLD_MAX_MOVES
+                )
+            else:
+                advantage_maintain = True
+
+            # Protect the current winning advantage. +6 should not casually
+            # fall toward +4 just because a lower MultiPV move exists.
+            floor_cp = max(
+                floor_cp,
+                int(
+                    advantage_target_cp
+                    - HUMAN_ADVANTAGE_PROTECT_BAND_CP
+                )
+            )
+        # Keep the original safety floor for winning positions, but in
+        # normal/early play allow a small extra human-like evaluation band.
+        selection_floor_cp = floor_cp
+
+        winning_guard = (
+            best_cp >= HUMAN_WINNING_GUARD_START_CP
+        )
+
+        if not advantage_mode:
+            selection_floor_cp = max(
+                5,
+                floor_cp - HUMAN_SELECTION_EXTRA_DROP_CP
+            )
+
+        # Once ahead, keep human-like variation inside a tight evaluation
+        # band. The old 70cp extra drop could turn a winning position into
+        # equality for the sake of rank shuffling.
+        if winning_guard:
+            winning_drop_floor = max(
+                5,
+                best_cp - HUMAN_WINNING_GUARD_MAX_DROP_CP
+            )
+            selection_floor_cp = max(
+                selection_floor_cp,
+                winning_drop_floor
+            )
+
+        winning_rank_cap = (
+            HUMAN_STRONG_WINNING_RANK_CAP
+            if best_cp >= HUMAN_STRONG_WINNING_CP
+            else HUMAN_WINNING_GUARD_RANK_CAP
+        )
+
+        effective_rank_cap = (
+            min(adaptive_max_rank, winning_rank_cap)
+            if winning_guard
+            else adaptive_max_rank
+        )
+
+        safe = [
+            c
+            for c in candidates
+            if (
+                c["cp"] >= selection_floor_cp
+                and c["cp"] > 0
+                and c["rank"] <= effective_rank_cap
+                and (
+                    not winning_guard
+                    or not candidate_hangs_own_piece(
+                        board,
+                        c["move"]
+                    )
+                )
+            )
+        ]
+
+        if not safe:
+            safe = [best]
+
+        if not safe:
+            safe = [best]
+
+        non_best = [
+            c
+            for c in safe
+            if c["rank"] > 0
+        ]
+
+        non_best_chance = (
+            HUMAN_STRONG_WINNING_NON_BEST_CHANCE
+            if best_cp >= HUMAN_STRONG_WINNING_CP
+            else HUMAN_WINNING_NON_BEST_CHANCE
+            if winning_guard
+            else HUMAN_SELECTION_NON_BEST_CHANCE
+        )
+
+        if (
+            len(non_best) >= 2
+            and random.random() < non_best_chance
+        ):
+            pool = non_best
+        else:
+            pool = safe
+
+        roll = random.random()
+
+        if roll < 0.45:
+            target_drop = random.uniform(
+                0.00,
+                max_drop * 0.35
+            )
+
+        elif roll < 0.78:
+            target_drop = random.uniform(
+                max_drop * 0.35,
+                max_drop * 0.70
+            )
+
+        elif roll < 0.95:
+            target_drop = random.uniform(
+                max_drop * 0.70,
+                max_drop * 0.90
+            )
+
+        else:
+            target_drop = random.uniform(
+                max_drop * 0.90,
+                max_drop
+            )
+
+        desired_cp = max(
+            floor_cp,
+            int(
+                best_cp
+                * (
+                    1.0
+                    - target_drop
+                )
+            )
+        )
+
+        if advantage_mode:
+            if advantage_maintain:
+                desired_cp = min(
+                    best_cp,
+                    max(
+                        floor_cp,
+                        int(
+                            advantage_target_cp
+                            + random.uniform(
+                                -HUMAN_ADVANTAGE_MAINTAIN_BAND_CP * 0.20,
+                                HUMAN_ADVANTAGE_MAINTAIN_BAND_CP * 0.20
+                            )
+                        )
+                    )
+                )
+            else:
+                growth_preference_cp = random.randint(
+                    HUMAN_ADVANTAGE_GROWTH_PREFERENCE_MIN_CP,
+                    HUMAN_ADVANTAGE_GROWTH_PREFERENCE_MAX_CP
+                )
+                desired_cp = min(
+                    best_cp,
+                    max(
+                        floor_cp,
+                        int(
+                            advantage_target_cp
+                            + growth_preference_cp
+                        )
+                    )
+                )
+
+        if advantage_mode:
+            if advantage_growth:
+                # Progress moves must still feel human-like. Do not collapse
+                # the pool to only the top few centipawn lines: that makes
+                # advantage growth select #1 repeatedly. Keep every safe
+                # MultiPV=15 candidate available and let the fuzzy rank/score
+                # weighting decide among them.
+                growth_pool = [
+                    c
+                    for c in safe
+                    if c["cp"] >= floor_cp
+                ]
+
+                if growth_pool:
+                    pool = growth_pool
+                else:
+                    pool = safe
+            else:
+                maintain_min = max(
+                    floor_cp,
+                    int(
+                        advantage_target_cp
+                        - HUMAN_ADVANTAGE_MAINTAIN_BAND_CP
+                    )
+                )
+
+                maintain_pool = [
+                    c
+                    for c in safe
+                    if (
+                        c["cp"] >= maintain_min
+                        and c["cp"] <= best_cp
+                    )
+                ]
+
+                if maintain_pool:
+                    pool = maintain_pool
+
+        if advantage_mode and advantage_growth:
+            # Keep #1/#2 available, but spread lower-rank preference instead
+            # of making #3 the default. Growth remains protected by the CP
+            # preference above.
+            rank_factors = {
+                0: 0.50,
+                1: 0.62,
+                2: 0.82,
+                3: 1.06,
+                4: 1.15,
+                5: 1.16,
+                6: 1.14,
+                7: 1.11,
+                8: 1.08,
+                9: 1.05,
+                10: 1.02,
+                11: 1.00,
+                12: 0.98,
+                13: 0.96,
+                14: 0.94,
+            }
+        else:
+            # Spread the lower-rank preference across #3-#8 so #3 does not
+            # become the default answer when several safe choices exist.
+            rank_factors = {
+                0: 0.55,
+                1: 0.68,
+                2: 0.82,
+                3: 1.06,
+                4: 1.15,
+                5: 1.16,
+                6: 1.14,
+                7: 1.11,
+                8: 1.08,
+                9: 1.05,
+                10: 1.02,
+                11: 1.00,
+                12: 0.98,
+                13: 0.96,
+                14: 0.94,
+            }
+
+        pool, _avoided_ranks = _diversify_rank_pool(
+            pool, _recent_selected_ranks
+        )
+        lower_rank_pool = [
+            candidate
+            for candidate in pool
+            if candidate["rank"] >= 2
+        ]
+
+        # If the normal safety/evaluation band leaves fewer than three
+        # candidates, do NOT let the fuzzy draw collapse back to #1/#2.
+        # Build a slightly wider lower-rank-only pool using the same engine
+        # candidates and the same rank cap. The extra band is small and is
+        # used only to create human-like choice diversity.
+        diversity_floor_cp = max(
+            5,
+            int(
+                best_cp
+                * (
+                    1.0
+                    - min(
+                        0.28,
+                        max_drop
+                        + HUMAN_SELECTION_DIVERSITY_EXTRA_DROP
+                    )
+                )
+            )
+        )
+
+        diversity_lower_pool = [
+            candidate
+            for candidate in candidates
+            if (
+                candidate["rank"] >= 2
+                and candidate["rank"] <= effective_rank_cap
+                and candidate["cp"] >= diversity_floor_cp
+                and candidate["cp"] > 0
+                and (
+                    not winning_guard
+                    or not candidate_hangs_own_piece(
+                        board,
+                        candidate["move"]
+                    )
+                )
+            )
+        ]
+
+        if (
+            diversity_lower_pool
+            and (
+                len(pool) <= 1
+                or not lower_rank_pool
+            )
+        ):
+            selection_pool = diversity_lower_pool
+        else:
+            selection_pool = (
+                lower_rank_pool
+                if (
+                    lower_rank_pool
+                    and random.random() > HUMAN_SELECTION_TOP12_MAX_CHANCE
+                )
+                else pool
+            )
+
+        # Baseline weighting/rank diversity remains unchanged unless a candidate
+        # clearly gives away an unrelated major/minor piece and another safe
+        # candidate already exists in the same pool.
+        non_giveaway_pool = [
+            candidate for candidate in selection_pool
+            if not candidate_exposes_free_major_piece(board, candidate["move"])
+        ]
+        if non_giveaway_pool:
+            selection_pool = non_giveaway_pool
+
+        selection_pool, _avoided_ranks = _diversify_rank_pool(
+            selection_pool, _recent_selected_ranks
+        )
+
+        weighted = []
+
+        for candidate in selection_pool:
+            distance = abs(
+                candidate["cp"]
+                - desired_cp
+            )
+
+            weight = (
+                1.0
+                / (
+                    1.0
+                    + distance / (
+                        HUMAN_SELECTION_DISTANCE_CP
+                        * (
+                            1.35
+                            if advantage_mode
+                            else 1.0
+                        )
+                    )
+                )
+            )
+
+            weight *= (
+                rank_factors.get(
+                    candidate["rank"],
+                    0.45
+                )
+            )
+
+            weighted.append(
+                (
+                    candidate,
+                    max(
+                        0.01,
+                        weight
+                    )
+                )
+            )
+
+        total = sum(
+            weight
+            for _, weight
+            in weighted
+        )
+
+        pick = random.uniform(
+            0,
+            total
+        )
+
+        running = 0.0
+        selected = weighted[0][0]
+
+        for candidate, weight in weighted:
+            running += weight
+
+            if pick <= running:
+                selected = candidate
+                break
+
+        _record_rank_selection(selected["rank"])
+        return (
+            selected["move"],
+            selected["info"],
+            {
+                "rank": selected["rank"],
+                "current_cp": best_cp,
+                "selected_cp": selected["cp"],
+                "reason": (
+                    (
+                        "advantage growth"
+                        if advantage_mode and advantage_growth
+                        else "advantage maintain"
+                        if advantage_mode
+                        else "controlled shuffle"
+                    )
+                    + " | "
+                    + f"BEST={best_cp/100:+.2f} "
+                    + f"SELECTED={selected['cp']/100:+.2f} "
+                    + f"RANK=#{selected['rank'] + 1} "
+                    + f"FLOOR={floor_cp/100:+.2f} "
+                    + f"MAX_DROP={max_drop*100:.1f}% "
+                    + f"OPP="
+                    f"{profile['opponent_accuracy'] if profile['opponent_accuracy'] is not None else 0.0:.1f}% "
+                    f"TARGET="
+                    f"{profile['target_accuracy']:.1f}% "
+                    f"RANKCAP=#"
+                    f"{adaptive_max_rank + 1}"
+                )
+            }
+        )
+
+    # The old fixed 20cp floor routinely excluded every line below #2.
+    # Reuse the existing bounded recovery pool so normal/equal positions may
+    # consider up to 70cp lower lines, while still respecting the adaptive rank cap.
+    safe, near_equal_floor, near_equal_drop_cap = _near_equal_selection_pool(
+        candidates, best_cp, adaptive_max_rank
+    )
+
+    if not safe:
+        safe = [best]
+
+    rank_weights = {
+        0: 0.85,
+        1: 0.90,
+        2: 0.98,
+        3: 1.04,
+        4: 1.08,
+        5: 1.10,
+        6: 1.08,
+        7: 1.06,
+        8: 1.04,
+        9: 1.02,
+        10: 1.00,
+        11: 0.98,
+        12: 0.96,
+        13: 0.94,
+        14: 0.92,
+    }
+
+    safe, _avoided_ranks = _diversify_rank_pool(
+        safe, _recent_selected_ranks
+    )
+    lower_rank_safe = [
+        candidate
+        for candidate in safe
+        if candidate["rank"] >= 2
+    ]
+
+    # Prefer rank #3 and below almost every time when the bounded safe pool
+    # contains such alternatives. Keep a small fallback chance for the top two.
+    selection_safe = (
+        lower_rank_safe
+        if (
+            lower_rank_safe
+            and random.random() > NON_ADVANTAGE_TOP12_MAX_CHANCE
+        )
+        else safe
+    )
+    selection_safe, _avoided_ranks = _diversify_rank_pool(
+        selection_safe, _recent_selected_ranks
+    )
+
+    weighted = []
+
+    for candidate in selection_safe:
+        weighted.append(
+            (
+                candidate,
+                rank_weights.get(
+                    candidate["rank"],
+                    0.3
+                )
+            )
+        )
+
+    total = sum(
+        weight
+        for _, weight
+        in weighted
+    )
+
+    pick = random.uniform(
+        0,
+        total
+    )
+
+    running = 0.0
+    selected = weighted[0][0]
+
+    for candidate, weight in weighted:
+        running += weight
+
+        if pick <= running:
+            selected = candidate
+            break
+
+    _record_rank_selection(selected["rank"])
+    return (
+        selected["move"],
+        selected["info"],
+        {
+            "rank": selected["rank"],
+            "current_cp": best_cp,
+            "selected_cp": selected["cp"],
+            "reason": (
+                f"near-equal shuffle | "
+                f"BEST="
+                f"{best_cp/100:+.2f} "
+                f"SELECTED="
+                f"{selected['cp']/100:+.2f} "
+                f"RANK=#"
+                f"{selected['rank'] + 1}"
+            )
+        }
+    )
