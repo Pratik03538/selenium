@@ -327,16 +327,17 @@ _INSTALL_OVERLAY = r"""(() => {
         display:flex;align-items:center;justify-content:space-between;gap:8px;
         font-size:10px;color:#8e9db0;margin-top:7px;
       }
-      .collapsed .body { display:none; }
-      .collapsed .panel { width:auto; max-height:none; resize:none; }
+      :host(.collapsed) .body { display:none; }
+      :host(.collapsed) .panel { width:auto; max-height:none; resize:none; }
+      :host(.collapsed) .status, :host(.collapsed) #arrows { display:none; }
       .chip {
         display:none; border:1px solid rgba(180,200,225,.28);
         border-radius:999px;background:#17202d;color:#f1f6fd;
         box-shadow:0 4px 18px rgba(0,0,0,.3);padding:8px 12px;
         font-weight:750;cursor:pointer;
       }
-      .hidden .panel { display:none; }
-      .hidden .chip { display:inline-flex; }
+      :host(.hidden) .panel { display:none; }
+      :host(.hidden) .chip { display:inline-flex; }
       @media (max-width:600px) {
         .panel { max-height:min(36vh,300px); }
         .head { min-height:34px; }
@@ -535,9 +536,11 @@ _INSTALL_OVERLAY = r"""(() => {
     host.classList.toggle('collapsed', state.collapsed);
     $('#min').textContent = state.collapsed ? '+' : '−';
     if (state.collapsed) {
+      host.style.width = 'max-content';
       $('#panel').style.width = 'fit-content';
       $('#panel').style.resize = 'none';
     } else {
+      host.style.width = 'min(326px,calc(100vw - 20px))';
       $('#panel').style.width = '100%';
       $('#panel').style.resize = '';
     }
@@ -545,10 +548,12 @@ _INSTALL_OVERLAY = r"""(() => {
   $('#hide').addEventListener('click', event => {
     event.stopPropagation();
     host.classList.add('hidden');
+    host.style.width = 'max-content';
     state.hidden = true;
   });
   $('#restore').addEventListener('click', () => {
     host.classList.remove('hidden');
+    host.style.width = 'min(326px,calc(100vw - 20px))';
     state.hidden = false;
   });
   $('#clear').addEventListener('click', event => {
@@ -672,7 +677,11 @@ def _square_name(square: chess.Square) -> str:
     return chess.square_name(square)
 
 
-def _describe_score(info: dict | None, perspective: chess.Color) -> str:
+def _describe_score(
+    info: dict | None,
+    perspective: chess.Color,
+    perspective_label: str = "bot",
+) -> str:
     if not isinstance(info, dict):
         return "Engine evaluation unavailable."
     score_obj = info.get("score")
@@ -685,10 +694,11 @@ def _describe_score(info: dict | None, perspective: chess.Color) -> str:
         return "Engine evaluation unavailable."
 
     if mate is not None:
+        other_side = "opponent" if perspective_label == "bot" else "doosri side"
         if mate > 0:
-            return f"Is line mein engine bot ke liye mate in {mate} dikhata hai."
+            return f"Is line mein engine {perspective_label} ke liye mate in {mate} dikhata hai."
         if mate < 0:
-            return f"Is line mein engine opponent ke liye mate in {abs(mate)} dikhata hai."
+            return f"Is line mein engine {other_side} ke liye mate in {abs(mate)} dikhata hai."
         return "Engine ne position ko mate position score kiya hai."
 
     try:
@@ -699,14 +709,15 @@ def _describe_score(info: dict | None, perspective: chess.Color) -> str:
         return "Engine evaluation unavailable."
 
     pawns = cp / 100.0
+    other_side = "opponent" if perspective_label == "bot" else "doosri side"
     if pawns >= 1.2:
-        return f"Is played-move line mein bot ko lagbhag +{pawns:.1f} pawn ka faayda hai."
+        return f"Is played-move line mein {perspective_label} ko lagbhag +{pawns:.1f} pawn ka faayda hai."
     if pawns <= -1.2:
-        return f"Is played-move line mein opponent ko lagbhag {abs(pawns):.1f} pawn ka faayda hai."
+        return f"Is played-move line mein {other_side} ko lagbhag {abs(pawns):.1f} pawn ka faayda hai."
     if pawns >= 0.35:
-        return f"Is played-move line mein bot ko halka faayda hai (lagbhag +{pawns:.1f})."
+        return f"Is played-move line mein {perspective_label} ko halka faayda hai (lagbhag +{pawns:.1f})."
     if pawns <= -0.35:
-        return f"Is played-move line mein opponent ko halka faayda hai (lagbhag {pawns:.1f})."
+        return f"Is played-move line mein {other_side} ko halka faayda hai (lagbhag {pawns:.1f})."
     return "Is played-move line mein position lagbhag balanced dikh rahi hai."
 
 
@@ -734,12 +745,16 @@ def _move_commentary(
     """Explain the already-observed move. Never returns a replacement move."""
     mover = before.turn
     is_bot_move = bot_color is not None and mover == bot_color
-    side_label = "Hamari move" if is_bot_move else "Opponent ki move"
+    side_label = (
+        "Hamari move" if is_bot_move
+        else "Opponent ki move" if bot_color is not None
+        else "Board par move"
+    )
     san = before.san(move)
     source, target = _square_name(move.from_square), _square_name(move.to_square)
     lines: list[dict[str, str]] = [{
-        "kind": "ours" if is_bot_move else "opponent",
-        "label": "BOT MOVE" if is_bot_move else "OPPONENT MOVE",
+        "kind": "ours" if is_bot_move else "opponent" if bot_color is not None else "info",
+        "label": "BOT MOVE" if is_bot_move else "OPPONENT MOVE" if bot_color is not None else "OBSERVED MOVE",
         "text": f"{side_label}: {san} ({source}→{target}).",
     }]
 
@@ -752,10 +767,15 @@ def _move_commentary(
             captured = chess.Piece(chess.PAWN, not before.turn)
         if captured:
             label = captured.symbol().upper()
+            captured_side = (
+                "opponent ka" if is_bot_move
+                else "hamara" if bot_color is not None
+                else "doosri side ka"
+            )
             lines.append({
                 "kind": "info",
                 "label": "MATERIAL",
-                "text": f"Yeh capture hai: move se opponent ka {label} piece capture hua.",
+                "text": f"Yeh capture hai: move se {captured_side} {label} piece capture hua.",
             })
     if before.gives_check(move):
         lines.append({
@@ -809,11 +829,16 @@ def _move_commentary(
             arrows.append({"from": reply_from, "to": reply_to, "kind": "reply"})
             squares.append({"square": reply_to, "kind": "reply"})
 
+            response_side = (
+                "opponent ka likely jawab" if is_bot_move
+                else "hamari possible response" if bot_color is not None
+                else "agla likely move"
+            )
             if after.gives_check(reply):
                 lines.append({
                     "kind": "warning",
                     "label": "CHECK WARNING",
-                    "text": f"Engine ki line mein opponent ka likely jawab {reply_san} check hai.",
+                    "text": f"Engine ki line mein {response_side} {reply_san} check hai.",
                 })
             elif after.is_capture(reply):
                 captured = after.piece_at(reply.to_square)
@@ -825,22 +850,35 @@ def _move_commentary(
                         chess.BISHOP: "bishop", chess.ROOK: "rook",
                         chess.QUEEN: "queen", chess.KING: "king",
                     }.get(captured.piece_type, "piece")
+                    capture_description = (
+                        f"Opponent ka jawab {reply_san} hamara {piece_name} capture karta hai."
+                        if is_bot_move else
+                        f"Hamari line mein {reply_san} se opponent ka {piece_name} capture ho sakta hai."
+                        if bot_color is not None else
+                        f"Is line mein {reply_san} ek {piece_name} capture karta hai."
+                    )
                     lines.append({
-                        "kind": "warning",
-                        "label": "CAPTURE WARNING",
-                        "text": f"Opponent ka likely jawab {reply_san} hai, jo hamara {piece_name} capture karta hai.",
+                        "kind": "warning" if is_bot_move else "info",
+                        "label": "CAPTURE WARNING" if is_bot_move else "TACTICAL REPLY",
+                        "text": capture_description,
                     })
+            response_label = (
+                "OPPONENT KA LIKELY REPLY" if is_bot_move
+                else "HAMARI POSSIBLE RESPONSE" if bot_color is not None
+                else "NEXT LIKELY MOVE"
+            )
             lines.append({
                 "kind": "info",
-                "label": "OPPONENT KA LIKELY REPLY",
-                "text": f"Is forced-move variation mein opponent ka next move {reply_san} ({reply_from}→{reply_to}) hai. Yeh prediction hai, guarantee nahi.",
+                "label": response_label,
+                "text": f"Is line mein agla move {reply_san} ({reply_from}→{reply_to}) hai. Yeh engine prediction hai, guarantee nahi.",
             })
 
     perspective = bot_color if bot_color is not None else mover
+    perspective_label = "bot" if bot_color is not None else "move khelne wali side"
     lines.append({
         "kind": "info",
         "label": "POSITION ESTIMATE",
-        "text": _describe_score(info, perspective),
+        "text": _describe_score(info, perspective, perspective_label),
     })
     if isinstance(info, dict):
         try:
@@ -986,6 +1024,7 @@ def main() -> int:
         previous_entries: list[dict[str, str]] | None = None
         previous_fen = ""
         previous_board: chess.Board | None = None
+        already_explained: set[tuple[str, str]] = set()
         feed: list[dict[str, str]] = []
         current_orientation = "white"
         last_status_push = 0.0
@@ -1121,6 +1160,12 @@ def main() -> int:
             for record in new_records:
                 move = record["move"]
                 before = record["before"]
+                explanation_key = (before.fen(), move.uci())
+                if explanation_key in already_explained:
+                    continue
+                already_explained.add(explanation_key)
+                if len(already_explained) > 256:
+                    already_explained = set(list(already_explained)[-128:])
                 try:
                     lines, arrows, highlights = _move_commentary(
                         before,
