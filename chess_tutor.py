@@ -45,6 +45,15 @@ def _score_value(score: Any) -> int | None:
         return None
 
 
+def _mate_distance(score: Any) -> int | None:
+    if score is None:
+        return None
+    try:
+        return score.mate()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def _score_description(score: Any) -> str:
     if score is None:
         return 'evaluation unavailable'
@@ -243,10 +252,8 @@ def build_coach_commentary(
                 pass
 
         selected_score = selected_candidate['score']
-        try:
-            mate = selected_score.mate() if selected_score is not None else None
-        except (AttributeError, TypeError, ValueError):
-            mate = None
+        mate = _mate_distance(selected_score)
+        best_mate = _mate_distance(best['score']) if best is not None else None
         if mate is not None and mate < 0:
             lines.append(
                 f'[COACH WARNING] Is line mein opponent ke paas forced mate '
@@ -257,6 +264,8 @@ def build_coach_commentary(
             and selected_candidate['value'] is not None
             and best is not None
             and best['move'] != selected_move
+            and mate is None
+            and best_mate is None
         ):
             loss_cp = best_value - selected_candidate['value']
             if loss_cp >= 250:
@@ -271,6 +280,18 @@ def build_coach_commentary(
                     f'[COACH] Engine ki top line {best_name} hai; selected line '
                     f'uske muqable lagbhag {loss_cp / 100:.1f} pawn weaker hai.'
                 )
+        elif (
+            best is not None
+            and best['move'] != selected_move
+            and best_mate is not None
+            and best_mate > 0
+            and mate is None
+        ):
+            lines.append(
+                f'[COACH WARNING] Engine ki top line {best_name} forced mate in '
+                f'{best_mate} dikhati hai, lekin selected move ki line forced mate '
+                'confirm nahi karti.'
+            )
 
         for note in _capture_details(board, selected_pv):
             lines.append(f'[COACH TACTIC] {note}.')
@@ -304,10 +325,8 @@ def build_coach_commentary(
         lines.append(detail)
 
         score = candidate['score']
-        try:
-            mate = score.mate() if score is not None else None
-        except (AttributeError, TypeError, ValueError):
-            mate = None
+        mate = _mate_distance(score)
+        best_mate = _mate_distance(best['score']) if best is not None else None
         if mate is not None and mate < 0:
             lines.append(
                 f'[COACH WARNING] Engine #{engine_rank} wali line opponent ko '
@@ -318,6 +337,8 @@ def build_coach_commentary(
             and candidate['value'] is not None
             and best is not None
             and candidate['move'] != best['move']
+            and mate is None
+            and best_mate is None
         ):
             drop_cp = best_value - candidate['value']
             if drop_cp >= 100:
