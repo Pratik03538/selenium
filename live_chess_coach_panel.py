@@ -1033,9 +1033,22 @@ def main() -> int:
         feed: list[dict[str, str]] = []
         current_orientation = "white"
         last_status_push = 0.0
+        last_overlay_check = 0.0
 
         while True:
             try:
+                if time.monotonic() - last_overlay_check >= 1.5:
+                    overlay_ready = bool(
+                        page.evaluate("Boolean(window.__liveChessCoachPanel)", timeout=1.0)
+                    )
+                    if not overlay_ready:
+                        page.evaluate(_INSTALL_OVERLAY, timeout=1.5)
+                        _ui_update(page, {
+                            "status": "Panel restored after page update",
+                            "mode": "READ-ONLY • NO MOVE INPUT",
+                            "footnote": "Overlay restored; gameplay input is untouched.",
+                        })
+                    last_overlay_check = time.monotonic()
                 state = page.evaluate(_STATE_EXPRESSION, timeout=1.5)
             except Exception:
                 _ui_update(page, {"status": "Reconnecting to tracker state…"})
