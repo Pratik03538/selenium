@@ -1122,13 +1122,20 @@ def _launch_wrapped_bot() -> int:
                 and gap > options.clock_margin + max(1.0, options.coach_engine_time + 0.2)
                 and not kwargs.get("low_clock_mode", False)
             )
-            if not can_spend_analysis:
+            if options.coach_no_engine:
+                quick_lines.append({
+                    "kind": "info",
+                    "label": "FAST COMMENTARY",
+                    "text": "Extra Stockfish analysis disabled hai; selected move ka arrow aur available tactical note hi dikhaya jayega.",
+                })
+            elif not can_spend_analysis:
                 quick_lines.append({
                     "kind": "info",
                     "label": "CLOCK-SAFE MODE",
                     "text": (
                         "Clock lead chhota hai ya clock data unavailable hai; "
-                        "extra engine calculation aur explanation pause skip kiya."
+                        "extra engine calculation skip ki. Agar measured lead allow kare "
+                        "to sirf bounded short pause use hogi."
                     ),
                 })
 
@@ -1165,6 +1172,23 @@ def _launch_wrapped_bot() -> int:
                     "messages": detailed_lines[-MAX_FEED_LINES:],
                     "arrows": arrows,
                     "highlights": highlights,
+                    "orientation": orientation,
+                })
+            elif can_spend_analysis:
+                no_engine_lines = quick_lines + [{
+                    "kind": "info",
+                    "label": "ENGINE UNAVAILABLE",
+                    "text": "Stockfish tutor analysis start nahi ho saka; selected move unchanged hai, basic commentary hi dikhayi ja rahi hai.",
+                }]
+                _ui_update(cdp, {
+                    "status": "Quick explanation • executing selected move next",
+                    "mode": "SELECTED MOVE • READ-ONLY COACH",
+                    "clock": (
+                        f"W {state.get('whiteClock') or '—'}  ·  B {state.get('blackClock') or '—'}"
+                    ),
+                    "messages": no_engine_lines[-MAX_FEED_LINES:],
+                    "arrows": quick_arrows,
+                    "highlights": quick_highlights,
                     "orientation": orientation,
                 })
 
