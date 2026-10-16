@@ -410,12 +410,20 @@ def voice_summary(commentary: list[str], max_chars: int = 220) -> str:
     """Choose a short spoken version, avoiding repetitive/detailed console lines."""
     if not commentary:
         return ''
-    priorities = ('[COACH] Hamne', '[COACH] Is line', '[COACH WARNING]')
+    has_our_move = any(line.startswith('[COACH] Hamne') for line in commentary)
+    if has_our_move:
+        priorities = ('[COACH] Hamne', '[COACH] Is line', '[COACH WARNING]', '[COACH TACTIC]')
+    else:
+        priorities = ('[COACH OPPONENT] Opponent', '[COACH TACTIC]', '[COACH OPPONENT] Quick')
     selected: list[str] = []
     for prefix in priorities:
         item = next((line for line in commentary if line.startswith(prefix)), None)
         if item and item not in selected:
-            selected.append(item.replace('[COACH WARNING]', 'Dhyan dein.').replace('[COACH] ', ''))
+            item = item.replace('[COACH WARNING]', 'Dhyan dein.')
+            item = item.replace('[COACH OPPONENT] ', '')
+            item = item.replace('[COACH TACTIC] ', 'Tactical note: ')
+            item = item.replace('[COACH] ', '')
+            selected.append(item)
     summary = ' '.join(selected)
     if len(summary) > max_chars:
         summary = summary[: max_chars - 1].rsplit(' ', 1)[0] + '…'
