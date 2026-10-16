@@ -1058,8 +1058,6 @@ def _launch_wrapped_bot() -> int:
     settings = _load_settings()
     tracker_globals: dict = {}
     tutor_engine = None
-    last_explanation_at = 0.0
-
     # Respect an explicitly passed Stockfish path to the existing tracker too.
     tracker_engine_override = ""
     for index, item in enumerate(tracker_args):
@@ -1078,7 +1076,7 @@ def _launch_wrapped_bot() -> int:
         *args,
         **kwargs,
     ) -> None:
-        nonlocal tutor_engine, last_explanation_at
+        nonlocal tutor_engine
         if kwargs.get("allow_premove", False):
             # A premove is queued for a future position; its final tactical line
             # cannot be honestly explained as if it were already a legal move.
@@ -1106,48 +1104,73 @@ def _launch_wrapped_bot() -> int:
                 orientation = "white"
 
             own_clock, gap = _side_clock_gap(state, expected_color)
-            # When the own clock is not comfortably ahead, skip the extra search
-            # entirely and render only the move/check/capture information.
-            can_spend_analysis = (
-                own_clock is None
-                or (
-                    own_clock > max(5.0, options.clock_margin + 2.0)
-                    and (gap is None or gap > options.clock_margin + options.coach_engine_time + 0.1)
-                )
-            )
-            active_engine = None
-            if not options.coach_no_engine and can_spend_analysis:
-                if tutor_engine is None:
-                    tutor_engine = _open_engine(settings, engine_override)
-                active_engine = tutor_engine
-
-            lines, arrows, highlights = _move_commentary(
-                board,
-                move,
+            bot_color = (
                 chess.WHITE if expected_color == "white"
                 else chess.BLACK if expected_color == "black"
-                else None,
-                active_engine,
-                options.coach_engine_time,
+                else None
             )
-            _INSTALL_OVERLAY_RESULT = cdp.evaluate(_INSTALL_OVERLAY, timeout=0.8)
-            payload = {
+            # Draw the selected-move arrow and a short basic explanation first.
+            # Detailed calculation follows only when the clocks show a safe lead.
+            quick_lines, quick_arrows, quick_highlights = _move_commentary(
+                board, move, bot_color, None, options.coach_engine_time
+            )
+            quick_lines = [line for line in quick_lines if line.get("label") != "ENGINE"]
+            can_spend_analysis = (
+                not options.coach_no_engine
+                and own_clock is not None
+                and gap is not None
+                and own_clock > max(5.0, options.clock_margin + 2.0)
+                and gap > options.clock_margin + options.coach_engine_time + 0.1
+                and not kwargs.get("low_clock_mode", False)
+            )
+            if not can_spend_analysis:
+                quick_lines.append({
+                    "kind": "info",
+                    "label": "CLOCK-SAFE MODE",
+                    "text": (
+                        "Clock lead chhota hai ya clock data unavailable hai; "
+                        "extra engine calculation aur explanation pause skip kiya."
+                    ),
+                })
+
+            cdp.evaluate(_INSTALL_OVERLAY, timeout=0.8)
+            _ui_update(cdp, {
                 "status": "Explaining selected move before execution",
                 "mode": "SELECTED MOVE • READ-ONLY COACH",
                 "clock": (
                     f"W {state.get('whiteClock') or '—'}  ·  B {state.get('blackClock') or '—'}"
                 ),
-                "footnote": "Short pre-move explanation. Existing move selection remains unchanged.",
-                "messages": lines[-MAX_FEED_LINES:],
-                "arrows": arrows,
-                "highlights": highlights,
+                "footnote": "Existing move selector and selected UCI remain unchanged.",
+                "messages": quick_lines[-MAX_FEED_LINES:],
+                "arrows": quick_arrows,
+                "highlights": quick_highlights,
                 "orientation": orientation,
-            }
-            _ui_update(cdp, payload)
-            last_explanation_at = time.monotonic()
+            })
 
-            # Re-read clocks after the bounded engine work and drawing. Pause only
-            # while a measurable lead remains beyond the user's safety margin.
+            active_engine = None
+            if can_spend_analysis:
+                if tutor_engine is None:
+                    tutor_engine = _open_engine(settings, engine_override)
+                active_engine = tutor_engine
+            if active_engine is not None:
+                detailed_lines, arrows, highlights = _move_commentary(
+                    board, move, bot_color, active_engine, options.coach_engine_time
+                )
+                _ui_update(cdp, {
+                    "status": "Explained • executing selected move next",
+                    "mode": "SELECTED MOVE • READ-ONLY COACH",
+                    "clock": (
+                        f"W {state.get('whiteClock') or '—'}  ·  B {state.get('blackClock') or '—'}"
+                    ),
+                    "footnote": "This analysis explains the already-selected move; it cannot replace it.",
+                    "messages": detailed_lines[-MAX_FEED_LINES:],
+                    "arrows": arrows,
+                    "highlights": highlights,
+                    "orientation": orientation,
+                })
+
+            # Re-read clocks after analysis and rendering. Pause only by the amount
+            # that still preserves the configured measured lead; unknown clocks mean no wait.
             if active_engine is None or options.explain_pause <= 0:
                 return
             latest = cdp.evaluate(_STATE_EXPRESSION, timeout=0.5)
