@@ -3,10 +3,11 @@ name: Python syntax and timing tests
 on:
   push:
     branches:
-      - feature/live-game-tracker
+      - main
+      - 'work/**'
   pull_request:
     branches:
-      - feature/live-game-tracker
+      - main
 
 jobs:
   syntax-and-timing:
