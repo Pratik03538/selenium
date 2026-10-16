@@ -1081,9 +1081,8 @@ def _launch_wrapped_bot() -> int:
             # A premove is queued for a future position; its final tactical line
             # cannot be honestly explained as if it were already a legal move.
             return
-        if kwargs.get("low_clock_mode", False):
-            # In emergency mode do not add an engine search or an intentional pause.
-            return
+        # Emergency mode still gets the instant arrow/text overlay below, but
+        # it skips the added engine search and intentional pause.
         try:
             board = chess.Board(str(expected_fen))
             move = chess.Move.from_uci(str(uci))
@@ -1119,8 +1118,8 @@ def _launch_wrapped_bot() -> int:
                 not options.coach_no_engine
                 and own_clock is not None
                 and gap is not None
-                and own_clock > max(5.0, options.clock_margin + 2.0)
-                and gap > options.clock_margin + options.coach_engine_time + 0.1
+                and own_clock > max(8.0, options.clock_margin + 3.0)
+                and gap > options.clock_margin + max(1.0, options.coach_engine_time + 0.2)
                 and not kwargs.get("low_clock_mode", False)
             )
             if not can_spend_analysis:
@@ -1171,7 +1170,7 @@ def _launch_wrapped_bot() -> int:
 
             # Re-read clocks after analysis and rendering. Pause only by the amount
             # that still preserves the configured measured lead; unknown clocks mean no wait.
-            if active_engine is None or options.explain_pause <= 0:
+            if options.explain_pause <= 0 or kwargs.get("low_clock_mode", False):
                 return
             latest = cdp.evaluate(_STATE_EXPRESSION, timeout=0.5)
             if not isinstance(latest, dict):
@@ -1221,11 +1220,10 @@ def _launch_wrapped_bot() -> int:
 
         def wrapped_api(driver, uci, expected_fen, expected_color, *,
                         low_clock_mode=False, source="api"):
-            if not low_clock_mode:
-                explain_before_submit(
-                    driver, uci, expected_fen, expected_color,
-                    allow_premove=False, low_clock_mode=low_clock_mode,
-                )
+            explain_before_submit(
+                driver, uci, expected_fen, expected_color,
+                allow_premove=False, low_clock_mode=low_clock_mode,
+            )
             return original_api(
                 driver, uci, expected_fen, expected_color,
                 low_clock_mode=low_clock_mode,
