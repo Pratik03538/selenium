@@ -1,2 +1,0 @@
-Coach validation: PASS
-Python compile + existing unit tests outcome: success
