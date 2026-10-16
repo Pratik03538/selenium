@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import runpy
 import shutil
 import sys
 import time
@@ -981,7 +982,261 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
+def _clock_seconds(value: object) -> float | None:
+    """Parse the site's visible clock without assuming its exact presentation."""
+    raw = str(value or "").strip().replace(",", ".")
+    if not raw:
+        return None
+    try:
+        if ":" in raw:
+            parts = raw.split(":")
+            if len(parts) == 2:
+                return max(0.0, float(parts[0]) * 60.0 + float(parts[1]))
+            if len(parts) == 3:
+                return max(
+                    0.0,
+                    float(parts[0]) * 3600.0
+                    + float(parts[1]) * 60.0
+                    + float(parts[2]),
+                )
+        return max(0.0, float(raw.removesuffix("s").strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _side_clock_gap(state: dict, bot_color: str | None) -> tuple[float | None, float | None]:
+    if bot_color not in {"white", "black"}:
+        return None, None
+    white = _clock_seconds(state.get("whiteClock"))
+    black = _clock_seconds(state.get("blackClock"))
+    if white is None or black is None:
+        return None, None
+    own = white if bot_color == "white" else black
+    opponent = black if bot_color == "white" else white
+    return own, own - opponent
+
+
+def _launch_wrapped_bot() -> int:
+    """Launch the original tracker and tutor its already-selected move pre-submit.
+
+    All patching is done in this new process and this new file. The tracker source
+    and strategy source stay unchanged; the wrappers run only immediately before
+    the original submit function and always delegate to that exact function.
+    """
+    parser = argparse.ArgumentParser(
+        description="Launch the existing tracker with a read-only live tutor overlay."
+    )
+    parser.add_argument("--launch-bot", action="store_true")
+    parser.add_argument("--explain-pause", type=float, default=0.45,
+                        help="Maximum explanation pause in seconds; clock-gap guard can shorten it.")
+    parser.add_argument("--clock-margin", type=float, default=0.75,
+                        help="Minimum own-clock lead to preserve before adding an explanation pause.")
+    parser.add_argument("--coach-engine-time", type=float, default=0.12,
+                        help="Maximum Stockfish analysis time for the already-selected move.")
+    parser.add_argument("--coach-stockfish-path", default="",
+                        help="Optional Stockfish path for tutor analysis (does not choose the bot move).")
+    parser.add_argument("--coach-no-engine", action="store_true",
+                        help="Show the move arrow and brief commentary without an extra Stockfish search.")
+    options, tracker_args = parser.parse_known_args(sys.argv[1:])
+    if not options.launch_bot:
+        parser.error("Use --launch-bot to start the tracker with pre-move commentary.")
+    if not 0.0 <= options.explain_pause <= 1.5:
+        parser.error("--explain-pause must be between 0 and 1.5 seconds.")
+    if not 0.0 <= options.clock_margin <= 10.0:
+        parser.error("--clock-margin must be between 0 and 10 seconds.")
+    if not 0.04 <= options.coach_engine_time <= 0.25:
+        parser.error("--coach-engine-time must be between 0.04 and 0.25 seconds.")
+
+    if tracker_args and tracker_args[0] == "--":
+        tracker_args = tracker_args[1:]
+
+    tracker_path = BASE_DIR / "seleniumbase_live_game_tracker.py"
+    if not tracker_path.is_file():
+        print("[COACH ERROR] Existing tracker file is missing beside this new file.", file=sys.stderr)
+        return 2
+
+    settings = _load_settings()
+    tracker_globals: dict = {}
+    tutor_engine = None
+    last_explanation_at = 0.0
+
+    # Respect an explicitly passed Stockfish path to the existing tracker too.
+    tracker_engine_override = ""
+    for index, item in enumerate(tracker_args):
+        if item == "--stockfish-path" and index + 1 < len(tracker_args):
+            tracker_engine_override = tracker_args[index + 1]
+        elif item.startswith("--stockfish-path="):
+            tracker_engine_override = item.split("=", 1)[1]
+
+    engine_override = options.coach_stockfish_path or tracker_engine_override
+
+    def explain_before_submit(
+        driver,
+        uci: str,
+        expected_fen: str,
+        expected_color: str | None,
+        *args,
+        **kwargs,
+    ) -> None:
+        nonlocal tutor_engine, last_explanation_at
+        if kwargs.get("allow_premove", False):
+            # A premove is queued for a future position; its final tactical line
+            # cannot be honestly explained as if it were already a legal move.
+            return
+        if kwargs.get("low_clock_mode", False):
+            # In emergency mode do not add an engine search or an intentional pause.
+            return
+        try:
+            board = chess.Board(str(expected_fen))
+            move = chess.Move.from_uci(str(uci))
+        except (ValueError, TypeError):
+            return
+        if move not in board.legal_moves:
+            return
+
+        try:
+            cdp_factory = tracker_globals.get("_direct_cdp_page_for_driver")
+            cdp = cdp_factory(driver) if callable(cdp_factory) else None
+            if cdp is None:
+                return
+            state = cdp.evaluate(_STATE_EXPRESSION, timeout=0.6)
+            state = state if isinstance(state, dict) else {}
+            orientation = str(state.get("bottomSide") or "white")
+            if orientation not in {"white", "black"}:
+                orientation = "white"
+
+            own_clock, gap = _side_clock_gap(state, expected_color)
+            # When the own clock is not comfortably ahead, skip the extra search
+            # entirely and render only the move/check/capture information.
+            can_spend_analysis = (
+                own_clock is None
+                or (
+                    own_clock > max(5.0, options.clock_margin + 2.0)
+                    and (gap is None or gap > options.clock_margin + options.coach_engine_time + 0.1)
+                )
+            )
+            active_engine = None
+            if not options.coach_no_engine and can_spend_analysis:
+                if tutor_engine is None:
+                    tutor_engine = _open_engine(settings, engine_override)
+                active_engine = tutor_engine
+
+            lines, arrows, highlights = _move_commentary(
+                board,
+                move,
+                chess.WHITE if expected_color == "white"
+                else chess.BLACK if expected_color == "black"
+                else None,
+                active_engine,
+                options.coach_engine_time,
+            )
+            _INSTALL_OVERLAY_RESULT = cdp.evaluate(_INSTALL_OVERLAY, timeout=0.8)
+            payload = {
+                "status": "Explaining selected move before execution",
+                "mode": "SELECTED MOVE • READ-ONLY COACH",
+                "clock": (
+                    f"W {state.get('whiteClock') or '—'}  ·  B {state.get('blackClock') or '—'}"
+                ),
+                "footnote": "Short pre-move explanation. Existing move selection remains unchanged.",
+                "messages": lines[-MAX_FEED_LINES:],
+                "arrows": arrows,
+                "highlights": highlights,
+                "orientation": orientation,
+            }
+            _ui_update(cdp, payload)
+            last_explanation_at = time.monotonic()
+
+            # Re-read clocks after the bounded engine work and drawing. Pause only
+            # while a measurable lead remains beyond the user's safety margin.
+            if active_engine is None or options.explain_pause <= 0:
+                return
+            latest = cdp.evaluate(_STATE_EXPRESSION, timeout=0.5)
+            if not isinstance(latest, dict):
+                return
+            _, latest_gap = _side_clock_gap(latest, expected_color)
+            if latest_gap is None:
+                return
+            allowed_pause = min(
+                options.explain_pause,
+                max(0.0, latest_gap - options.clock_margin),
+            )
+            if allowed_pause > 0:
+                time.sleep(allowed_pause)
+        except Exception as exc:
+            # Coaching failure must not replace, cancel, or alter the chosen move.
+            print(
+                f"[COACH] Pre-move explanation skipped ({type(exc).__name__}); "
+                "continuing with the existing selected move.",
+                flush=True,
+            )
+
+    try:
+        tracker_globals = runpy.run_path(
+            str(tracker_path),
+            run_name="live_game_tracker_module",
+        )
+        # The original main() resolves these function names from its own global
+        # namespace. Replacing only these call points here lets us explain the
+        # same chosen UCI immediately before the original submission function.
+        original_cursor = tracker_globals.get("perform_cursor_drag")
+        original_api = tracker_globals.get("perform_api_move")
+        if not callable(original_cursor) or not callable(original_api):
+            raise RuntimeError("Tracker move-submit functions were not available.")
+
+        def wrapped_cursor(driver, uci, expected_fen, expected_color,
+                           allow_premove=False, low_clock_mode=False):
+            if not allow_premove:
+                explain_before_submit(
+                    driver, uci, expected_fen, expected_color,
+                    allow_premove=False, low_clock_mode=low_clock_mode,
+                )
+            return original_cursor(
+                driver, uci, expected_fen, expected_color,
+                allow_premove=allow_premove,
+                low_clock_mode=low_clock_mode,
+            )
+
+        def wrapped_api(driver, uci, expected_fen, expected_color, *,
+                        low_clock_mode=False, source="api"):
+            if not low_clock_mode:
+                explain_before_submit(
+                    driver, uci, expected_fen, expected_color,
+                    allow_premove=False, low_clock_mode=low_clock_mode,
+                )
+            return original_api(
+                driver, uci, expected_fen, expected_color,
+                low_clock_mode=low_clock_mode,
+                source=source,
+            )
+
+        tracker_globals["perform_cursor_drag"] = wrapped_cursor
+        tracker_globals["perform_api_move"] = wrapped_api
+
+        original_argv = sys.argv[:]
+        sys.argv = [str(tracker_path), *tracker_args]
+        print("[COACH] Launching the original tracker with read-only pre-move explanations.")
+        print("[COACH] No move selector is wrapped; the selected UCI is passed unchanged to the original submit function.")
+        print("[COACH] Premove queues and low-clock emergency moves skip the intentional explanation wait.")
+        try:
+            return int(tracker_globals["main"]() or 0)
+        finally:
+            sys.argv = original_argv
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else 0
+    except Exception as exc:
+        print(f"[COACH ERROR] {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        if tutor_engine is not None:
+            try:
+                tutor_engine.quit()
+            except Exception:
+                pass
+
+
 def main() -> int:
+    if "--launch-bot" in sys.argv[1:]:
+        return _launch_wrapped_bot()
     args = _parse_args()
     settings = _load_settings()
     try:
