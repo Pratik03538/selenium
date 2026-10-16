@@ -648,7 +648,7 @@ def _draw_right_click_board_arrow(driver, source: str, target: str, orientation:
             }
             const from = center(source), to = center(target);
             return from && to ? {from, to} : null;
-            """.replace('r"""',''),
+            """,
             source, target, orientation
         )
         if not isinstance(points, dict):
