@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import runpy
 import shutil
 import sys
@@ -354,6 +355,7 @@ _INSTALL_OVERLAY = r"""(() => {
         <span class="live"></span>
         <span class="brand">Live Coach</span>
         <span class="status" id="status">Waiting for tracker…</span>
+        <button id="voice" type="button" title="Toggle spoken commentary">🔊</button>
         <button id="arrows" type="button" title="Show/hide arrows">↗</button>
         <button id="min" type="button" title="Minimize panel">−</button>
         <button id="hide" type="button" title="Shrink to floating tab">×</button>
@@ -379,7 +381,7 @@ _INSTALL_OVERLAY = r"""(() => {
   (document.body || document.documentElement).appendChild(host);
 
   const $ = selector => shadow.querySelector(selector);
-  const state = {arrows: [], highlights: [], visuals: true, collapsed: false, hidden: false, orientation:'white'};
+  const state = {arrows: [], highlights: [], visuals: true, collapsed: false, hidden: false, voiceEnabled: true, orientation:'white'};
 
   function findBoard() {
     const selectors = ['wc-chess-board', 'chess-board', '#board-single', '[data-board]'];
@@ -504,6 +506,42 @@ _INSTALL_OVERLAY = r"""(() => {
     }
   }
 
+  function stopSpeech() {
+    try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (_) {}
+    window.__liveCoachSpeaking = false;
+  }
+
+  function speak(text) {
+    if (!state.voiceEnabled || !String(text || '').trim()) return false;
+    if (!window.speechSynthesis || typeof window.SpeechSynthesisUtterance !== 'function') return false;
+    try {
+      stopSpeech();
+      const utterance = new SpeechSynthesisUtterance(String(text).slice(0, 280));
+      const voices = window.speechSynthesis.getVoices() || [];
+      const chosen = voices.find(v => /^hi[-_]/i.test(v.lang || '')) ||
+        voices.find(v => /^en[-_]IN$/i.test(v.lang || '')) ||
+        voices.find(v => /hindi/i.test(v.name || '')) || voices[0];
+      if (chosen) {
+        utterance.voice = chosen;
+        utterance.lang = chosen.lang || 'hi-IN';
+      } else {
+        utterance.lang = 'hi-IN';
+      }
+      utterance.rate = 1.28;
+      utterance.pitch = 1.08;
+      utterance.volume = 0.92;
+      utterance.onstart = () => { window.__liveCoachSpeaking = true; };
+      utterance.onend = () => { window.__liveCoachSpeaking = false; };
+      utterance.onerror = () => { window.__liveCoachSpeaking = false; };
+      window.__liveCoachSpeaking = false;
+      window.speechSynthesis.speak(utterance);
+      return true;
+    } catch (_) {
+      window.__liveCoachSpeaking = false;
+      return false;
+    }
+  }
+
   function update(payload) {
     if (!payload || typeof payload !== 'object') return false;
     if (payload.status != null) $('#status').textContent = String(payload.status);
@@ -511,6 +549,7 @@ _INSTALL_OVERLAY = r"""(() => {
     if (payload.mode != null) $('#mode').textContent = String(payload.mode);
     if (payload.footnote != null) $('#footnote').textContent = String(payload.footnote);
     if (Array.isArray(payload.messages)) renderMessages(payload.messages);
+    if (payload.speak != null) speak(payload.speak);
     if (payload.orientation === 'white' || payload.orientation === 'black') {
       state.orientation = payload.orientation;
     }
@@ -524,6 +563,12 @@ _INSTALL_OVERLAY = r"""(() => {
     return true;
   }
 
+  $('#voice').addEventListener('click', event => {
+    event.stopPropagation();
+    state.voiceEnabled = !state.voiceEnabled;
+    $('#voice').textContent = state.voiceEnabled ? '🔊' : '🔇';
+    if (!state.voiceEnabled) stopSpeech();
+  });
   $('#arrows').addEventListener('click', event => {
     event.stopPropagation();
     state.visuals = !state.visuals;
@@ -586,7 +631,7 @@ _INSTALL_OVERLAY = r"""(() => {
   $('#head').addEventListener('pointercancel', stopDrag);
   window.addEventListener('resize', redrawArrows);
 
-  window.__liveChessCoachPanel = {update, redraw: redrawArrows};
+  window.__liveChessCoachPanel = {update, redraw: redrawArrows, stopSpeech};
   return true;
 })()"""
 
@@ -1099,6 +1144,42 @@ def _side_clock_gap(state: dict, bot_color: str | None) -> tuple[float | None, f
     return own, own - opponent
 
 
+def _voice_commentary(
+    board: chess.Board,
+    move: chess.Move,
+    bot_color: chess.Color | None,
+    lines: list[dict[str, str]],
+    pause_budget: float,
+) -> str:
+    """Create a short, original Hindi/Hinglish narration for the selected move."""
+    san = board.san(move)
+    if bot_color is not None and board.turn == bot_color:
+        parts = [f"Dekho, hum {san} khel rahe hain."]
+    else:
+        parts = [f"Dekho, opponent ne {san} khela hai."]
+    if board.is_capture(move):
+        parts.append("Yeh capture important hai.")
+    if board.gives_check(move):
+        parts.append("Check hai, ab jawab zaroori hai.")
+    if pause_budget >= 1.15:
+        reply = next((
+            line for line in lines
+            if line.get("label") in {
+                "OPPONENT KA LIKELY REPLY", "HAMARI POSSIBLE RESPONSE", "NEXT LIKELY MOVE"
+            }
+        ), None)
+        if reply:
+            match = re.search(r"move\s+([^\s(]+)", str(reply.get("text", "")), re.IGNORECASE)
+            if match:
+                parts.append(f"Agla likely reply {match.group(1)} ho sakta hai.")
+    if pause_budget >= 2.0 and any(
+        line.get("kind") == "warning" or "mate in" in str(line.get("text", "")).lower()
+        for line in lines
+    ):
+        parts.append("Is tactical point par dhyan dena.")
+    return " ".join(parts)[:280]
+
+
 def _launch_wrapped_bot() -> int:
     """Launch the original tracker and tutor its already-selected move pre-submit.
 
@@ -1317,18 +1398,31 @@ def _launch_wrapped_bot() -> int:
             if has_critical_warning:
                 requested_pause = options.explain_pause
             elif board.is_capture(move) or board.gives_check(move) or move.promotion is not None:
-                requested_pause = min(options.explain_pause, 0.9)
+                requested_pause = min(options.explain_pause, 1.2)
             else:
-                requested_pause = min(options.explain_pause, 0.35)
+                requested_pause = min(options.explain_pause, 0.9)
             allowed_pause = min(
                 requested_pause,
                 max(0.0, latest_gap - options.clock_margin),
             )
             if allowed_pause > 0:
+                if allowed_pause >= 0.75:
+                    _ui_update(cdp, {
+                        "speak": _voice_commentary(
+                            board, move, bot_color, explanation_lines, allowed_pause
+                        )
+                    })
                 print(f"[COACH] Explanation pause={allowed_pause:.2f}s "
                       f"(critical={has_critical_warning}, measured_clock_gap={latest_gap:.2f}s).",
                       flush=True)
                 time.sleep(allowed_pause)
+                try:
+                    cdp.evaluate(
+                        "window.__liveChessCoachPanel && window.__liveChessCoachPanel.stopSpeech()",
+                        timeout=0.35,
+                    )
+                except Exception:
+                    pass
         except Exception as exc:
             # Coaching failure must not replace, cancel, or alter the chosen move.
             print(
@@ -1679,7 +1773,7 @@ def main() -> int:
         if page is not None:
             try:
                 page.evaluate(
-                    "(() => { try { window.__liveChessCoachPanel = null; "
+                    "(() => { try { if (window.speechSynthesis) window.speechSynthesis.cancel(); window.__liveCoachSpeaking = false; window.__liveChessCoachPanel = null; "
                     "document.getElementById('live-chess-coach-panel-host')?.remove(); "
                     "document.getElementById('live-chess-coach-arrows')?.remove(); return true; } "
                     "catch (_) { return false; } })()",
