@@ -901,17 +901,24 @@ def _move_commentary(
 
 
 def _resolve_bot_color(state: dict, settings: dict[str, str]) -> chess.Color | None:
-    candidates = (
-        state.get("playingAsColor"),
-        state.get("playerNameColor"),
-        settings.get("bot_color"),
-    )
-    for token in candidates:
+    # Prefer the same per-game side signals that the tracker observes. If a
+    # player-name setting is configured, do not fall back to a fixed TXT color:
+    # the player can be White in one game and Black in the next.
+    for token in (state.get("playingAsColor"), state.get("playerNameColor")):
         normalized = str(token or "").strip().lower()
         if normalized in {"white", "w", "light"}:
             return chess.WHITE
         if normalized in {"black", "b", "dark"}:
             return chess.BLACK
+
+    if settings.get("player_name", "").strip():
+        return None
+
+    normalized = str(settings.get("bot_color") or "").strip().lower()
+    if normalized in {"white", "w", "light"}:
+        return chess.WHITE
+    if normalized in {"black", "b", "dark"}:
+        return chess.BLACK
     return None
 
 
