@@ -74,6 +74,10 @@ class ChessTutorCommentaryTests(unittest.TestCase):
             any("forced mate in 3" in line for line in lines),
             "\n".join(lines),
         )
+        self.assertFalse(
+            any("1000.0 pawn" in line for line in lines),
+            "Mate scores must not be reported as huge pawn differences.",
+        )
 
     def test_invalid_selected_move_returns_no_commentary(self):
         illegal = chess.Move.from_uci("e2e5")
