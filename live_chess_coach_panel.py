@@ -376,7 +376,7 @@ _INSTALL_OVERLAY = r"""(() => {
     'position:fixed;inset:0;width:100vw;height:100vh;z-index:2147483645;' +
     'pointer-events:none;overflow:visible;';
   document.documentElement.appendChild(arrowsSvg);
-  document.documentElement.appendChild(host);
+  (document.body || document.documentElement).appendChild(host);
 
   const $ = selector => shadow.querySelector(selector);
   const state = {arrows: [], highlights: [], visuals: true, collapsed: false, hidden: false, orientation:'white'};
@@ -778,10 +778,15 @@ def _move_commentary(
                 "text": f"Yeh capture hai: move se {captured_side} {label} piece capture hua.",
             })
     if before.gives_check(move):
+        responder = (
+            "opponent" if is_bot_move
+            else "hamari side" if bot_color is not None
+            else "doosri side"
+        )
         lines.append({
             "kind": "info",
             "label": "TACTICAL IDEA",
-            "text": "Is move se check diya gaya hai; opponent ko pehle check ka legal jawab dena hoga.",
+            "text": f"Is move se check diya gaya hai; {responder} ko pehle check ka legal jawab dena hoga.",
         })
 
     if engine is None:
@@ -1122,6 +1127,7 @@ def main() -> int:
                 or (common == 0 and bool(old_signature) and bool(new_signature))
             ):
                 feed.clear()
+                already_explained.clear()
                 previous_board = board_from_history if history_ok and entries else None
                 _ui_update(page, {
                     "status": "New game/history reset",
