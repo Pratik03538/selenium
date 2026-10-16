@@ -1,14 +1,11 @@
-"""Small, responsive live chess-coach overlay for the existing Selenium project.
+"""Read-only live chess coach for the existing Selenium project.
 
-Run the existing tracker first, then run this companion script in a second
-terminal. It attaches to the existing local Chrome DevTools page, requires the
-tracker's read-only window.__liveGameApiReader, and renders a minimizable panel.
-It does not import, patch, or modify the gameplay script.
-
-Only this new file is needed. python-chess and websocket-client are expected to
-be available from the existing project dependencies. Stockfish analysis is
-optional and read-only: the observed move is analysed as a forced root move;
-this file never chooses or submits a chess move.
+Normal mode shows post-move coaching in a connected tab. With --launch-bot,
+this file starts the original tracker and adds a pre-submit coach wrapper in
+memory only. It draws native right-click board arrows when the site supports
+them, keeps text/highlight overlays as fallback, and explains the exact UCI
+already selected by the original tracker. Original gameplay/strategy files are
+never edited and the coach never substitutes a different move.
 """
 from __future__ import annotations
 
@@ -602,6 +599,90 @@ def _ui_update(page: _CDPPage, payload: dict) -> None:
     page.evaluate(expression, timeout=1.5)
 
 
+def _draw_right_click_board_arrow(driver, source: str, target: str, orientation: str) -> bool:
+    """Draw a native right-button drag arrow on the actual board via Chrome CDP.
+
+    This annotates the board; it does not send a left-button move or alter the
+    UCI already selected by the original tracker. Return False when the board
+    cannot be located so the existing visual overlay can act as a fallback.
+    """
+    if not source or not target or source == target:
+        return False
+    try:
+        points = driver.execute_script(
+            r""" 
+            const source = arguments[0], target = arguments[1];
+            const orientation = arguments[2] === 'black' ? 'black' : 'white';
+            const selectors = ['wc-chess-board', 'chess-board', '#board-single', '[data-board]'];
+            const roots = [document];
+            let board = null;
+            for (let i = 0; i < roots.length && i < 80 && !board; i++) {
+              const root = roots[i];
+              for (const selector of selectors) {
+                try {
+                  board = root.querySelector(selector);
+                  if (board) break;
+                } catch (_) {}
+              }
+              if (board) break;
+              try {
+                for (const element of root.querySelectorAll('*')) {
+                  if (element.shadowRoot) roots.push(element.shadowRoot);
+                  if (roots.length >= 80) break;
+                }
+              } catch (_) {}
+            }
+            if (!board) return null;
+            const rect = board.getBoundingClientRect();
+            if (rect.width < 80 || rect.height < 80) return null;
+            function center(square) {
+              if (!/^[a-h][1-8]$/.test(square)) return null;
+              const file = square.charCodeAt(0) - 97;
+              const rank = Number(square[1]);
+              const col = orientation === 'black' ? 7 - file : file;
+              const row = orientation === 'black' ? rank - 1 : 8 - rank;
+              return {
+                x: rect.left + (col + 0.5) * rect.width / 8,
+                y: rect.top + (row + 0.5) * rect.height / 8
+              };
+            }
+            const from = center(source), to = center(target);
+            return from && to ? {from, to} : null;
+            """.replace('r"""',''),
+            source, target, orientation
+        )
+        if not isinstance(points, dict):
+            return False
+        start = points.get("from") or {}
+        finish = points.get("to") or {}
+        sx, sy = float(start["x"]), float(start["y"])
+        tx, ty = float(finish["x"]), float(finish["y"])
+        # Mouse button 2 is the standard CDP right-button bit. A small waypoint
+        # makes this a drag gesture rather than a right-click on one square.
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": sx, "y": sy, "buttons": 0
+        })
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": sx, "y": sy,
+            "button": "right", "buttons": 2, "clickCount": 1
+        })
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": (sx + tx) / 2, "y": (sy + ty) / 2,
+            "button": "right", "buttons": 2
+        })
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": tx, "y": ty,
+            "button": "right", "buttons": 2
+        })
+        driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": tx, "y": ty,
+            "button": "right", "buttons": 0, "clickCount": 1
+        })
+        return True
+    except Exception:
+        return False
+
+
 def _normalise_move_items(raw) -> list[dict[str, str]]:
     if not isinstance(raw, list):
         return []
@@ -756,7 +837,7 @@ def _move_commentary(
     lines: list[dict[str, str]] = [{
         "kind": "ours" if is_bot_move else "opponent" if bot_color is not None else "info",
         "label": "BOT MOVE" if is_bot_move else "OPPONENT MOVE" if bot_color is not None else "OBSERVED MOVE",
-        "text": f"{side_label}: {san} ({source}→{target}).",
+        "text": f"Dekho, {side_label.lower()} {san} hai ({source} se {target}). Ab is position ka idea aur likely reply dekhte hain.",
     }]
 
     squares = [{"square": target, "kind": "played"}]
@@ -1027,8 +1108,8 @@ def _launch_wrapped_bot() -> int:
         description="Launch the existing tracker with a read-only live tutor overlay."
     )
     parser.add_argument("--launch-bot", action="store_true")
-    parser.add_argument("--explain-pause", type=float, default=0.45,
-                        help="Maximum explanation pause in seconds; clock-gap guard can shorten it.")
+    parser.add_argument("--explain-pause", type=float, default=1.5,
+                        help="Maximum pause for critical explanations in seconds; quiet moves get less and the clock guard can shorten it.")
     parser.add_argument("--clock-margin", type=float, default=0.75,
                         help="Minimum own-clock lead to preserve before adding an explanation pause.")
     parser.add_argument("--coach-engine-time", type=float, default=0.12,
@@ -1040,8 +1121,8 @@ def _launch_wrapped_bot() -> int:
     options, tracker_args = parser.parse_known_args(sys.argv[1:])
     if not options.launch_bot:
         parser.error("Use --launch-bot to start the tracker with pre-move commentary.")
-    if not 0.0 <= options.explain_pause <= 1.5:
-        parser.error("--explain-pause must be between 0 and 1.5 seconds.")
+    if not 0.0 <= options.explain_pause <= 4.0:
+        parser.error("--explain-pause must be between 0 and 4 seconds.")
     if not 0.0 <= options.clock_margin <= 10.0:
         parser.error("--clock-margin must be between 0 and 10 seconds.")
     if not 0.04 <= options.coach_engine_time <= 0.25:
@@ -1114,6 +1195,18 @@ def _launch_wrapped_bot() -> int:
                 board, move, bot_color, None, options.coach_engine_time
             )
             quick_lines = [line for line in quick_lines if line.get("label") != "ENGINE"]
+            explanation_lines = quick_lines
+            selected_arrow = quick_arrows[0] if quick_arrows else None
+            selected_arrow_drawn = bool(
+                selected_arrow
+                and _draw_right_click_board_arrow(
+                    driver, selected_arrow.get("from", ""),
+                    selected_arrow.get("to", ""), orientation
+                )
+            )
+            # Use the SVG arrow only when the site's actual board did not accept
+            # a native right-click drag. Destination square highlights stay visible.
+            quick_overlay_arrows = [] if selected_arrow_drawn else quick_arrows
             can_spend_analysis = (
                 not options.coach_no_engine
                 and own_clock is not None
@@ -1148,7 +1241,7 @@ def _launch_wrapped_bot() -> int:
                 ),
                 "footnote": "Existing move selector and selected UCI remain unchanged.",
                 "messages": quick_lines[-MAX_FEED_LINES:],
-                "arrows": quick_arrows,
+                "arrows": quick_overlay_arrows,
                 "highlights": quick_highlights,
                 "orientation": orientation,
             })
@@ -1162,15 +1255,25 @@ def _launch_wrapped_bot() -> int:
                 detailed_lines, arrows, highlights = _move_commentary(
                     board, move, bot_color, active_engine, options.coach_engine_time
                 )
+                explanation_lines = detailed_lines
+                overlay_arrows = []
+                if arrows and not selected_arrow_drawn:
+                    overlay_arrows.append(arrows[0])
+                for reply_arrow in arrows[1:]:
+                    if not _draw_right_click_board_arrow(
+                        driver, reply_arrow.get("from", ""),
+                        reply_arrow.get("to", ""), orientation
+                    ):
+                        overlay_arrows.append(reply_arrow)
                 _ui_update(cdp, {
                     "status": "Explained • executing selected move next",
                     "mode": "SELECTED MOVE • READ-ONLY COACH",
                     "clock": (
                         f"W {state.get('whiteClock') or '—'}  ·  B {state.get('blackClock') or '—'}"
                     ),
-                    "footnote": "This analysis explains the already-selected move; it cannot replace it.",
+                    "footnote": "Native right-click arrows on the board; the selected UCI stays unchanged.",
                     "messages": detailed_lines[-MAX_FEED_LINES:],
-                    "arrows": arrows,
+                    "arrows": overlay_arrows,
                     "highlights": highlights,
                     "orientation": orientation,
                 })
@@ -1180,6 +1283,7 @@ def _launch_wrapped_bot() -> int:
                     "label": "ENGINE UNAVAILABLE",
                     "text": "Stockfish tutor analysis start nahi ho saka; selected move unchanged hai, basic commentary hi dikhayi ja rahi hai.",
                 }]
+                explanation_lines = no_engine_lines
                 _ui_update(cdp, {
                     "status": "Quick explanation • executing selected move next",
                     "mode": "SELECTED MOVE • READ-ONLY COACH",
@@ -1187,7 +1291,7 @@ def _launch_wrapped_bot() -> int:
                         f"W {state.get('whiteClock') or '—'}  ·  B {state.get('blackClock') or '—'}"
                     ),
                     "messages": no_engine_lines[-MAX_FEED_LINES:],
-                    "arrows": quick_arrows,
+                    "arrows": quick_overlay_arrows,
                     "highlights": quick_highlights,
                     "orientation": orientation,
                 })
@@ -1202,11 +1306,26 @@ def _launch_wrapped_bot() -> int:
             _, latest_gap = _side_clock_gap(latest, expected_color)
             if latest_gap is None:
                 return
+            has_critical_warning = any(
+                str(line.get("kind", "")) == "warning"
+                or any(token in str(line.get("label", "")).upper()
+                       for token in ("WARNING", "MATE", "TACTICAL REPLY"))
+                for line in explanation_lines
+            )
+            if has_critical_warning:
+                requested_pause = options.explain_pause
+            elif board.is_capture(move) or board.gives_check(move) or move.promotion is not None:
+                requested_pause = min(options.explain_pause, 0.9)
+            else:
+                requested_pause = min(options.explain_pause, 0.35)
             allowed_pause = min(
-                options.explain_pause,
+                requested_pause,
                 max(0.0, latest_gap - options.clock_margin),
             )
             if allowed_pause > 0:
+                print(f"[COACH] Explanation pause={allowed_pause:.2f}s "
+                      f"(critical={has_critical_warning}, measured_clock_gap={latest_gap:.2f}s).",
+                      flush=True)
                 time.sleep(allowed_pause)
         except Exception as exc:
             # Coaching failure must not replace, cancel, or alter the chosen move.
