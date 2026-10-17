@@ -4317,7 +4317,7 @@ def parse_args() -> argparse.Namespace:
     next_game_group = parser.add_mutually_exclusive_group()
     next_game_group.add_argument(
         "--auto-next-game", dest="auto_next_game", action="store_true",
-        help="On the configured authorized test site, click a New-game button 2-5 seconds after game over.",
+        help="On the configured authorized test site, click a New-game button 2-5 seconds after game over (default: off).",
     )
     next_game_group.add_argument(
         "--no-auto-next-game", dest="auto_next_game", action="store_false",
@@ -4360,7 +4360,7 @@ def main() -> int:
         next_setting = load_optional_txt_setting("auto_next_game").strip().lower()
         args.auto_next_game = (
             next_setting in {"1", "true", "yes", "on", "enabled"}
-            if next_setting else True
+            if next_setting else False
         )
     print(f"[CONFIG] Automatic new match: {'enabled' if args.auto_next_game else 'disabled'}.", flush=True)
     raw_rematch_setting = load_optional_txt_setting("auto_rematch").strip().lower()
