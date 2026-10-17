@@ -33,6 +33,19 @@ class TacticalCoachVariationTests(unittest.TestCase):
         self.assertEqual(variations[0]["moves"][1]["side"], "black")
         self.assertEqual(variations[0]["moves"][2]["uci"], "g1f3")
 
+    def test_top_three_opponent_lines_are_capped_at_three(self):
+        board = chess.Board()
+        infos = [
+            {"pv": [chess.Move.from_uci(move)]}
+            for move in ("e2e4", "d2d4", "c2c4", "g1f3")
+        ]
+        variations = build_coach_variations(board.fen(), infos, max_lines=3)
+        self.assertEqual(len(variations), 3)
+        self.assertEqual(
+            [line["moves"][0]["uci"] for line in variations],
+            ["e2e4", "d2d4", "c2c4"],
+        )
+
     def test_capture_is_explained_in_coaching_steps(self):
         board = chess.Board()
         board.push_uci("e2e4")
