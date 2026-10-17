@@ -46,9 +46,19 @@ class MainBoardHintOverlay:
             from ctypes import wintypes
 
             user32 = ctypes.windll.user32
-            hwnd = wintypes.HWND(self.window.winfo_id())
-            get_style = getattr(user32, "GetWindowLongPtrW", user32.GetWindowLongW)
-            set_style = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
+
+            # On Tk/Windows, winfo_id() may be the client child HWND. The
+            # extended styles and color key must be applied to the actual
+            # top-level frame, otherwise the whole frame can intercept clicks.
+            frame_id = self.window.wm_frame()
+            hwnd_value = int(str(frame_id), 0)
+            hwnd = wintypes.HWND(hwnd_value)
+            get_style = getattr(user32, "GetWindowLongPtrW", None)
+            set_style = getattr(user32, "SetWindowLongPtrW", None)
+            if get_style is None:
+                get_style = user32.GetWindowLongW
+            if set_style is None:
+                set_style = user32.SetWindowLongW
             get_style.argtypes = [wintypes.HWND, ctypes.c_int]
             get_style.restype = ctypes.c_ssize_t
             set_style.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
@@ -73,13 +83,18 @@ class MainBoardHintOverlay:
             if not set_layered(hwnd, color_key, 0, 0x00000001):  # LWA_COLORKEY
                 raise OSError("Could not enable the overlay transparency color key")
 
+            # SWP_FRAMECHANGED makes Windows reread the new extended
+            # styles immediately. TOPMOST + NOACTIVATE + SHOWWINDOW are
+            # retained; no move/resize is requested here.
             user32.SetWindowPos(
                 hwnd, wintypes.HWND(-1), 0, 0, 0, 0,
-                0x0002 | 0x0001 | 0x0010 | 0x0040,
+                0x0002 | 0x0001 | 0x0010 | 0x0020 | 0x0040,
             )
-        except Exception:
-            # Do not show a visual overlay that could intercept board input.
+        except Exception as exc:
+            # Fail closed rather than displaying an overlay that might block
+            # the source board if transparent/click-through styles fail.
             self.supported = False
+            self.last_error = f"{type(exc).__name__}: {exc}"
             try:
                 self.window.withdraw()
             except self.tk.TclError:
