@@ -1825,9 +1825,17 @@ function snapshot() {
   const boardRect = (() => {
     try {
       const r = board && board.getBoundingClientRect ? board.getBoundingClientRect() : null;
-      return r && r.width > 0 && r.height > 0
-        ? {left: r.left, top: r.top, width: r.width, height: r.height}
-        : null;
+      if (!r || !r.width || !r.height) return null;
+      // Convert viewport CSS coordinates into desktop screen coordinates for
+      // the independent native overlay window.
+      const leftFrame = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+      const topFrame = Math.max(0, window.outerHeight - window.innerHeight);
+      return {
+        left: window.screenX + leftFrame + r.left,
+        top: window.screenY + topFrame + r.top,
+        width: r.width,
+        height: r.height
+      };
     } catch (_) { return null; }
   })();
   return {
@@ -1856,70 +1864,11 @@ function snapshot() {
     result: readText(cfg.resultSelector)
   };
 }
-function clearBoardHintNode() {
-  const node = document.getElementById('__owned_site_move_hint_overlay');
-  if (node) node.remove();
-}
-function renderBoardHint(value, hint) {
-  if (hint.fen && value.fen && String(hint.fen) !== String(value.fen)) {
-    clearBoardHintNode();
-    state.activeHint = null;
-    return false;
-  }
-  const r = value.boardRect;
-  if (!r || !Number.isFinite(r.width) || !Number.isFinite(r.height) || r.width < 40 || r.height < 40) {
-    return false;
-  }
-  let svg = document.getElementById('__owned_site_move_hint_overlay');
-  if (!svg) {
-    svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.id = '__owned_site_move_hint_overlay';
-    svg.setAttribute('aria-label', 'Move suggestion');
-    svg.style.position = 'fixed';
-    svg.style.pointerEvents = 'none';
-    svg.style.overflow = 'visible';
-    svg.style.zIndex = '2147483647';
-    svg.style.margin = '0';
-    svg.style.padding = '0';
-    svg.style.border = '0';
-    document.documentElement.appendChild(svg);
-  }
-  const bottomSide = hint.bottomSide === 'black' ? 'black' : 'white';
-  const color = hint.color === 'red' ? '#ef4444' : '#facc15';
-  const uci = String(hint.uci || '').toLowerCase();
-  if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uci)) return false;
-  function center(square) {
-    const file = square.charCodeAt(0) - 97;
-    const rank = Number(square[1]) - 1;
-    const col = bottomSide === 'black' ? 7 - file : file;
-    const row = bottomSide === 'black' ? rank : 7 - rank;
-    return [(col + 0.5) * 100, (row + 0.5) * 100, col, row];
-  }
-  const from = center(uci.slice(0, 2));
-  const to = center(uci.slice(2, 4));
-  svg.style.left = r.left + 'px';
-  svg.style.top = r.top + 'px';
-  svg.style.width = r.width + 'px';
-  svg.style.height = r.height + 'px';
-  svg.setAttribute('width', String(r.width));
-  svg.setAttribute('height', String(r.height));
-  svg.setAttribute('viewBox', '0 0 800 800');
-  const lineWidth = 12;
-  svg.innerHTML =
-    '<defs><marker id="owned-site-hint-arrow" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto" markerUnits="strokeWidth">' +
-    '<path d="M0,0 L5,2.5 L0,5 z" fill="' + color + '"></path></marker></defs>' +
-    '<rect x="' + (from[2] * 100 + 3) + '" y="' + (from[3] * 100 + 3) + '" width="94" height="94" rx="8" fill="' + color + '" fill-opacity=".12" stroke="' + color + '" stroke-width="5"></rect>' +
-    '<rect x="' + (to[2] * 100 + 3) + '" y="' + (to[3] * 100 + 3) + '" width="94" height="94" rx="8" fill="' + color + '" fill-opacity=".12" stroke="' + color + '" stroke-width="5"></rect>' +
-    '<line x1="' + from[0] + '" y1="' + from[1] + '" x2="' + to[0] + '" y2="' + to[1] + '" stroke="#111827" stroke-width="' + (lineWidth + 6) + '" stroke-linecap="round"></line>' +
-    '<line x1="' + from[0] + '" y1="' + from[1] + '" x2="' + to[0] + '" y2="' + to[1] + '" stroke="' + color + '" stroke-width="' + lineWidth + '" stroke-linecap="round" marker-end="url(#owned-site-hint-arrow)"></line>';
-  return true;
-}
-const state = {queue: [], lastSignature: null, observer: null, pollTimer: null, pollIntervalMs: 50, lastError: null, snapshot, activeHint: null};
+const state = {queue: [], lastSignature: null, observer: null, pollTimer: null, pollIntervalMs: 50, lastError: null, snapshot};
 function refresh(forceRoots = false) {
   try {
     if (forceRoots) rootsDeep(document, true);
     const value = snapshot();
-    if (state.activeHint) renderBoardHint(value, state.activeHint);
     const signature = JSON.stringify(value);
     if (signature === state.lastSignature) return;
     state.lastSignature = signature;
@@ -1927,19 +1876,7 @@ function refresh(forceRoots = false) {
     if (state.queue.length > 10000) state.queue.splice(0, state.queue.length - 10000);
   } catch (e) { state.lastError = String(e); }
 }
-state.observer = new MutationObserver(records => {
-  // Arrow SVG updates are local presentation changes; do not treat them as
-  // game mutations or feed the observer with its own drawing operations.
-  const relevant = (records || []).some(record => {
-    let node = record.target;
-    if (node && node.nodeType !== 1) node = node.parentElement;
-    return !(node && (
-      node.id === '__owned_site_move_hint_overlay' ||
-      (typeof node.closest === 'function' && node.closest('#__owned_site_move_hint_overlay'))
-    ));
-  });
-  if (relevant) refresh(false);
-});
+state.observer = new MutationObserver(() => refresh(false));
 state.observer.observe(document.documentElement, {
   subtree: true, childList: true, characterData: true, attributes: true,
   attributeFilter: ['class', 'style', 'title', 'aria-label', 'aria-valuetext', 'aria-valuenow', 'data-clock', 'data-remaining-time', 'data-fen', 'data-ply', 'data-time', 'data-result', 'data-turn']
@@ -1950,24 +1887,6 @@ window.__liveGameApiReader = {
   status: () => ({lastError: state.lastError, pending: state.queue.length}),
   drain: () => state.queue.splice(0, state.queue.length),
   current: () => state.snapshot(),
-  showMoveHint: (fen, uci, bottomSide, color) => {
-    const expectedFen = String(fen || '').trim();
-    const move = String(uci || '').trim().toLowerCase();
-    if (!expectedFen || !/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(move)) return false;
-    const current = state.snapshot();
-    if (!current.fen || String(current.fen).trim() !== expectedFen) return false;
-    state.activeHint = {
-      fen: expectedFen, uci: move,
-      bottomSide: bottomSide === 'black' ? 'black' : 'white',
-      color: color === 'red' ? 'red' : 'yellow'
-    };
-    return renderBoardHint(current, state.activeHint);
-  },
-  clearMoveHint: () => {
-    state.activeHint = null;
-    clearBoardHintNode();
-    return true;
-  },
   setFastPolling: enabled => {
     const nextIntervalMs = enabled ? 20 : 50;
     if (state.pollTimer && state.pollIntervalMs === nextIntervalMs) {
@@ -4792,28 +4711,10 @@ def main() -> int:
                                 flush=True,
                             )
 
-                        def on_hint_change(position_fen, uci, bottom_side, color):
-                            # The SVG is rendered inside the authorized test page,
-                            # so the arrow follows its live board and remains part
-                            # of the ordinary browser window. It is not a new OS window.
-                            try:
-                                if not uci:
-                                    return bool(driver.execute_script(
-                                        "return window.__liveGameApiReader?.clearMoveHint?.() || false"
-                                    ))
-                                return bool(driver.execute_script(
-                                    "return window.__liveGameApiReader?.showMoveHint?.("
-                                    "arguments[0], arguments[1], arguments[2], arguments[3]) || false",
-                                    position_fen, uci, bottom_side, color,
-                                ))
-                            except (WebDriverException, RuntimeError, TypeError):
-                                return False
-
                         hint_panel = MoveHintBoardPanel(
                             settings_window.root,
                             initial_mode=args.move_output,
                             on_mode_change=on_move_output_change,
-                            on_hint_change=on_hint_change,
                         )
                         hint_panel.show()
                         print("[HINT] Separate animated move-hint board opened. Use its button or F8 to switch modes.", flush=True)
@@ -4935,7 +4836,7 @@ def main() -> int:
                     fen = str(event.get("fen") or "").strip()
                     dom_moves = event.get("moves") or []
                     if hint_panel is not None and fen:
-                        hint_panel.update_position(fen, event.get("bottomSide"))
+                        hint_panel.update_position(fen, event.get("bottomSide"), event.get("boardRect"))
                     api_bot_color, api_color_conflict = normalize_api_bot_color(
                         event.get("playingAsColor"), event.get("playingAs")
                     )
