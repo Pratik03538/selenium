@@ -27,6 +27,8 @@ class TacticalCoachVariationTests(unittest.TestCase):
         self.assertEqual(len(variations), 2)
         self.assertEqual(variations[0]["sequence"], "e4 → e5 → Nf3")
         self.assertEqual(variations[1]["sequence"], "d4 → d5 → c4")
+        self.assertIn("central space", variations[0]["moves"][0]["explanation"])
+        self.assertTrue(variations[0]["explanation"])
         self.assertEqual(variations[0]["moves"][0]["side"], "white")
         self.assertEqual(variations[0]["moves"][1]["side"], "black")
         self.assertEqual(variations[0]["moves"][2]["uci"], "g1f3")
