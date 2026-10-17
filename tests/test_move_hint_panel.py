@@ -3,7 +3,20 @@ import unittest
 
 import chess
 
-from move_hint_panel import build_hint, build_premove_hint, square_to_display
+from move_hint_panel import (
+    build_hint, build_premove_hint, square_to_display, toggle_output_mode,
+)
+
+
+class OutputModeToggleTests(unittest.TestCase):
+    def test_hint_mode_switches_to_existing_autoplay_path(self):
+        self.assertEqual(toggle_output_mode("hint"), "execute")
+
+    def test_autoplay_mode_switches_back_to_hint(self):
+        self.assertEqual(toggle_output_mode("execute"), "hint")
+
+    def test_unknown_mode_fails_safe_to_hint(self):
+        self.assertEqual(toggle_output_mode("unexpected"), "hint")
 
 
 class MoveHintDescriptionTests(unittest.TestCase):
