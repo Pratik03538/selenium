@@ -16,10 +16,13 @@ class MainBoardHintOverlay:
         self.enabled = True
         self.rect = None
         self.hint = None
+        self.line_hints = None
+        self.show_all_hints = False
         self.bottom_side = "white"
         self.color = "#facc15"
         self.step = 8
         self.job = None
+        self.styles_applied = False
 
         self.window = tk.Toplevel(parent)
         self.window.title("Main Board Hint Overlay")
@@ -131,14 +134,40 @@ class MainBoardHintOverlay:
 
     def set_hint(self, hint, bottom_side="white", color="#facc15"):
         self.hint = dict(hint) if isinstance(hint, dict) else None
+        self.line_hints = None
+        self.show_all_hints = False
         self.bottom_side = "black" if str(bottom_side).lower() == "black" else "white"
         self.color = color
         self.step = 0
         self._cancel_animation()
         self._sync()
 
+    def set_line(self, moves, bottom_side="white", active_index=0, show_all=True):
+        """Display a complete candidate line in distinct colours or animate one step."""
+        palette = ["#facc15", "#22d3ee", "#f472b6", "#a78bfa", "#fb923c", "#34d399"]
+        items = []
+        for index, move in enumerate(list(moves or [])[:8]):
+            if not isinstance(move, dict):
+                continue
+            item = dict(move)
+            item["overlay_color"] = palette[index % len(palette)]
+            items.append(item)
+        self.line_hints = items
+        self.hint = None
+        self.show_all_hints = bool(show_all)
+        self.active_line_index = max(0, min(int(active_index), max(0, len(items) - 1)))
+        self.bottom_side = "black" if str(bottom_side).lower() == "black" else "white"
+        self.step = 8 if self.show_all_hints else 0
+        self.color = (
+            items[self.active_line_index]["overlay_color"] if items else "#facc15"
+        )
+        self._cancel_animation()
+        self._sync()
+
     def clear(self):
         self.hint = None
+        self.line_hints = None
+        self.show_all_hints = False
         self._cancel_animation()
         self._sync()
 
@@ -161,7 +190,9 @@ class MainBoardHintOverlay:
             self.window.deiconify()
             self.window.attributes("-topmost", True)
             self.window.update_idletasks()
-            self._make_click_through()
+            if not self.styles_applied:
+                self._make_click_through()
+                self.styles_applied = self.supported
             self._draw()
             if self.step < 8:
                 self._schedule_animation()
@@ -193,51 +224,63 @@ class MainBoardHintOverlay:
         if self.step < 8:
             self._schedule_animation()
 
+    def _draw_arrow(self, hint, color, progress, cw, ch):
+        def center(square):
+            col, row = int(square) % 8, 7 - int(square) // 8
+            if self.bottom_side == "black":
+                col, row = 7 - col, 7 - row
+            return (col + 0.5) * cw, (row + 0.5) * ch, col, row
+
+        start = center(hint["from_square"])
+        target = center(hint["to_square"])
+        for point in (start, target):
+            col, row = point[2], point[3]
+            self.canvas.create_rectangle(
+                col * cw + 2, row * ch + 2,
+                (col + 1) * cw - 2, (row + 1) * ch - 2,
+                outline=color, width=max(3, int(min(cw, ch) * 0.055)),
+            )
+        end = (
+            start[0] + (target[0] - start[0]) * progress,
+            start[1] + (target[1] - start[1]) * progress,
+        )
+        line_width = max(5, int(min(cw, ch) * 0.10))
+        arrow_shape = (
+            max(12, int(cw * 0.30)),
+            max(14, int(ch * 0.32)),
+            max(5, int(cw * 0.12)),
+        )
+        self.canvas.create_line(
+            start[0], start[1], end[0], end[1],
+            fill="#111827", width=line_width + 3, capstyle="round",
+        )
+        self.canvas.create_line(
+            start[0], start[1], end[0], end[1],
+            fill=color, width=line_width, capstyle="round",
+            arrow="last" if progress >= 1.0 else "none",
+            arrowshape=arrow_shape,
+        )
+
     def _draw(self):
-        if not self.alive or not self.supported or not self.hint or not self.rect:
+        if not self.alive or not self.supported or not self.rect:
+            return
+        if not self.hint and not self.line_hints:
             return
         try:
             self.canvas.delete("all")
             width = max(1, self.rect["width"])
             height = max(1, self.rect["height"])
             cw, ch = width / 8.0, height / 8.0
-
-            def center(square):
-                col, row = int(square) % 8, 7 - int(square) // 8
-                if self.bottom_side == "black":
-                    col, row = 7 - col, 7 - row
-                return (col + 0.5) * cw, (row + 0.5) * ch, col, row
-
-            start = center(self.hint["from_square"])
-            target = center(self.hint["to_square"])
-            for point in (start, target):
-                col, row = point[2], point[3]
-                self.canvas.create_rectangle(
-                    col * cw + 2, row * ch + 2,
-                    (col + 1) * cw - 2, (row + 1) * ch - 2,
-                    outline=self.color, width=max(3, int(min(cw, ch) * 0.055)),
-                )
-            progress = self.step / 8.0
-            end = (
-                start[0] + (target[0] - start[0]) * progress,
-                start[1] + (target[1] - start[1]) * progress,
-            )
-            line_width = max(5, int(min(cw, ch) * 0.10))
-            arrow_shape = (
-                max(12, int(cw * 0.30)),
-                max(14, int(ch * 0.32)),
-                max(5, int(cw * 0.12)),
-            )
-            self.canvas.create_line(
-                start[0], start[1], end[0], end[1],
-                fill="#111827", width=line_width + 3, capstyle="round",
-            )
-            self.canvas.create_line(
-                start[0], start[1], end[0], end[1],
-                fill=self.color, width=line_width, capstyle="round",
-                arrow="last" if progress >= 1.0 else "none",
-                arrowshape=arrow_shape,
-            )
+            if self.line_hints:
+                if self.show_all_hints:
+                    # Simultaneous line preview: every ply gets its own colour.
+                    for item in self.line_hints:
+                        self._draw_arrow(item, item["overlay_color"], 1.0, cw, ch)
+                elif self.active_line_index < len(self.line_hints):
+                    item = self.line_hints[self.active_line_index]
+                    self._draw_arrow(item, item["overlay_color"], self.step / 8.0, cw, ch)
+                return
+            self._draw_arrow(self.hint, self.color, self.step / 8.0, cw, ch)
         except self.tk.TclError:
             self.alive = False
 
