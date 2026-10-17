@@ -4289,6 +4289,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stockfish-path", default="", help="Stockfish executable path; can also be set as stockfish_path=... in TXT settings.")
     parser.add_argument("--engine-time", type=float, default=0.75, help="Maximum Stockfish search time per move in seconds; effective time is adapted to the remaining clock.")
     parser.add_argument("--move-input", choices=("api", "cursor"), default=None, help="Move submission method; defaults to cursor; can also be set with move_input=api|cursor in tracker_settings.txt.")
+    parser.add_argument(
+        "--move-output", choices=("hint", "execute"), default="hint",
+        help="Show selected moves as animated hints in a separate window (default), or execute them on the authorized test site.",
+    )
     premove_group = parser.add_mutually_exclusive_group()
     premove_group.add_argument("--premove", dest="premove_enabled", action="store_true", help="Try best-effort premoves on the configured authorized site.")
     premove_group.add_argument("--no-premove", dest="premove_enabled", action="store_false", help="Disable premove attempts.")
@@ -4662,13 +4666,24 @@ def main() -> int:
             last_fast_polling_state = None
             low_clock_polling_active = False
             settings_window = None
+            hint_panel = None
             try:
                 settings_window = RuntimeSettingsWindow(
                     args, driver, allowed_host, cfg, chosen_handle
                 )
                 print("[GUI] Live settings window opened. Switches apply without restarting.", flush=True)
+                if args.move_output == "hint":
+                    try:
+                        from move_hint_panel import MoveHintBoardPanel
+                        hint_panel = MoveHintBoardPanel(settings_window.root)
+                        hint_panel.show()
+                        print("[HINT] Separate animated move-hint board opened; moves will not be submitted to the original board.", flush=True)
+                    except Exception:
+                        print("[HINT] Hint panel could not be opened; hint mode remains non-executing.", flush=True)
             except Exception:
                 print("[GUI] Runtime settings window could not be opened; continuing with TXT/CLI settings.", flush=True)
+                if args.move_output == "hint":
+                    print("[HINT] Hint mode is active but the panel is unavailable; no moves will be submitted.", flush=True)
 
             while True:
                 if settings_window is not None:
@@ -4780,6 +4795,8 @@ def main() -> int:
                             break
                     fen = str(event.get("fen") or "").strip()
                     dom_moves = event.get("moves") or []
+                    if hint_panel is not None and fen:
+                        hint_panel.update_position(fen, event.get("bottomSide"))
                     api_bot_color, api_color_conflict = normalize_api_bot_color(
                         event.get("playingAsColor"), event.get("playingAs")
                     )
@@ -5590,6 +5607,37 @@ def main() -> int:
                                             status="Selected",
                                         )
                                     print(f"[STRATEGY] selected={chosen_san} | rank={rank_text} | {reason}", flush=True)
+
+                                    if args.move_output == "hint":
+                                        hint_shown = False
+                                        if hint_panel is not None:
+                                            hint_shown = hint_panel.set_suggestion(
+                                                fen, chosen_move.uci(), chosen_san,
+                                                rank=dashboard_rank, reason=reason,
+                                            )
+                                        move_retry_gate.finish({"ok": True, "confirmed": True})
+                                        hint_status = "Hint shown" if hint_shown else "Hint unavailable"
+                                        if settings_window is not None:
+                                            settings_window.update_move_status(
+                                                game_number, pending_ply, hint_status
+                                            )
+                                            if not hint_shown:
+                                                settings_window.status.set(
+                                                    "Hint mode is enabled; no original-board move was submitted. "
+                                                    "Check that the separate hint panel is available."
+                                                )
+                                        if hint_shown:
+                                            print(
+                                                f"[HINT] Animated suggestion: {chosen_san} "
+                                                f"({chosen_move.uci()}); waiting for manual play on the original board.",
+                                                flush=True,
+                                            )
+                                        else:
+                                            print(
+                                                "[HINT] Suggestion was not displayed; original-board move was not submitted.",
+                                                flush=True,
+                                            )
+                                        continue
 
                                     if low_clock_mode:
                                         wait_for_manual_verification(driver, allowed_host, cfg)
