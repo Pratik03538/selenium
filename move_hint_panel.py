@@ -271,7 +271,7 @@ class MoveHintBoardPanel:
         )
         self.visibility_button.pack(fill="x", padx=12, pady=(0, 7))
         tk.Label(
-            self.window, text="LIVE ANALYSIS · TOP 3 OPPONENT MOVES",
+            self.window, text="LIVE ANALYSIS · OPPONENT TOP 3 + OUR REPLIES",
             font=("Segoe UI", 9, "bold"), bg="#f4f6f8", fg="#6d28d9",
             anchor="w",
         ).pack(fill="x", padx=12, pady=(0, 3))
@@ -283,7 +283,7 @@ class MoveHintBoardPanel:
             padx=8, pady=5, relief="solid", bd=1,
         ).pack(fill="x", padx=12, pady=(0, 4))
         self.analysis_step_status = tk.StringVar(
-            value="Small cyan arrow = opponent candidate · violet = your tactical continuation"
+            value="Yellow = main hint · small cyan = opponent move · small violet = our reply"
         )
         tk.Label(
             self.window, textvariable=self.analysis_step_status,
@@ -482,7 +482,7 @@ class MoveHintBoardPanel:
             root_board = chess.Board(root_fen)
             self.coach_root_side = "white" if root_board.turn == chess.WHITE else "black"
             self.coach_lines = build_coach_variations(
-                root_fen, engine_infos, max_lines=3, max_plies=8,
+                root_fen, engine_infos, max_lines=3, max_plies=2,
             )
         except (RuntimeError, TypeError, ValueError):
             self.coach_lines = []
@@ -497,10 +497,14 @@ class MoveHintBoardPanel:
 
         summary_rows = []
         for index, line in enumerate(self.coach_lines[:3], start=1):
-            continuation = " → ".join(
-                step["san"] for step in line["moves"][:4]
+            moves = line["moves"][:2]
+            if not moves:
+                continue
+            opponent_move = moves[0]["san"]
+            our_reply = moves[1]["san"] if len(moves) > 1 else "reply unavailable"
+            summary_rows.append(
+                f"{index}. Opp: {opponent_move} → Us: {our_reply}"
             )
-            summary_rows.append(f"{index}. {continuation}")
         self.analysis_text.set("\n".join(summary_rows))
         if self.hint_visible and self.mode == "hint":
             self._start_auto_coach_playback()
@@ -522,7 +526,7 @@ class MoveHintBoardPanel:
         self.coach_playing = True
         self._show_auto_coach_step()
         try:
-            self.coach_play_job = self.window.after(180, self._advance_auto_coach_step)
+            self.coach_play_job = self.window.after(150, self._advance_auto_coach_step)
         except self.tk.TclError:
             self.coach_play_job = None
             self.coach_playing = False
@@ -542,7 +546,7 @@ class MoveHintBoardPanel:
         if self.hint_visible and self.mode == "hint":
             self.overlay.set_coach_hint(move, arrow_color)
             self.overlay.set_enabled(True)
-        actor = "OPPONENT" if is_opponent_move else "YOUR TACTICAL CONTINUATION"
+        actor = "OPPONENT" if is_opponent_move else "YOUR TACTICAL RESPONSE"
         explanation = move.get("explanation") or "Review this reply and the resulting position."
         self.analysis_step_status.set(
             f"Line {self.coach_line_index + 1}/3 · Step "
