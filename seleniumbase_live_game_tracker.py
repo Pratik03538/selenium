@@ -4675,9 +4675,25 @@ def main() -> int:
                 if args.move_output == "hint":
                     try:
                         from move_hint_panel import MoveHintBoardPanel
-                        hint_panel = MoveHintBoardPanel(settings_window.root)
+
+                        def on_move_output_change(mode):
+                            # This changes only whether selected moves are hinted or
+                            # sent through the existing execution path. Strategy,
+                            # timing, and safety checks are deliberately unchanged.
+                            args.move_output = mode
+                            print(
+                                "[MODE] Output switched to "
+                                + ("HINT (manual play)." if mode == "hint" else "AUTOPLAY (existing bot execution)."),
+                                flush=True,
+                            )
+
+                        hint_panel = MoveHintBoardPanel(
+                            settings_window.root,
+                            initial_mode=args.move_output,
+                            on_mode_change=on_move_output_change,
+                        )
                         hint_panel.show()
-                        print("[HINT] Separate animated move-hint board opened; moves will not be submitted to the original board.", flush=True)
+                        print("[HINT] Separate animated move-hint board opened. Use its button or F8 to switch modes.", flush=True)
                     except Exception:
                         print("[HINT] Hint panel could not be opened; hint mode remains non-executing.", flush=True)
             except Exception:
@@ -5681,6 +5697,28 @@ def main() -> int:
                                         wait_for_manual_verification(driver, allowed_host, cfg)
                                     if settings_window is not None:
                                         settings_window.pump()
+                                    if args.move_output == "hint":
+                                        # If the user switched modes during the existing
+                                        # thinking delay, never send this move to the original board.
+                                        hint_shown = bool(
+                                            hint_panel is not None
+                                            and hint_panel.set_suggestion(
+                                                fen, chosen_move.uci(), chosen_san,
+                                                rank=dashboard_rank, reason=reason,
+                                            )
+                                        )
+                                        move_retry_gate.finish({"ok": True, "confirmed": True})
+                                        if settings_window is not None:
+                                            settings_window.update_move_status(
+                                                game_number, pending_ply,
+                                                "Hint shown" if hint_shown else "Hint unavailable",
+                                            )
+                                        print(
+                                            "[MODE] Switched to hint mode before move submission; "
+                                            "the original board was not changed.",
+                                            flush=True,
+                                        )
+                                        continue
                                     if not args.auto_play:
                                         submit = {"ok": False, "reason": "bot-disabled-in-settings"}
                                     elif args.move_input == "cursor":
@@ -5937,6 +5975,20 @@ def main() -> int:
                                                     time.sleep(wait_remaining)
                                         if settings_window is not None:
                                             settings_window.pump()
+                                        if args.move_output == "hint":
+                                            premove_hint_shown = bool(
+                                                hint_panel is not None
+                                                and predicted_reply is not None
+                                                and hint_panel.set_premove_suggestion(
+                                                    fen, chosen_premove_uci, predicted_reply.uci()
+                                                )
+                                            )
+                                            print(
+                                                "[MODE] Switched to hint mode before premove submission; "
+                                                "no premove was submitted.",
+                                                flush=True,
+                                            )
+                                            continue
                                         if not args.auto_play or not args.premove_enabled:
                                             premove_submit = {"ok": False, "reason": "bot-or-extra-premove-disabled-in-settings"}
                                         elif args.move_input == "cursor" and low_clock_premove_mode:
