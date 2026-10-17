@@ -467,6 +467,17 @@ class MoveHintBoardPanel:
             self._refresh_coach_lines()
         return len(self.coach_lines)
 
+    def is_coach_open(self) -> bool:
+        """True only while the Tactical Coach window is actually visible."""
+        try:
+            return bool(
+                self.coach_window is not None
+                and self.coach_window.winfo_exists()
+                and self.coach_window.state() == "normal"
+            )
+        except (AttributeError, self.tk.TclError):
+            return False
+
     def open_coach(self):
         if not self._alive:
             return
