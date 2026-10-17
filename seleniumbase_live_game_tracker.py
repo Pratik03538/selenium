@@ -5806,7 +5806,6 @@ def main() -> int:
                                     print("[AUTO] Strategy calculation/submission failed; bounded retry remains available if no move was accepted.", flush=True)
                             elif (
                                 args.auto_play
-                                and args.move_output != "hint"
                                 and args.premove_enabled
                                 and active_bot_color in {"white", "black"}
                                 and not side_matches_bot
@@ -5899,6 +5898,24 @@ def main() -> int:
                                     else:
                                         predicted_san = engine_board.san(predicted_reply) if predicted_reply else "unknown"
                                         chosen_premove_uci = premove_move.uci()
+                                        if args.move_output == "hint":
+                                            premove_hint_shown = False
+                                            if hint_panel is not None and predicted_reply is not None:
+                                                premove_hint_shown = hint_panel.set_premove_suggestion(
+                                                    fen, chosen_premove_uci, predicted_reply.uci()
+                                                )
+                                            if premove_hint_shown:
+                                                print(
+                                                    f"[PREMOVE HINT] Red arrow: {chosen_premove_uci} "
+                                                    f"after predicted reply {predicted_san}; hint only, no premove submitted.",
+                                                    flush=True,
+                                                )
+                                            else:
+                                                print(
+                                                    "[PREMOVE HINT] Candidate found but could not be displayed; no premove submitted.",
+                                                    flush=True,
+                                                )
+                                            continue
                                         wait_for_manual_verification(driver, allowed_host, cfg)
                                         if low_clock_premove_mode:
                                             reserve = 0.075 if args.move_input == "cursor" else 0.035
