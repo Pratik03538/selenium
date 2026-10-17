@@ -5,7 +5,16 @@ import chess
 
 from move_hint_panel import (
     build_hint, build_premove_hint, square_to_display, toggle_output_mode,
+    toggle_hint_visibility,
 )
+
+
+class HintVisibilityToggleTests(unittest.TestCase):
+    def test_enabled_overlay_switches_off(self):
+        self.assertFalse(toggle_hint_visibility(True))
+
+    def test_disabled_overlay_switches_on(self):
+        self.assertTrue(toggle_hint_visibility(False))
 
 
 class OutputModeToggleTests(unittest.TestCase):
