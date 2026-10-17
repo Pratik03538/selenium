@@ -4,10 +4,49 @@ import unittest
 import chess
 
 from move_hint_panel import (
-    build_hint, build_premove_hint, square_to_display, toggle_output_mode,
-    toggle_hint_visibility,
+    build_hint, build_premove_hint, build_coach_variations,
+    square_to_display, toggle_output_mode, toggle_hint_visibility,
 )
 
+
+class TacticalCoachVariationTests(unittest.TestCase):
+    def test_multipv_lines_become_legal_step_by_step_variations(self):
+        board = chess.Board()
+        variations = build_coach_variations(board.fen(), [
+            {"pv": [
+                chess.Move.from_uci("e2e4"),
+                chess.Move.from_uci("e7e5"),
+                chess.Move.from_uci("g1f3"),
+            ]},
+            {"pv": [
+                chess.Move.from_uci("d2d4"),
+                chess.Move.from_uci("d7d5"),
+                chess.Move.from_uci("c2c4"),
+            ]},
+        ])
+        self.assertEqual(len(variations), 2)
+        self.assertEqual(variations[0]["sequence"], "e4 → e5 → Nf3")
+        self.assertEqual(variations[1]["sequence"], "d4 → d5 → c4")
+        self.assertEqual(variations[0]["moves"][0]["side"], "white")
+        self.assertEqual(variations[0]["moves"][1]["side"], "black")
+        self.assertEqual(variations[0]["moves"][2]["uci"], "g1f3")
+
+    def test_empty_or_missing_engine_lines_returns_no_variations(self):
+        board = chess.Board()
+        self.assertEqual(build_coach_variations(board.fen(), []), [])
+        self.assertEqual(build_coach_variations(board.fen(), [{"pv": []}]), [])
+
+    def test_illegal_move_truncates_a_principal_variation(self):
+        board = chess.Board()
+        variations = build_coach_variations(board.fen(), [{
+            "pv": [
+                chess.Move.from_uci("e2e4"),
+                chess.Move.from_uci("e2e5"),
+                chess.Move.from_uci("e7e5"),
+            ]
+        }])
+        self.assertEqual(len(variations), 1)
+        self.assertEqual(variations[0]["sequence"], "e4")
 
 class HintVisibilityToggleTests(unittest.TestCase):
     def test_enabled_overlay_switches_off(self):
