@@ -4677,10 +4677,17 @@ def main() -> int:
                         from move_hint_panel import MoveHintBoardPanel
 
                         def on_move_output_change(mode):
-                            # This changes only whether selected moves are hinted or
-                            # sent through the existing execution path. Strategy,
-                            # timing, and safety checks are deliberately unchanged.
+                            nonlocal last_auto_attempt_fen, move_retry_gate
+                            nonlocal last_premove_attempt_fen, last_low_clock_premove_fen
+                            # This changes only the output mode. When returning to
+                            # autoplay, clear the current-position gates so the existing
+                            # strategy can handle this same position through its old path.
                             args.move_output = mode
+                            if mode == "execute":
+                                last_auto_attempt_fen = ""
+                                last_premove_attempt_fen = ""
+                                last_low_clock_premove_fen = ""
+                                move_retry_gate = MoveAttemptRetryGate()
                             print(
                                 "[MODE] Output switched to "
                                 + ("HINT (manual play)." if mode == "hint" else "AUTOPLAY (existing bot execution)."),
