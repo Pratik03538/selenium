@@ -31,6 +31,16 @@ class TacticalCoachVariationTests(unittest.TestCase):
         self.assertEqual(variations[0]["moves"][1]["side"], "black")
         self.assertEqual(variations[0]["moves"][2]["uci"], "g1f3")
 
+    def test_capture_is_explained_in_coaching_steps(self):
+        board = chess.Board()
+        board.push_uci("e2e4")
+        board.push_uci("d7d5")
+        variations = build_coach_variations(board.fen(), [{
+            "pv": [chess.Move.from_uci("e4d5")]
+        }])
+        self.assertEqual(len(variations), 1)
+        self.assertIn("captures pawn", variations[0]["moves"][0]["notes"])
+
     def test_empty_or_missing_engine_lines_returns_no_variations(self):
         board = chess.Board()
         self.assertEqual(build_coach_variations(board.fen(), []), [])
