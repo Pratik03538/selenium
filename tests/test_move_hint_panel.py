@@ -46,6 +46,35 @@ class TacticalCoachVariationTests(unittest.TestCase):
             ["e2e4", "d2d4", "c2c4"],
         )
 
+    def test_each_opponent_option_shows_only_its_immediate_reply(self):
+        board = chess.Board()
+        infos = [
+            {"pv": [
+                chess.Move.from_uci("e2e4"),
+                chess.Move.from_uci("e7e5"),
+                chess.Move.from_uci("g1f3"),
+            ]},
+            {"pv": [
+                chess.Move.from_uci("d2d4"),
+                chess.Move.from_uci("d7d5"),
+                chess.Move.from_uci("c2c4"),
+            ]},
+            {"pv": [
+                chess.Move.from_uci("c2c4"),
+                chess.Move.from_uci("e7e5"),
+                chess.Move.from_uci("g1f3"),
+            ]},
+        ]
+        variations = build_coach_variations(
+            board.fen(), infos, max_lines=3, max_plies=2,
+        )
+        self.assertEqual(len(variations), 3)
+        self.assertEqual(
+            [line["sequence"] for line in variations],
+            ["e4 → e5", "d4 → d5", "c4 → e5"],
+        )
+        self.assertTrue(all(len(line["moves"]) == 2 for line in variations))
+
     def test_capture_is_explained_in_coaching_steps(self):
         board = chess.Board()
         board.push_uci("e2e4")
