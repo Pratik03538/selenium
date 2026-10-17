@@ -1236,6 +1236,113 @@ def check_target(url: str | None, allowed_host: str) -> None:
         raise RuntimeError("The selected browser tab no longer matches the saved site settings.")
 
 
+
+def draw_native_board_arrow(
+    driver, allowed_host: str, move: dict, color: str,
+    expected_fen: str, bottom_side: str, board_rect,
+) -> bool:
+    """Draw a persistent mark via the configured page's native right-click gesture.
+
+    This deliberately avoids any separate transparent arrow window. It only works
+    on the exact site already validated by the tracker and only when the live FEN
+    still matches the analysis position.
+    """
+    if not isinstance(move, dict) or not isinstance(board_rect, dict):
+        return False
+    try:
+        check_target(driver.current_url, allowed_host)
+        live = driver.execute_script(
+            "return window.__liveGameApiReader ? window.__liveGameApiReader.current() : null;"
+        ) or {}
+        if str(live.get("fen") or "").strip() != str(expected_fen or "").strip():
+            return False
+        left = float(board_rect["left"])
+        top = float(board_rect["top"])
+        width = float(board_rect["width"])
+        height = float(board_rect["height"])
+        from_square = int(move["from_square"])
+        to_square = int(move["to_square"])
+        if width < 80 or height < 80 or abs(width - height) > max(12, width * 0.12):
+            return False
+        if not (0 <= from_square < 64 and 0 <= to_square < 64):
+            return False
+
+        def point(square):
+            file_index, rank_index = square % 8, square // 8
+            if str(bottom_side).strip().lower() == "black":
+                col, row = 7 - file_index, rank_index
+            else:
+                col, row = file_index, 7 - rank_index
+            return (
+                left + (col + 0.5) * width / 8.0,
+                top + (row + 0.5) * height / 8.0,
+            )
+
+        sx, sy = point(from_square)
+        ex, ey = point(to_square)
+        # Standard right-click drawing boards commonly map modifier keys to colors:
+        # plain = default, Shift = alternate, Ctrl = red, Alt = yellow.
+        modifiers = {
+            "best": 0,
+            "opponent": 8,
+            "reply": 9,
+            "hint": 1,
+            "bad": 2,
+            "premove": 2,
+        }.get(str(color or "").lower(), 0)
+
+        driver.execute_script(
+            """
+            if (!window.__hintNativeArrowGuardInstalled) {
+              document.addEventListener('contextmenu', function (event) {
+                if (window.__hintNativeArrowGestureActive) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }
+              }, true);
+              window.__hintNativeArrowGuardInstalled = true;
+            }
+            window.__hintNativeArrowGestureActive = true;
+            """
+        )
+        pressed = False
+        try:
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": "mouseMoved", "x": sx, "y": sy,
+            })
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": "mousePressed", "x": sx, "y": sy,
+                "button": "right", "buttons": 2, "clickCount": 1,
+                "modifiers": modifiers,
+            })
+            pressed = True
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": "mouseMoved", "x": ex, "y": ey,
+                "button": "right", "buttons": 2, "modifiers": modifiers,
+            })
+            driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                "type": "mouseReleased", "x": ex, "y": ey,
+                "button": "right", "buttons": 0, "modifiers": modifiers,
+            })
+            pressed = False
+        finally:
+            if pressed:
+                try:
+                    driver.execute_cdp_cmd("Input.dispatchMouseEvent", {
+                        "type": "mouseReleased", "x": ex, "y": ey,
+                        "button": "right", "buttons": 0, "modifiers": modifiers,
+                    })
+                except Exception:
+                    pass
+            try:
+                driver.execute_script("window.__hintNativeArrowGestureActive = false;")
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
 JS_DETECT_VERIFICATION = r"""
 const body = String(document.body?.innerText || '').slice(0, 12000).toLowerCase();
 const title = String(document.title || '').toLowerCase();
@@ -1826,13 +1933,10 @@ function snapshot() {
     try {
       const r = board && board.getBoundingClientRect ? board.getBoundingClientRect() : null;
       if (!r || !r.width || !r.height) return null;
-      // Convert viewport CSS coordinates into desktop screen coordinates for
-      // the independent native overlay window.
-      const leftFrame = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
-      const topFrame = Math.max(0, window.outerHeight - window.innerHeight);
+      // Keep viewport CSS coordinates for native CDP right-click gestures on the page board.
       return {
-        left: window.screenX + leftFrame + r.left,
-        top: window.screenY + topFrame + r.top,
+        left: r.left,
+        top: r.top,
         width: r.width,
         height: r.height
       };
