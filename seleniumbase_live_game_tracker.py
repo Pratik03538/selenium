@@ -4667,6 +4667,7 @@ def main() -> int:
         new_file = not csv_path.exists() or csv_path.stat().st_size == 0
         previous_fen = ""
         last_dashboard_eval_fen = ""
+        last_coach_analysis_key = ""
         reconstructed_history: list[dict[str, str]] = []
         game_number = 1
         if chess is None:
@@ -5413,6 +5414,42 @@ def main() -> int:
                                         "Move generation paused for this position.",
                                         flush=True,
                                     )
+
+                            # When Tactical Coach is open and it is the opponent's
+                            # turn, do a very short display-only MultiPV search. This keeps
+                            # the coach updating after either player's move without touching
+                            # the existing bot move-selection or submission branch.
+                            if (
+                                not our_turn
+                                and args.move_output == "hint"
+                                and hint_panel is not None
+                                and hint_panel.is_coach_open()
+                                and engine is not None
+                                and strategy_module is not None
+                                and not engine_board.is_game_over(claim_draw=True)
+                            ):
+                                coach_key = f"{game_number}:{fen}"
+                                if coach_key != last_coach_analysis_key:
+                                    try:
+                                        coach_multipv = max(
+                                            2, min(
+                                                4,
+                                                int(getattr(strategy_module, "TRAINING_MULTI_PV", 4)),
+                                            )
+                                        )
+                                        coach_infos = engine.analyse(
+                                            engine_board.copy(stack=True),
+                                            chess.engine.Limit(depth=8, time=0.035),
+                                            multipv=coach_multipv,
+                                        )
+                                        hint_panel.set_coach_variations(fen, coach_infos)
+                                    except (
+                                        chess.engine.EngineError, ValueError,
+                                        TypeError, RuntimeError,
+                                    ):
+                                        pass
+                                    finally:
+                                        last_coach_analysis_key = coach_key
 
                             if our_turn and not engine_board.is_game_over(claim_draw=True):
                                 move_cycle_started_at = time.monotonic()
