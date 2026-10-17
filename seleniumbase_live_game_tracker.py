@@ -5638,11 +5638,14 @@ def main() -> int:
                                         and engine is not None
                                         and not engine_board.is_game_over(claim_draw=True)
                                     ):
-                                        coach_key = f"{game_number}:{fen}:after:{chosen_move.uci()}"
+                                        coach_board = engine_board.copy(stack=True)
+                                        coach_board.push(chosen_move)
+                                        # Dedupe against the resulting board position, so the
+                                        # same opponent options are not replayed when the board
+                                        # observer catches up after the hinted move is played.
+                                        coach_key = f"{game_number}:{coach_board.fen()}"
                                         if coach_key != last_coach_analysis_key:
                                             try:
-                                                coach_board = engine_board.copy(stack=True)
-                                                coach_board.push(chosen_move)
                                                 coach_infos = engine.analyse(
                                                     coach_board,
                                                     chess.engine.Limit(depth=8, time=0.025),
