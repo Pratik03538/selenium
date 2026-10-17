@@ -5599,6 +5599,15 @@ def main() -> int:
                                     if chosen_move is None or chosen_move not in engine_board.legal_moves:
                                         raise RuntimeError("ChessKida selector did not return a legal move.")
 
+                                    # Tactical Coach consumes the already-computed MultiPV
+                                    # lines only; it does not run another search or change
+                                    # the selected move, its timing, or its submission path.
+                                    if hint_panel is not None:
+                                        try:
+                                            hint_panel.set_coach_variations(fen, engine_result)
+                                        except (ValueError, TypeError, RuntimeError):
+                                            pass
+
                                     chosen_san = engine_board.san(chosen_move)
                                     rank = selection_meta.get("rank") if isinstance(selection_meta, dict) else None
                                     rank_text = f"#{int(rank) + 1}" if rank is not None else "FREE"
