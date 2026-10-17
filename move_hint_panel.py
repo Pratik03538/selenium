@@ -120,15 +120,43 @@ def build_coach_variations(board_fen: str, engine_infos, max_lines: int = 5, max
                     )
             if move.promotion:
                 notes.append(f"promotes to {chess.piece_name(move.promotion)}")
+            piece_before = board.piece_at(move.from_square)
+            moving_side = board.turn
+            side = "white" if moving_side == chess.WHITE else "black"
+            from_square, to_square = move.from_square, move.to_square
+
+            if piece_before and piece_before.piece_type == chess.PAWN:
+                if chess.square_file(to_square) in {3, 4} and chess.square_rank(to_square) in {3, 4}:
+                    notes.append("claims central space")
+            if piece_before and piece_before.piece_type in {chess.KNIGHT, chess.BISHOP}:
+                home_rank = 0 if moving_side == chess.WHITE else 7
+                if chess.square_rank(from_square) == home_rank:
+                    notes.append("develops a minor piece")
             if board.is_castling(move):
                 notes.append("kingside castle" if chess.square_file(move.to_square) == 6 else "queenside castle")
-            side = "white" if board.turn == chess.WHITE else "black"
-            from_square, to_square = move.from_square, move.to_square
+
             board.push(move)
             if board.is_checkmate():
                 notes.append("checkmate")
             elif board.is_check():
                 notes.append("check")
+
+            moved_piece = board.piece_at(to_square)
+            if moved_piece is not None:
+                enemy_targets = []
+                for target_square in board.attacks(to_square):
+                    target_piece = board.piece_at(target_square)
+                    if (
+                        target_piece is not None
+                        and target_piece.color == board.turn
+                        and target_piece.piece_type in {
+                            chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING
+                        }
+                    ):
+                        enemy_targets.append(chess.piece_name(target_piece.piece_type))
+                if len(enemy_targets) >= 2:
+                    notes.append("fork threat against " + " and ".join(enemy_targets[:3]))
+
             steps.append({
                 "uci": move.uci(),
                 "san": san,
@@ -137,6 +165,10 @@ def build_coach_variations(board_fen: str, engine_infos, max_lines: int = 5, max
                 "side": side,
                 "ply": len(steps) + 1,
                 "notes": notes,
+                "explanation": (
+                    "; ".join(dict.fromkeys(notes))
+                    if notes else "engine continuation; watch the opponent's reply"
+                ),
             })
         if not steps:
             continue
@@ -157,11 +189,21 @@ def build_coach_variations(board_fen: str, engine_infos, max_lines: int = 5, max
             pass
 
         sequence = " → ".join(step["san"] for step in steps)
+        noted_steps = [
+            f"{step['san']}: {step['explanation']}"
+            for step in steps if step.get("notes")
+        ]
+        explanation = (
+            " · ".join(noted_steps[:4])
+            if noted_steps else
+            "No forced capture/check motif identified in this line; compare the continuation and evaluation."
+        )
         variations.append({
             "index": len(variations) + 1,
             "label": f"Line {len(variations) + 1} · {steps[0]['san']} · {score_text}",
             "score": score_text,
             "sequence": sequence,
+            "explanation": explanation,
             "moves": steps,
             "root_fen": str(board_fen),
         })
@@ -476,7 +518,8 @@ class MoveHintBoardPanel:
             buttons.pack(fill="x", padx=14, pady=(0, 12))
             tk.Button(buttons, text="◀ Previous", command=lambda: self._step_coach(-1)).pack(side="left", padx=(0, 6))
             tk.Button(buttons, text="Next ▶", command=lambda: self._step_coach(1)).pack(side="left", padx=6)
-            self.coach_play_button = tk.Button(buttons, text="▶ Play line", command=self._toggle_coach_playback)
+            tk.Button(buttons, text="Show full line", command=self._show_full_coach_line).pack(side="left", padx=6)
+            self.coach_play_button = tk.Button(buttons, text="▶ Play FAST", command=self._toggle_coach_playback)
             self.coach_play_button.pack(side="left", padx=6)
             tk.Button(buttons, text="Restore hint", command=self._restore_primary_hint).pack(side="left", padx=6)
             tk.Button(buttons, text="Close", command=self._close_coach).pack(side="right")
@@ -527,10 +570,27 @@ class MoveHintBoardPanel:
             return
         line = self.coach_lines[self.coach_line_index]
         self.coach_summary.set(
-            f"Evaluation from side-to-move: {line['score']}    ·    {line['sequence']}"
+            f"Evaluation: {line['score']}    ·    {line['sequence']}\n"
+            f"Why: {line.get('explanation', 'Inspect the move and its reply.')}"
         )
         self.coach_step_index = min(self.coach_step_index, len(line["moves"]) - 1)
-        self._show_coach_step()
+        self._show_full_coach_line()
+
+    def _show_full_coach_line(self):
+        if not self.coach_lines or self.coach_window is None:
+            return
+        line = self.coach_lines[self.coach_line_index]
+        self.coach_step_index = max(0, min(self.coach_step_index, len(line["moves"]) - 1))
+        if self.hint_visible and self.mode == "hint":
+            self.overlay.set_line(line["moves"], self.bottom_side, show_all=True)
+            self.overlay.set_enabled(True)
+        else:
+            self.overlay.set_enabled(False)
+        self.coach_step_status.set(
+            f"FULL LINE · {len(line['moves'])} plies shown together. "
+            "Yellow = candidate, cyan = opponent reply, purple/orange/green = continuation. "
+            "Select Next or Play FAST to step through it."
+        )
 
     def _show_coach_step(self):
         if not self.coach_lines or self.coach_window is None:
@@ -540,21 +600,22 @@ class MoveHintBoardPanel:
             return
         self.coach_step_index = max(0, min(self.coach_step_index, len(line["moves"]) - 1))
         move = line["moves"][self.coach_step_index]
-        move_color = "#facc15" if self.coach_step_index % 2 == 0 else "#22d3ee"
         if self.hint_visible and self.mode == "hint":
-            self.overlay.set_hint(move, self.bottom_side, move_color)
+            self.overlay.set_line(
+                line["moves"], self.bottom_side,
+                active_index=self.coach_step_index, show_all=False,
+            )
             self.overlay.set_enabled(True)
-        elif not self.hint_visible:
-            self.overlay.set_enabled(False)
         else:
             self.overlay.set_enabled(False)
         actor = "Candidate-side move" if self.coach_step_index % 2 == 0 else "Opponent reply / continuation"
-        note_text = "; ".join(move.get("notes") or [])
-        tactical_note = f" Tactical note: {note_text}." if note_text else ""
+        note_text = move.get("explanation") or "Review the opponent's reply and resulting position."
+        palette = ["yellow", "cyan", "pink", "purple", "orange", "green"]
+        colour = palette[self.coach_step_index % len(palette)]
         self.coach_step_status.set(
             f"Step {self.coach_step_index + 1}/{len(line['moves'])}: "
-            f"{actor} plays {move['san']} ({move['uci'][:2]} → {move['uci'][2:4]})."
-            f"{tactical_note} Yellow = candidate move; cyan = reply/continuation."
+            f"{actor} plays {move['san']} ({move['uci'][:2]} → {move['uci'][2:4]}). "
+            f"Why: {note_text}. Arrow colour: {colour}."
         )
 
     def _step_coach(self, delta):
@@ -580,7 +641,7 @@ class MoveHintBoardPanel:
         self.coach_playing = True
         self.coach_play_button.configure(text="Ⅱ Pause")
         self._show_coach_step()
-        self.coach_play_job = self.coach_window.after(850, self._advance_coach_playback)
+        self.coach_play_job = self.coach_window.after(220, self._advance_coach_playback)
 
     def _advance_coach_playback(self):
         self.coach_play_job = None
@@ -607,7 +668,7 @@ class MoveHintBoardPanel:
         self.coach_play_job = None
         try:
             if self.coach_play_button.winfo_exists():
-                self.coach_play_button.configure(text="▶ Play line")
+                self.coach_play_button.configure(text="▶ Play FAST")
         except (AttributeError, self.tk.TclError):
             pass
 
