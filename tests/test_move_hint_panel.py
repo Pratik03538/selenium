@@ -39,7 +39,7 @@ class MoveHintDescriptionTests(unittest.TestCase):
         board = chess.Board("4k3/P7/8/8/8/8/8/4K3 b - - 0 1")
         hint = build_premove_hint(board.fen(), "a7a8q", "e8d7")
         self.assertEqual(hint["promotion"], chess.QUEEN)
-        self.assertEqual(hint["san"], "a8=Q+")
+        self.assertEqual(hint["san"], "a8=Q")
 
     def test_white_orientation_square_coordinates(self):
         self.assertEqual(square_to_display(chess.A1, "white"), (0, 7))
