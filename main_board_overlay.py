@@ -17,6 +17,8 @@ class MainBoardHintOverlay:
         self.rect = None
         self.hint = None
         self.line_hints = None
+        self.coach_hint = None
+        self.coach_color = "#38bdf8"
         self.show_all_hints = False
         self.bottom_side = "white"
         self.color = "#facc15"
@@ -160,19 +162,31 @@ class MainBoardHintOverlay:
             items.append(item)
         self.line_hints = items
         self.hint = None
-        self.show_all_hints = bool(show_all)
+        # Keep variation arrows sequential; never draw every ply on top of the board.
+        self.show_all_hints = False
         self.active_line_index = max(0, min(int(active_index), max(0, len(items) - 1)))
         self.bottom_side = "black" if str(bottom_side).lower() == "black" else "white"
-        self.step = 8 if self.show_all_hints else 0
+        self.step = 0
         self.color = (
             items[self.active_line_index]["overlay_color"] if items else "#facc15"
         )
         self._cancel_animation()
         self._sync()
 
+    def set_coach_hint(self, hint, color="#38bdf8"):
+        """Show one small, clearly separated analysis move without replacing the main hint."""
+        self.coach_hint = dict(hint) if isinstance(hint, dict) else None
+        self.coach_color = str(color or "#38bdf8")
+        self._sync()
+
+    def clear_coach_hint(self):
+        self.coach_hint = None
+        self._sync()
+
     def clear(self):
         self.hint = None
         self.line_hints = None
+        self.coach_hint = None
         self.show_all_hints = False
         self._cancel_animation()
         self._sync()
@@ -184,7 +198,7 @@ class MainBoardHintOverlay:
     def _sync(self):
         if not self.alive:
             return
-        if not (self.supported and self.enabled and (self.hint or self.line_hints) and self.rect):
+        if not (self.supported and self.enabled and (self.hint or self.line_hints or self.coach_hint) and self.rect):
             try:
                 self.window.withdraw()
             except self.tk.TclError:
@@ -200,7 +214,7 @@ class MainBoardHintOverlay:
                 self._make_click_through()
                 self.styles_applied = self.supported
             self._draw()
-            if self.step < 8:
+            if (self.hint or self.line_hints) and self.step < 8:
                 self._schedule_animation()
         except self.tk.TclError:
             self.alive = False
@@ -230,7 +244,7 @@ class MainBoardHintOverlay:
         if self.step < 8:
             self._schedule_animation()
 
-    def _draw_arrow(self, hint, color, progress, cw, ch):
+    def _draw_arrow(self, hint, color, progress, cw, ch, size_scale=1.0):
         def center(square):
             col, row = int(square) % 8, 7 - int(square) // 8
             if self.bottom_side == "black":
@@ -244,17 +258,18 @@ class MainBoardHintOverlay:
             self.canvas.create_rectangle(
                 col * cw + 2, row * ch + 2,
                 (col + 1) * cw - 2, (row + 1) * ch - 2,
-                outline=color, width=max(3, int(min(cw, ch) * 0.055)),
+                outline=color,
+                width=max(1, int(max(3, min(cw, ch) * 0.055) * size_scale)),
             )
         end = (
             start[0] + (target[0] - start[0]) * progress,
             start[1] + (target[1] - start[1]) * progress,
         )
-        line_width = max(5, int(min(cw, ch) * 0.10))
+        line_width = max(2, int(max(5, min(cw, ch) * 0.10) * size_scale))
         arrow_shape = (
-            max(12, int(cw * 0.30)),
-            max(14, int(ch * 0.32)),
-            max(5, int(cw * 0.12)),
+            max(7, int(max(12, cw * 0.30) * size_scale)),
+            max(8, int(max(14, ch * 0.32) * size_scale)),
+            max(3, int(max(5, cw * 0.12) * size_scale)),
         )
         self.canvas.create_line(
             start[0], start[1], end[0], end[1],
@@ -270,7 +285,7 @@ class MainBoardHintOverlay:
     def _draw(self):
         if not self.alive or not self.supported or not self.rect:
             return
-        if not self.hint and not self.line_hints:
+        if not self.hint and not self.line_hints and not self.coach_hint:
             return
         try:
             self.canvas.delete("all")
@@ -278,15 +293,17 @@ class MainBoardHintOverlay:
             height = max(1, self.rect["height"])
             cw, ch = width / 8.0, height / 8.0
             if self.line_hints:
-                if self.show_all_hints:
-                    # Simultaneous line preview: every ply gets its own colour.
-                    for item in self.line_hints:
-                        self._draw_arrow(item, item["overlay_color"], 1.0, cw, ch)
-                elif self.active_line_index < len(self.line_hints):
+                # The old whole-line preview is intentionally disabled: show one ply at a time.
+                if self.active_line_index < len(self.line_hints):
                     item = self.line_hints[self.active_line_index]
                     self._draw_arrow(item, item["overlay_color"], self.step / 8.0, cw, ch)
-                return
-            self._draw_arrow(self.hint, self.color, self.step / 8.0, cw, ch)
+            elif self.hint:
+                self._draw_arrow(self.hint, self.color, self.step / 8.0, cw, ch)
+            # Coach analysis is a smaller, secondary arrow; the main hint stays visible.
+            if self.coach_hint:
+                self._draw_arrow(
+                    self.coach_hint, self.coach_color, 1.0, cw, ch, size_scale=0.52
+                )
         except self.tk.TclError:
             self.alive = False
 
