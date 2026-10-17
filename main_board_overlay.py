@@ -178,7 +178,7 @@ class MainBoardHintOverlay:
     def _sync(self):
         if not self.alive:
             return
-        if not (self.supported and self.enabled and self.hint and self.rect):
+        if not (self.supported and self.enabled and (self.hint or self.line_hints) and self.rect):
             try:
                 self.window.withdraw()
             except self.tk.TclError:
@@ -208,7 +208,7 @@ class MainBoardHintOverlay:
             self.job = None
 
     def _schedule_animation(self):
-        if not self.alive or not self.enabled or not self.hint or self.job is not None:
+        if not self.alive or not self.enabled or not (self.hint or self.line_hints) or self.job is not None:
             return
         try:
             self.job = self.window.after(12, self._animate)
@@ -217,7 +217,7 @@ class MainBoardHintOverlay:
 
     def _animate(self):
         self.job = None
-        if not self.alive or not self.enabled or not self.hint:
+        if not self.alive or not self.enabled or not (self.hint or self.line_hints):
             return
         self.step = min(8, self.step + 1)
         self._draw()
