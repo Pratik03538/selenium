@@ -5,7 +5,8 @@ import chess
 
 from move_hint_panel import (
     build_hint, build_premove_hint, build_coach_variations,
-    square_to_display, toggle_output_mode, toggle_hint_visibility,
+    classify_variation_risk, square_to_display, toggle_output_mode,
+    toggle_hint_visibility,
 )
 
 
@@ -74,6 +75,38 @@ class TacticalCoachVariationTests(unittest.TestCase):
             ["e4 → e5", "d4 → d5", "c4 → e5"],
         )
         self.assertTrue(all(len(line["moves"]) == 2 for line in variations))
+
+    def test_piece_moving_out_of_attack_is_explained(self):
+        board = chess.Board("r6k/8/8/8/8/8/8/R3K3 w - - 0 1")
+        variations = build_coach_variations(
+            board.fen(), [{"pv": [chess.Move.from_uci("a1b1")]}],
+            max_lines=1, max_plies=1,
+        )
+        self.assertEqual(len(variations), 1)
+        self.assertIn(
+            "out of attack", variations[0]["moves"][0]["explanation"]
+        )
+
+    def test_bad_candidate_is_flagged_when_eval_drops_by_threshold(self):
+        lines = [
+            {"score_cp": 35, "mate_distance": None, "moves": []},
+            {"score_cp": -5, "mate_distance": None, "moves": []},
+            {"score_cp": -210, "mate_distance": None, "moves": []},
+        ]
+        best, bad, best_cp = classify_variation_risk(lines, threshold_cp=150)
+        self.assertIs(best, lines[0])
+        self.assertEqual(best_cp, 35)
+        self.assertEqual(bad["score_cp"], -210)
+        self.assertEqual(bad["drop_cp"], 245)
+
+    def test_forced_mate_against_side_to_move_is_marked_dangerous(self):
+        lines = [
+            {"score_cp": 25, "mate_distance": None, "moves": []},
+            {"score_cp": -99997, "mate_distance": -3, "moves": []},
+        ]
+        _best, bad, _best_cp = classify_variation_risk(lines)
+        self.assertIsNotNone(bad)
+        self.assertEqual(bad["mate_distance"], -3)
 
     def test_capture_is_explained_in_coaching_steps(self):
         board = chess.Board()
