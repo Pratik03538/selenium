@@ -83,7 +83,7 @@ def square_to_display(square: int, bottom_side: str = "white") -> tuple[int, int
     return file_index, 7 - rank_index
 
 
-def build_coach_variations(board_fen: str, engine_infos, max_lines: int = 5, max_plies: int = 10) -> list[dict]:
+def build_coach_variations(board_fen: str, engine_infos, max_lines: int = 3, max_plies: int = 8) -> list[dict]:
     """Convert Stockfish MultiPV principal variations into legal coaching steps.
 
     This is display-only: it does not choose, submit, or change a bot move.
@@ -229,6 +229,7 @@ class MoveHintBoardPanel:
         self.coach_lines = []
         self.coach_line_index = 0
         self.coach_step_index = 0
+        self.coach_root_side = "black"
         self.coach_window = None
         self.coach_play_job = None
         self.coach_playing = False
@@ -237,8 +238,8 @@ class MoveHintBoardPanel:
 
         self.window = tk.Toplevel(parent)
         self.window.title("Board Hint Controls")
-        self.window.geometry("500x285")
-        self.window.minsize(450, 260)
+        self.window.geometry("520x390")
+        self.window.minsize(480, 350)
         self.window.configure(background="#f4f6f8")
         self.window.protocol("WM_DELETE_WINDOW", self.hide)
         tk.Label(
@@ -269,13 +270,26 @@ class MoveHintBoardPanel:
             activeforeground="white", relief="flat", cursor="hand2",
         )
         self.visibility_button.pack(fill="x", padx=12, pady=(0, 7))
-        self.coach_button = tk.Button(
-            self.window, text="TACTICAL COACH · VARIATIONS",
-            command=self.open_coach, font=("Segoe UI", 10, "bold"),
-            padx=12, pady=5, bg="#6d28d9", fg="white", activebackground="#5b21b6",
-            activeforeground="white", relief="flat", cursor="hand2",
+        tk.Label(
+            self.window, text="LIVE ANALYSIS · TOP 3 OPPONENT MOVES",
+            font=("Segoe UI", 9, "bold"), bg="#f4f6f8", fg="#6d28d9",
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(0, 3))
+        self.analysis_text = tk.StringVar(value="Waiting for the next position…")
+        tk.Label(
+            self.window, textvariable=self.analysis_text,
+            font=("Consolas", 9), bg="#ffffff", fg="#334155",
+            wraplength=490, justify="left", anchor="w", height=4,
+            padx=8, pady=5, relief="solid", bd=1,
+        ).pack(fill="x", padx=12, pady=(0, 4))
+        self.analysis_step_status = tk.StringVar(
+            value="Small cyan arrow = opponent candidate · violet = your tactical continuation"
         )
-        self.coach_button.pack(fill="x", padx=12, pady=(0, 10))
+        tk.Label(
+            self.window, textvariable=self.analysis_step_status,
+            font=("Segoe UI", 9), bg="#f4f6f8", fg="#6d28d9",
+            wraplength=490, justify="left", anchor="w",
+        ).pack(fill="x", padx=12, pady=(0, 8))
         self._refresh_mode_button()
         self._refresh_visibility_button()
         self.window.bind_all("<F8>", self._handle_mode_shortcut, add="+")
@@ -322,6 +336,8 @@ class MoveHintBoardPanel:
         else:
             self.move_text.set("HINT MODE · moves are shown over the main board")
             self.move_label.configure(fg="#166534")
+            if self.coach_lines:
+                self._start_auto_coach_playback()
         if callable(self.on_mode_change):
             self.on_mode_change(self.mode)
         return "break"
@@ -334,6 +350,7 @@ class MoveHintBoardPanel:
             return "break"
         self.hint_visible = toggle_hint_visibility(self.hint_visible)
         self._refresh_visibility_button()
+        self._stop_coach_playback()
         self.overlay.set_enabled(self.hint_visible and self.mode == "hint")
         if not self.hint_visible:
             self.move_text.set("Hint overlay OFF · bot output mode is unchanged")
@@ -345,8 +362,8 @@ class MoveHintBoardPanel:
                 self.move_text.set("Hint overlay ON")
             else:
                 self.move_text.set("Hint overlay ON · waiting for the next hint")
-        if self.coach_window is not None and self.coach_window.winfo_exists():
-            self._refresh_coach_status()
+            if self.mode == "hint" and self.coach_lines:
+                self._start_auto_coach_playback()
         return "break"
 
     def _handle_visibility_shortcut(self, _event=None):
@@ -407,8 +424,10 @@ class MoveHintBoardPanel:
             self.overlay.clear()
             self.move_text.set("Live position updated · waiting for the next hint/analysis")
             self.move_label.configure(fg="#475569")
-            if self.coach_window is not None and self.coach_window.winfo_exists():
-                self._refresh_coach_lines()
+            self.analysis_text.set("Waiting for fresh top-3 opponent replies…")
+            self.analysis_step_status.set(
+                "Analysis arrows play one at a time; the yellow hint stays separate."
+            )
 
     def set_suggestion(self, position_fen: str, uci: str, san: str | None = None,
                        rank: str | None = None, reason: str | None = None) -> bool:
@@ -452,259 +471,120 @@ class MoveHintBoardPanel:
             self.move_text.set(f"Hint overlay OFF · premove {hint['san']}")
         return True
 
-    def set_coach_variations(self, position_fen: str, engine_infos) -> int:
-        """Load the already-computed engine PVs for coaching without a second search."""
+    def set_coach_variations(
+        self, position_fen: str, engine_infos, analysis_fen: str | None = None,
+    ) -> int:
+        """Show the top three opponent options and auto-play their tactical continuations."""
         if not self._alive or not position_fen or str(position_fen) != self.fen:
             return 0
+        root_fen = str(analysis_fen or position_fen)
         try:
-            self.coach_lines = build_coach_variations(position_fen, engine_infos)
+            root_board = chess.Board(root_fen)
+            self.coach_root_side = "white" if root_board.turn == chess.WHITE else "black"
+            self.coach_lines = build_coach_variations(
+                root_fen, engine_infos, max_lines=3, max_plies=8,
+            )
         except (RuntimeError, TypeError, ValueError):
             self.coach_lines = []
+            self.coach_root_side = "black"
+        self._stop_coach_playback()
         self.coach_line_index = 0
         self.coach_step_index = 0
-        if self.coach_window is not None and self.coach_window.winfo_exists():
-            self._stop_coach_playback()
-            self._refresh_coach_lines()
+        if not self.coach_lines:
+            self.analysis_text.set("No legal reply lines yet · waiting for fresh analysis…")
+            self.analysis_step_status.set("The main hint remains available on the board.")
+            return 0
+
+        summary_rows = []
+        for index, line in enumerate(self.coach_lines[:3], start=1):
+            continuation = " → ".join(
+                step["san"] for step in line["moves"][:4]
+            )
+            summary_rows.append(f"{index}. {continuation}")
+        self.analysis_text.set("\n".join(summary_rows))
+        if self.hint_visible and self.mode == "hint":
+            self._start_auto_coach_playback()
+        else:
+            self.analysis_step_status.set(
+                "Analysis ready · switch back to Hint mode to replay the small arrows."
+            )
         return len(self.coach_lines)
 
-    def is_coach_open(self) -> bool:
-        """True only while the Tactical Coach window is actually visible."""
-        try:
-            return bool(
-                self.coach_window is not None
-                and self.coach_window.winfo_exists()
-                and self.coach_window.state() == "normal"
-            )
-        except (AttributeError, self.tk.TclError):
-            return False
-
-    def open_coach(self):
-        if not self._alive:
-            return
-        try:
-            if self.coach_window is not None and self.coach_window.winfo_exists():
-                self.coach_window.deiconify()
-                self.coach_window.lift()
-                self._refresh_coach_lines()
-                return
-            tk = self.tk
-            win = tk.Toplevel(self.window)
-            self.coach_window = win
-            win.title("Tactical Coach · Candidate Lines")
-            win.geometry("760x510")
-            win.minsize(650, 430)
-            win.configure(background="#f8fafc")
-            win.protocol("WM_DELETE_WINDOW", self._close_coach)
-            tk.Label(
-                win, text="TACTICAL COACH",
-                font=("Segoe UI", 15, "bold"), bg="#f8fafc", fg="#172033",
-            ).pack(fill="x", padx=14, pady=(12, 3))
-            tk.Label(
-                win,
-                text="Select a candidate line to inspect its move → reply → continuation. "
-                     "Arrows are a visual replay only; the board position is not changed.",
-                font=("Segoe UI", 9), bg="#f8fafc", fg="#475569",
-                wraplength=720, justify="left",
-            ).pack(fill="x", padx=14, pady=(0, 9))
-            self.coach_list = tk.Listbox(
-                win, height=7, font=("Consolas", 10),
-                selectmode=tk.SINGLE, activestyle="dotbox",
-                exportselection=False, bg="white", fg="#172033",
-            )
-            self.coach_list.pack(fill="both", expand=True, padx=14, pady=(0, 8))
-            self.coach_list.bind("<<ListboxSelect>>", self._on_coach_line_selected)
-            self.coach_summary = tk.StringVar(value="Waiting for engine variation lines…")
-            tk.Label(
-                win, textvariable=self.coach_summary,
-                font=("Segoe UI", 10, "bold"), bg="#f8fafc", fg="#334155",
-                wraplength=720, justify="left",
-            ).pack(fill="x", padx=14, pady=(0, 5))
-            self.coach_step_status = tk.StringVar(value="No line selected.")
-            tk.Label(
-                win, textvariable=self.coach_step_status,
-                font=("Segoe UI", 10), bg="#f8fafc", fg="#475569",
-                wraplength=720, justify="left",
-            ).pack(fill="x", padx=14, pady=(0, 8))
-            buttons = tk.Frame(win, bg="#f8fafc")
-            buttons.pack(fill="x", padx=14, pady=(0, 12))
-            tk.Button(buttons, text="◀ Previous", command=lambda: self._step_coach(-1)).pack(side="left", padx=(0, 6))
-            tk.Button(buttons, text="Next ▶", command=lambda: self._step_coach(1)).pack(side="left", padx=6)
-            tk.Button(buttons, text="Show full line", command=self._show_full_coach_line).pack(side="left", padx=6)
-            self.coach_play_button = tk.Button(buttons, text="▶ Play FAST", command=self._toggle_coach_playback)
-            self.coach_play_button.pack(side="left", padx=6)
-            tk.Button(buttons, text="Restore hint", command=self._restore_primary_hint).pack(side="left", padx=6)
-            tk.Button(buttons, text="Close", command=self._close_coach).pack(side="right")
-            self._refresh_coach_lines()
-        except self.tk.TclError:
-            self.coach_window = None
-
-    def _refresh_coach_lines(self):
-        if self.coach_window is None:
-            return
-        try:
-            if not self.coach_window.winfo_exists():
-                return
-            self.coach_list.delete(0, "end")
-            if not self.coach_lines:
-                self.coach_list.insert("end", "No MultiPV line yet · waiting for next engine search")
-                self.coach_summary.set(
-                    "A new legal position and Stockfish analysis are needed. "
-                    "Opening-book moves may not include a tactical variation."
-                )
-                self.coach_step_status.set("No variation steps available.")
-                return
-            for line in self.coach_lines:
-                self.coach_list.insert(
-                    "end", f"{line['label']}   |   {line['sequence']}"
-                )
-            self.coach_line_index = min(self.coach_line_index, len(self.coach_lines) - 1)
-            self.coach_list.selection_clear(0, "end")
-            self.coach_list.selection_set(self.coach_line_index)
-            self.coach_list.activate(self.coach_line_index)
-            self._show_selected_coach_line()
-        except self.tk.TclError:
-            pass
-
-    def _on_coach_line_selected(self, _event=None):
-        if self.coach_list is None:
-            return
-        selection = self.coach_list.curselection()
-        if not selection or not self.coach_lines:
+    def _start_auto_coach_playback(self):
+        if (
+            not self._alive or not self.coach_lines or not self.hint_visible
+            or self.mode != "hint" or self.coach_playing
+        ):
             return
         self._stop_coach_playback()
-        self.coach_line_index = int(selection[0])
+        self.coach_line_index = 0
         self.coach_step_index = 0
-        self._show_selected_coach_line()
+        self.coach_playing = True
+        self._show_auto_coach_step()
+        try:
+            self.coach_play_job = self.window.after(180, self._advance_auto_coach_step)
+        except self.tk.TclError:
+            self.coach_play_job = None
+            self.coach_playing = False
 
-    def _show_selected_coach_line(self):
-        if not self.coach_lines or self.coach_window is None:
-            return
-        line = self.coach_lines[self.coach_line_index]
-        self.coach_summary.set(
-            f"Evaluation: {line['score']}    ·    {line['sequence']}\n"
-            f"Why: {line.get('explanation', 'Inspect the move and its reply.')}"
-        )
-        self.coach_step_index = min(self.coach_step_index, len(line["moves"]) - 1)
-        self._show_full_coach_line()
-
-    def _show_full_coach_line(self):
-        if not self.coach_lines or self.coach_window is None:
-            return
-        line = self.coach_lines[self.coach_line_index]
-        self.coach_step_index = max(0, min(self.coach_step_index, len(line["moves"]) - 1))
-        if self.hint_visible and self.mode == "hint":
-            self.overlay.set_line(line["moves"], self.bottom_side, show_all=True)
-            self.overlay.set_enabled(True)
-        else:
-            self.overlay.set_enabled(False)
-        self.coach_step_status.set(
-            f"FULL LINE · {len(line['moves'])} plies shown together. "
-            "Yellow = candidate, cyan = opponent reply, purple/orange/green = continuation. "
-            "Select Next or Play FAST to step through it."
-        )
-
-    def _show_coach_step(self):
-        if not self.coach_lines or self.coach_window is None:
+    def _show_auto_coach_step(self):
+        if not self.coach_lines or not self.coach_playing:
             return
         line = self.coach_lines[self.coach_line_index]
         if not line["moves"]:
             return
-        self.coach_step_index = max(0, min(self.coach_step_index, len(line["moves"]) - 1))
+        self.coach_step_index = max(
+            0, min(self.coach_step_index, len(line["moves"]) - 1)
+        )
         move = line["moves"][self.coach_step_index]
+        is_opponent_move = move.get("side") == self.coach_root_side
+        arrow_color = "#38bdf8" if is_opponent_move else "#c084fc"
         if self.hint_visible and self.mode == "hint":
-            self.overlay.set_line(
-                line["moves"], self.bottom_side,
-                active_index=self.coach_step_index, show_all=False,
-            )
+            self.overlay.set_coach_hint(move, arrow_color)
             self.overlay.set_enabled(True)
-        else:
-            self.overlay.set_enabled(False)
-        actor = "Candidate-side move" if self.coach_step_index % 2 == 0 else "Opponent reply / continuation"
-        note_text = move.get("explanation") or "Review the opponent's reply and resulting position."
-        palette = ["yellow", "cyan", "pink", "purple", "orange", "green"]
-        colour = palette[self.coach_step_index % len(palette)]
-        self.coach_step_status.set(
-            f"Step {self.coach_step_index + 1}/{len(line['moves'])}: "
-            f"{actor} plays {move['san']} ({move['uci'][:2]} → {move['uci'][2:4]}). "
-            f"Why: {note_text}. Arrow colour: {colour}."
+        actor = "OPPONENT" if is_opponent_move else "YOUR TACTICAL CONTINUATION"
+        explanation = move.get("explanation") or "Review this reply and the resulting position."
+        self.analysis_step_status.set(
+            f"Line {self.coach_line_index + 1}/3 · Step "
+            f"{self.coach_step_index + 1}/{len(line['moves'])} · "
+            f"{actor}: {move['san']} — {explanation}"
         )
 
-    def _step_coach(self, delta):
-        if not self.coach_lines:
-            return
-        self._stop_coach_playback()
-        line = self.coach_lines[self.coach_line_index]
-        self.coach_step_index = (self.coach_step_index + int(delta)) % len(line["moves"])
-        self._show_coach_step()
-
-    def _toggle_coach_playback(self):
-        if not self.coach_lines or self.coach_window is None:
-            return
-        if self.coach_playing:
-            self._stop_coach_playback()
-            return
-        if not self.hint_visible or self.mode != "hint":
-            self.coach_step_status.set("Turn Hint Overlay ON and switch to HINT mode to animate arrows.")
-            return
-        line = self.coach_lines[self.coach_line_index]
-        if self.coach_step_index >= len(line["moves"]) - 1:
-            self.coach_step_index = 0
-        self.coach_playing = True
-        self.coach_play_button.configure(text="Ⅱ Pause")
-        self._show_coach_step()
-        self.coach_play_job = self.coach_window.after(220, self._advance_coach_playback)
-
-    def _advance_coach_playback(self):
+    def _advance_auto_coach_step(self):
         self.coach_play_job = None
         if not self.coach_playing or not self.coach_lines:
             return
         line = self.coach_lines[self.coach_line_index]
-        if self.coach_step_index >= len(line["moves"]) - 1:
-            self._stop_coach_playback()
+        if self.coach_step_index + 1 < len(line["moves"]):
+            self.coach_step_index += 1
+        elif self.coach_line_index + 1 < len(self.coach_lines):
+            self.coach_line_index += 1
+            self.coach_step_index = 0
+        else:
+            self._stop_coach_playback(clear_arrow=True)
+            self.analysis_step_status.set(
+                "Analysis replay complete · top 3 choices remain listed above."
+            )
             return
-        self.coach_step_index += 1
-        self._show_coach_step()
+        self._show_auto_coach_step()
         try:
-            self.coach_play_job = self.coach_window.after(850, self._advance_coach_playback)
+            self.coach_play_job = self.window.after(180, self._advance_auto_coach_step)
         except self.tk.TclError:
-            self._stop_coach_playback()
+            self._stop_coach_playback(clear_arrow=True)
 
-    def _stop_coach_playback(self):
+    def _stop_coach_playback(self, clear_arrow=True):
         self.coach_playing = False
-        if self.coach_play_job is not None and self.coach_window is not None:
+        if self.coach_play_job is not None:
             try:
-                self.coach_window.after_cancel(self.coach_play_job)
+                self.window.after_cancel(self.coach_play_job)
             except (self.tk.TclError, ValueError):
                 pass
         self.coach_play_job = None
-        try:
-            if self.coach_play_button.winfo_exists():
-                self.coach_play_button.configure(text="▶ Play FAST")
-        except (AttributeError, self.tk.TclError):
-            pass
-
-    def _restore_primary_hint(self):
-        self._stop_coach_playback()
-        current = self.suggestion or self.premove_suggestion
-        if current and self.hint_visible and self.mode == "hint":
-            color = "#ef4444" if self.premove_suggestion is current else "#facc15"
-            self.overlay.set_hint(current, self.bottom_side, color)
-            self.overlay.set_enabled(True)
-        else:
-            self.overlay.clear()
-
-    def _refresh_coach_status(self):
-        if self.coach_window is None or not self.coach_lines:
-            return
-        self._show_selected_coach_line()
-
-    def _close_coach(self):
-        self._stop_coach_playback()
-        try:
-            self.coach_window.withdraw()
-        except (AttributeError, self.tk.TclError):
-            self.coach_window = None
-        self._restore_primary_hint()
+        if clear_arrow and getattr(self, "overlay", None) is not None:
+            try:
+                self.overlay.clear_coach_hint()
+            except (AttributeError, self.tk.TclError):
+                pass
 
     def clear_suggestion(self):
         self.suggestion = None
