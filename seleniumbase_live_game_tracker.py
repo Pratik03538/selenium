@@ -1927,7 +1927,19 @@ function refresh(forceRoots = false) {
     if (state.queue.length > 10000) state.queue.splice(0, state.queue.length - 10000);
   } catch (e) { state.lastError = String(e); }
 }
-state.observer = new MutationObserver(() => refresh(false));
+state.observer = new MutationObserver(records => {
+  // Arrow SVG updates are local presentation changes; do not treat them as
+  // game mutations or feed the observer with its own drawing operations.
+  const relevant = (records || []).some(record => {
+    let node = record.target;
+    if (node && node.nodeType !== 1) node = node.parentElement;
+    return !(node && (
+      node.id === '__owned_site_move_hint_overlay' ||
+      (typeof node.closest === 'function' && node.closest('#__owned_site_move_hint_overlay'))
+    ));
+  });
+  if (relevant) refresh(false);
+});
 state.observer.observe(document.documentElement, {
   subtree: true, childList: true, characterData: true, attributes: true,
   attributeFilter: ['class', 'style', 'title', 'aria-label', 'aria-valuetext', 'aria-valuenow', 'data-clock', 'data-remaining-time', 'data-fen', 'data-ply', 'data-time', 'data-result', 'data-turn']
