@@ -377,9 +377,14 @@ class MoveHintBoardPanel:
         if not self.hint_visible or self.mode != "hint" or not callable(self.on_board_arrow):
             return False
         try:
-            return bool(self.on_board_arrow(
+            drawn = bool(self.on_board_arrow(
                 move, color, self.fen, self.bottom_side, self.board_rect,
             ))
+            if not drawn:
+                self.analysis_step_status.set(
+                    "Board-native right-click marks were not accepted at this position; text analysis remains available."
+                )
+            return drawn
         except Exception:
             self.analysis_step_status.set(
                 "Native board drawing is unavailable here; move explanations remain visible."
