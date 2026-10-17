@@ -4308,7 +4308,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--move-input", choices=("api", "cursor"), default=None, help="Move submission method; defaults to cursor; can also be set with move_input=api|cursor in tracker_settings.txt.")
     parser.add_argument(
         "--move-output", choices=("hint", "execute"), default="hint",
-        help="Show selected moves as animated hints in a separate window (default), or execute them on the authorized test site.",
+        help="Show selected moves as animated arrows in a separate transparent overlay above the configured test board (default), or execute them on the authorized test site.",
     )
     premove_group = parser.add_mutually_exclusive_group()
     premove_group.add_argument("--premove", dest="premove_enabled", action="store_true", help="Try best-effort premoves on the configured authorized site.")
