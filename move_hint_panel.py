@@ -35,6 +35,33 @@ def build_hint(board_fen: str, uci: str, san: str | None = None) -> dict:
     }
 
 
+def build_premove_hint(
+    board_fen: str, uci: str, predicted_reply_uci: str,
+) -> dict:
+    """Validate a premove on the position after the predicted opponent reply."""
+    if chess is None:
+        raise RuntimeError("python-chess is required for the move hint board.")
+    board = chess.Board(str(board_fen))
+    predicted_reply = chess.Move.from_uci(str(predicted_reply_uci).strip())
+    if predicted_reply not in board.legal_moves:
+        raise ValueError("Predicted reply is not legal in the mirrored position.")
+    predicted_reply_san = board.san(predicted_reply)
+    board.push(predicted_reply)
+    premove = chess.Move.from_uci(str(uci).strip())
+    if premove not in board.legal_moves:
+        raise ValueError("Premove is not legal after the predicted reply.")
+    return {
+        "fen": str(board_fen),
+        "uci": premove.uci(),
+        "san": board.san(premove),
+        "predicted_reply_uci": predicted_reply.uci(),
+        "predicted_reply_san": predicted_reply_san,
+        "from_square": premove.from_square,
+        "to_square": premove.to_square,
+        "promotion": premove.promotion,
+    }
+
+
 def square_to_display(square: int, bottom_side: str = "white") -> tuple[int, int]:
     """Return (column, row) for a square, with White or Black at the bottom."""
     if chess is None:
@@ -64,6 +91,7 @@ class MoveHintBoardPanel:
         self.board = None
         self.bottom_side = "white"
         self.suggestion = None
+        self.premove_suggestion = None
         self._animation_step = 0
         self._animation_job = None
         self._alive = True
@@ -83,12 +111,13 @@ class MoveHintBoardPanel:
         ).pack(fill="x", padx=12, pady=(0, 5))
 
         self.move_text = tk.StringVar(value="Waiting for a live board position…")
-        tk.Label(
+        self.move_label = tk.Label(
             self.window, textvariable=self.move_text,
             font=("Segoe UI", 11, "bold"),
             bg="#f4f6f8", fg="#166534",
             wraplength=630, justify="center",
-        ).pack(fill="x", padx=12, pady=(0, 6))
+        )
+        self.move_label.pack(fill="x", padx=12, pady=(0, 6))
 
         self.canvas = tk.Canvas(
             self.window, width=620, height=620,
@@ -142,7 +171,9 @@ class MoveHintBoardPanel:
         if changed:
             self._cancel_animation()
             self.suggestion = None
+            self.premove_suggestion = None
             self.move_text.set("Live position updated • waiting for the next hint")
+            self.move_label.configure(fg="#475569")
         self.fen = str(fen)
         self.board = new_board
         self.bottom_side = side
@@ -163,8 +194,10 @@ class MoveHintBoardPanel:
         suggestion["rank"] = str(rank or "")
         suggestion["reason"] = str(reason or "")
         self.suggestion = suggestion
+        self.premove_suggestion = None
         self._animation_step = 0
         self._cancel_animation()
+        self.move_label.configure(fg="#166534")
         self._draw()
         self._schedule_animation()
         detail = f"{suggestion['san']}  ·  {suggestion['uci'][:2]} → {suggestion['uci'][2:4]}"
@@ -181,9 +214,44 @@ class MoveHintBoardPanel:
             return False
         return True
 
+    def set_premove_suggestion(
+        self, position_fen: str, uci: str, predicted_reply_uci: str,
+    ) -> bool:
+        """Show the existing strategy's premove as a red hint; never submit it."""
+        if not self._alive or str(position_fen) != self.fen or self.board is None:
+            return False
+        try:
+            premove_hint = build_premove_hint(position_fen, uci, predicted_reply_uci)
+        except (ValueError, RuntimeError):
+            return False
+        self.suggestion = None
+        self.premove_suggestion = premove_hint
+        self._animation_step = 0
+        self._cancel_animation()
+        self.move_label.configure(fg="#b91c1c")
+        self._draw()
+        self._schedule_animation()
+        detail = (
+            f"RED PREMOVE: {premove_hint['san']}  ·  "
+            f"{premove_hint['uci'][:2]} → {premove_hint['uci'][2:4]}  "
+            f"after {premove_hint['predicted_reply_san']}"
+        )
+        if premove_hint.get("promotion"):
+            detail += f"  ·  promotes to {chess.piece_symbol(premove_hint['promotion']).upper()}"
+        self.move_text.set(f"{detail} — hint only, play manually")
+        try:
+            self.window.deiconify()
+            self.window.lift()
+        except self.tk.TclError:
+            self._alive = False
+            return False
+        return True
+
     def clear_suggestion(self):
         self._cancel_animation()
         self.suggestion = None
+        self.premove_suggestion = None
+        self.move_label.configure(fg="#475569")
         self.move_text.set("Live position updated • waiting for the next hint")
         self._draw()
 
@@ -196,25 +264,60 @@ class MoveHintBoardPanel:
             self._animation_job = None
 
     def _schedule_animation(self):
-        if not self._alive or self.suggestion is None:
+        if (
+            not self._alive
+            or (self.suggestion is None and self.premove_suggestion is None)
+        ):
             return
         try:
-            self._animation_job = self.window.after(35, self._animate_tick)
+            self._animation_job = self.window.after(12, self._animate_tick)
         except self.tk.TclError:
             self._alive = False
 
     def _animate_tick(self):
         self._animation_job = None
-        if not self._alive or self.suggestion is None:
+        if (
+            not self._alive
+            or (self.suggestion is None and self.premove_suggestion is None)
+        ):
             return
-        self._animation_step = min(16, self._animation_step + 1)
+        self._animation_step = min(8, self._animation_step + 1)
         self._draw()
-        if self._animation_step < 16:
+        if self._animation_step < 8:
             self._schedule_animation()
 
     def _square_center(self, square: int, left: float, top: float, cell: float):
         col, row = square_to_display(square, self.bottom_side)
         return left + (col + 0.5) * cell, top + (row + 0.5) * cell
+
+    def _draw_arrow(self, hint: dict, color: str, progress: float,
+                    left: float, top: float, cell: float):
+        start = self._square_center(hint["from_square"], left, top, cell)
+        end = self._square_center(hint["to_square"], left, top, cell)
+        from_col, from_row = square_to_display(hint["from_square"], self.bottom_side)
+        to_col, to_row = square_to_display(hint["to_square"], self.bottom_side)
+        for col, row in ((from_col, from_row), (to_col, to_row)):
+            self.canvas.create_rectangle(
+                left + col * cell + 2, top + row * cell + 2,
+                left + (col + 1) * cell - 2, top + (row + 1) * cell - 2,
+                outline=color, width=4,
+            )
+        current_end = (
+            start[0] + (end[0] - start[0]) * progress,
+            start[1] + (end[1] - start[1]) * progress,
+        )
+        self.canvas.create_line(
+            start[0], start[1], current_end[0], current_end[1],
+            fill="#111827", width=max(7, int(cell * 0.15)),
+            capstyle="round",
+        )
+        self.canvas.create_line(
+            start[0], start[1], current_end[0], current_end[1],
+            fill=color, width=max(4, int(cell * 0.09)),
+            arrow="last" if progress >= 1.0 else "none",
+            arrowshape=(max(12, int(cell * 0.30)), max(14, int(cell * 0.32)), max(5, int(cell * 0.12))),
+            capstyle="round",
+        )
 
     def _draw(self):
         if not self._alive or not hasattr(self, "canvas") or chess is None:
@@ -283,32 +386,14 @@ class MoveHintBoardPanel:
                 )
 
             if self.suggestion is not None:
-                start = self._square_center(self.suggestion["from_square"], left, top, cell)
-                end = self._square_center(self.suggestion["to_square"], left, top, cell)
-                from_col, from_row = square_to_display(self.suggestion["from_square"], self.bottom_side)
-                to_col, to_row = square_to_display(self.suggestion["to_square"], self.bottom_side)
-                for col, row in ((from_col, from_row), (to_col, to_row)):
-                    self.canvas.create_rectangle(
-                        left + col * cell + 2, top + row * cell + 2,
-                        left + (col + 1) * cell - 2, top + (row + 1) * cell - 2,
-                        outline="#facc15", width=4,
-                    )
-                progress = self._animation_step / 16.0
-                current_end = (
-                    start[0] + (end[0] - start[0]) * progress,
-                    start[1] + (end[1] - start[1]) * progress,
+                self._draw_arrow(
+                    self.suggestion, "#facc15", self._animation_step / 8.0,
+                    left, top, cell,
                 )
-                self.canvas.create_line(
-                    start[0], start[1], current_end[0], current_end[1],
-                    fill="#111827", width=max(7, int(cell * 0.15)),
-                    capstyle="round",
-                )
-                self.canvas.create_line(
-                    start[0], start[1], current_end[0], current_end[1],
-                    fill="#facc15", width=max(4, int(cell * 0.09)),
-                    arrow="last" if progress >= 1.0 else "none",
-                    arrowshape=(max(12, int(cell * 0.30)), max(14, int(cell * 0.32)), max(5, int(cell * 0.12))),
-                    capstyle="round",
+            if self.premove_suggestion is not None:
+                self._draw_arrow(
+                    self.premove_suggestion, "#ef4444", self._animation_step / 8.0,
+                    left, top, cell,
                 )
         except self.tk.TclError:
             self._alive = False
