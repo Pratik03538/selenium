@@ -106,10 +106,13 @@ class MainBoardHintOverlay:
     def update_geometry(self, rect, bottom_side="white"):
         if not self.alive:
             return
-        self.bottom_side = "black" if str(bottom_side).lower() == "black" else "white"
+        next_side = "black" if str(bottom_side).lower() == "black" else "white"
         if not isinstance(rect, dict):
+            changed = self.rect is not None or next_side != self.bottom_side
+            self.bottom_side = next_side
             self.rect = None
-            self._sync()
+            if changed:
+                self._sync()
             return
         try:
             result = {
@@ -129,6 +132,9 @@ class MainBoardHintOverlay:
             self.rect = None
             self._sync()
             return
+        if result == self.rect and next_side == self.bottom_side:
+            return
+        self.bottom_side = next_side
         self.rect = result
         self._sync()
 
