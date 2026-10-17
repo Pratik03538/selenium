@@ -5806,6 +5806,7 @@ def main() -> int:
                                     print("[AUTO] Strategy calculation/submission failed; bounded retry remains available if no move was accepted.", flush=True)
                             elif (
                                 args.auto_play
+                                and args.move_output != "hint"
                                 and args.premove_enabled
                                 and active_bot_color in {"white", "black"}
                                 and not side_matches_bot
