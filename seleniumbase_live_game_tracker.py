@@ -4412,7 +4412,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--move-input", choices=("api", "cursor"), default=None, help="Move submission method; defaults to cursor; can also be set with move_input=api|cursor in tracker_settings.txt.")
     parser.add_argument(
         "--move-output", choices=("hint", "execute"), default="hint",
-        help="Show selected moves as animated arrows in a separate transparent overlay above the configured test board (default), or execute them on the authorized test site.",
+        help="Show persistent right-click arrows on the configured authorized board plus streamer-style text analysis (default), or execute moves on that authorized test site.",
     )
     premove_group = parser.add_mutually_exclusive_group()
     premove_group.add_argument("--premove", dest="premove_enabled", action="store_true", help="Try best-effort premoves on the configured authorized site.")
@@ -4816,13 +4816,20 @@ def main() -> int:
                                 flush=True,
                             )
 
+                        def on_board_arrow(move, color, position_fen, bottom_side, board_rect):
+                            return draw_native_board_arrow(
+                                driver, allowed_host, move, color,
+                                position_fen, bottom_side, board_rect,
+                            )
+
                         hint_panel = MoveHintBoardPanel(
                             settings_window.root,
                             initial_mode=args.move_output,
                             on_mode_change=on_move_output_change,
+                            on_board_arrow=on_board_arrow,
                         )
                         hint_panel.show()
-                        print("[HINT] Separate animated move-hint board opened. Use its button or F8 to switch modes.", flush=True)
+                        print("[HINT] Native right-click board arrows and compact translucent analysis panel are ready.", flush=True)
                     except Exception:
                         print("[HINT] Hint panel could not be opened; hint mode remains non-executing.", flush=True)
             except Exception:
@@ -5732,40 +5739,8 @@ def main() -> int:
                                     if chosen_move is None or chosen_move not in engine_board.legal_moves:
                                         raise RuntimeError("ChessKida selector did not return a legal move.")
 
-                                    # The candidate move has already been selected. In Hint
-                                    # mode only, briefly analyze the replies after that candidate
-                                    # so the coach panel lists opponent options + our continuation.
-                                    # This is display-only; it does not alter selection or submission.
-                                    if (
-                                        args.move_output == "hint"
-                                        and hint_panel is not None
-                                        and engine is not None
-                                        and not engine_board.is_game_over(claim_draw=True)
-                                    ):
-                                        coach_board = engine_board.copy(stack=True)
-                                        coach_board.push(chosen_move)
-                                        # Dedupe against the resulting board position, so the
-                                        # same opponent options are not replayed when the board
-                                        # observer catches up after the hinted move is played.
-                                        coach_key = f"{game_number}:{coach_board.fen()}"
-                                        if coach_key != last_coach_analysis_key:
-                                            try:
-                                                coach_infos = engine.analyse(
-                                                    coach_board,
-                                                    chess.engine.Limit(depth=8, time=0.025),
-                                                    multipv=3,
-                                                )
-                                                hint_panel.set_coach_variations(
-                                                    fen, coach_infos,
-                                                    analysis_fen=coach_board.fen(),
-                                                )
-                                            except (
-                                                chess.engine.EngineError, ValueError,
-                                                TypeError, RuntimeError,
-                                            ):
-                                                pass
-                                            finally:
-                                                last_coach_analysis_key = coach_key
+                                    # Hint-mode analysis for the hypothetical post-move board is intentionally
+                                    # not drawn here: its squares do not yet match the visible live board.
 
                                     chosen_san = engine_board.san(chosen_move)
                                     rank = selection_meta.get("rank") if isinstance(selection_meta, dict) else None
@@ -5823,6 +5798,16 @@ def main() -> int:
                                                 fen, chosen_move.uci(), chosen_san,
                                                 rank=dashboard_rank, reason=reason,
                                             )
+                                            # Reuse this position's MultiPV results for the streamer
+                                            # analysis; selection/submission logic is not changed.
+                                            if engine_result:
+                                                try:
+                                                    hint_panel.set_coach_variations(
+                                                        fen, engine_result,
+                                                        analysis_fen=fen, perspective="you",
+                                                    )
+                                                except (ValueError, TypeError, RuntimeError):
+                                                    pass
                                         move_retry_gate.finish({"ok": True, "confirmed": True})
                                         hint_status = "Hint shown" if hint_shown else "Hint unavailable"
                                         if settings_window is not None:
