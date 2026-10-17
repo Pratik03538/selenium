@@ -572,7 +572,7 @@ class MoveHintBoardPanel:
             return
         self._show_auto_coach_step()
         try:
-            self.coach_play_job = self.window.after(180, self._advance_auto_coach_step)
+            self.coach_play_job = self.window.after(150, self._advance_auto_coach_step)
         except self.tk.TclError:
             self._stop_coach_playback(clear_arrow=True)
 
