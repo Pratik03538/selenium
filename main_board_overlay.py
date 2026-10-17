@@ -273,7 +273,7 @@ class MainBoardHintOverlay:
         )
         self.canvas.create_line(
             start[0], start[1], end[0], end[1],
-            fill="#111827", width=line_width + 3, capstyle="round",
+            fill="#111827", width=line_width + max(1, int(3 * size_scale)), capstyle="round",
         )
         self.canvas.create_line(
             start[0], start[1], end[0], end[1],
