@@ -4780,10 +4780,28 @@ def main() -> int:
                                 flush=True,
                             )
 
+                        def on_hint_change(position_fen, uci, bottom_side, color):
+                            # The SVG is rendered inside the authorized test page,
+                            # so the arrow follows its live board and remains part
+                            # of the ordinary browser window. It is not a new OS window.
+                            try:
+                                if not uci:
+                                    return bool(driver.execute_script(
+                                        "return window.__liveGameApiReader?.clearMoveHint?.() || false"
+                                    ))
+                                return bool(driver.execute_script(
+                                    "return window.__liveGameApiReader?.showMoveHint?.("
+                                    "arguments[0], arguments[1], arguments[2], arguments[3]) || false",
+                                    position_fen, uci, bottom_side, color,
+                                ))
+                            except (WebDriverException, RuntimeError, TypeError):
+                                return False
+
                         hint_panel = MoveHintBoardPanel(
                             settings_window.root,
                             initial_mode=args.move_output,
                             on_mode_change=on_move_output_change,
+                            on_hint_change=on_hint_change,
                         )
                         hint_panel.show()
                         print("[HINT] Separate animated move-hint board opened. Use its button or F8 to switch modes.", flush=True)
