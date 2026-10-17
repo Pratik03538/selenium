@@ -59,6 +59,20 @@ class MainBoardHintOverlay:
             style |= 0x00000080  # WS_EX_TOOLWINDOW: omit taskbar button
             style |= 0x08000000  # WS_EX_NOACTIVATE: keep browser focus
             set_style(hwnd, -20, style)
+
+            # Explicitly tell Windows which exact RGB color is transparent.
+            # Tk can accept -transparentcolor without reliably applying the
+            # native color key on every Windows/Tk build; without this call,
+            # the full overlay rectangle can appear black over the board.
+            set_layered = user32.SetLayeredWindowAttributes
+            set_layered.argtypes = [
+                wintypes.HWND, ctypes.c_ulong, ctypes.c_ubyte, ctypes.c_ulong
+            ]
+            set_layered.restype = wintypes.BOOL
+            color_key = 0x00030201  # COLORREF for #010203 (RGB byte order)
+            if not set_layered(hwnd, color_key, 0, 0x00000001):  # LWA_COLORKEY
+                raise OSError("Could not enable the overlay transparency color key")
+
             user32.SetWindowPos(
                 hwnd, wintypes.HWND(-1), 0, 0, 0, 0,
                 0x0002 | 0x0001 | 0x0010 | 0x0040,
