@@ -76,10 +76,12 @@ def square_to_display(square: int, bottom_side: str = "white") -> tuple[int, int
 class MoveHintBoardPanel:
     """Tk top-level chessboard that mirrors a FEN and animates a suggested move."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, initial_mode="hint", on_mode_change=None):
         import tkinter as tk
 
         self.tk = tk
+        self.on_mode_change = on_mode_change
+        self.mode = "execute" if str(initial_mode).lower() in {"execute", "autoplay"} else "hint"
         self.window = tk.Toplevel(parent)
         self.window.title("Move Hint Board — Manual Play")
         self.window.geometry("660x735")
@@ -119,6 +121,21 @@ class MoveHintBoardPanel:
         )
         self.move_label.pack(fill="x", padx=12, pady=(0, 6))
 
+        self.mode_button = tk.Button(
+            self.window,
+            text="",
+            command=self.toggle_mode,
+            font=("Segoe UI", 10, "bold"),
+            padx=12, pady=5,
+            bg="#1d4ed8", fg="white",
+            activebackground="#1e40af", activeforeground="white",
+            relief="flat", cursor="hand2",
+        )
+        self.mode_button.pack(fill="x", padx=12, pady=(0, 8))
+        self._refresh_mode_button()
+        self.window.bind_all("<F8>", self._handle_mode_shortcut, add="+")
+        self.window.bind("<F8>", self._handle_mode_shortcut, add="+")
+
         self.canvas = tk.Canvas(
             self.window, width=620, height=620,
             background="#f4f6f8", highlightthickness=0,
@@ -126,6 +143,43 @@ class MoveHintBoardPanel:
         self.canvas.pack(fill="both", expand=True, padx=8, pady=(0, 8))
         self.canvas.bind("<Configure>", lambda _event: self._draw())
         self.window.withdraw()
+
+    def _refresh_mode_button(self):
+        if self.mode == "hint":
+            self.mode_button.configure(
+                text="MODE: HINT  ·  Switch to AUTOPLAY  [F8]",
+                bg="#1d4ed8", activebackground="#1e40af",
+            )
+        else:
+            self.mode_button.configure(
+                text="MODE: AUTOPLAY  ·  Switch to HINT  [F8]",
+                bg="#b91c1c", activebackground="#991b1b",
+            )
+
+    def toggle_mode(self, _event=None):
+        """Toggle only the move-output path; existing move selection is untouched."""
+        if not self._alive:
+            return "break"
+        next_mode = "execute" if self.mode == "hint" else "hint"
+        self.mode = next_mode
+        self._refresh_mode_button()
+        self.clear_suggestion()
+        if next_mode == "execute":
+            self.move_text.set(
+                "AUTOPLAY MODE • existing bot output is active on the configured authorized test site"
+            )
+            self.move_label.configure(fg="#b91c1c")
+        else:
+            self.move_text.set(
+                "HINT MODE • selected moves are shown here; play them manually on the original board"
+            )
+            self.move_label.configure(fg="#166534")
+        if callable(self.on_mode_change):
+            self.on_mode_change(next_mode)
+        return "break"
+
+    def _handle_mode_shortcut(self, _event=None):
+        return self.toggle_mode()
 
     def show(self):
         if not self._alive:
