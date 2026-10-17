@@ -92,7 +92,8 @@ def build_coach_variations(board_fen: str, engine_infos, max_lines: int = 3, max
         raise RuntimeError("python-chess is required for tactical coaching.")
     root = chess.Board(str(board_fen))
     variations = []
-    for info in list(engine_infos or [])[:max(1, min(int(max_lines), 8))]:
+    normalized_infos = [engine_infos] if isinstance(engine_infos, dict) else list(engine_infos or [])
+    for info in normalized_infos[:max(1, min(int(max_lines), 8))]:
         if not isinstance(info, dict):
             continue
         pv = list(info.get("pv") or [])
@@ -122,6 +123,9 @@ def build_coach_variations(board_fen: str, engine_infos, max_lines: int = 3, max
                 notes.append(f"promotes to {chess.piece_name(move.promotion)}")
             piece_before = board.piece_at(move.from_square)
             moving_side = board.turn
+            under_attack_before = bool(
+                piece_before and board.is_attacked_by(not moving_side, move.from_square)
+            )
             side = "white" if moving_side == chess.WHITE else "black"
             from_square, to_square = move.from_square, move.to_square
 
@@ -136,6 +140,13 @@ def build_coach_variations(board_fen: str, engine_infos, max_lines: int = 3, max
                 notes.append("kingside castle" if chess.square_file(move.to_square) == 6 else "queenside castle")
 
             board.push(move)
+            if (
+                under_attack_before and piece_before is not None
+                and not board.is_attacked_by(board.turn, to_square)
+            ):
+                notes.append(
+                    f"moves {chess.piece_name(piece_before.piece_type)} out of attack"
+                )
             if board.is_checkmate():
                 notes.append("checkmate")
             elif board.is_check():
@@ -214,6 +225,29 @@ def build_coach_variations(board_fen: str, engine_infos, max_lines: int = 3, max
             "root_fen": str(board_fen),
         })
     return variations
+
+
+def classify_variation_risk(variations, threshold_cp: int = 150):
+    """Return the best scored line and the clearest losing candidate, if any."""
+    lines = list(variations or [])
+    scored = [
+        line for line in lines
+        if isinstance(line, dict) and isinstance(line.get("score_cp"), (int, float))
+    ]
+    if not scored:
+        return (lines[0] if lines else None), None, None
+    best = max(scored, key=lambda line: float(line["score_cp"]))
+    best_cp = float(best["score_cp"])
+    danger = []
+    for line in scored:
+        mate = line.get("mate_distance")
+        drop_cp = best_cp - float(line["score_cp"])
+        if (mate is not None and int(mate) < 0) or drop_cp >= max(1, int(threshold_cp)):
+            item = dict(line)
+            item["drop_cp"] = max(0.0, drop_cp)
+            danger.append(item)
+    bad = min(danger, key=lambda line: float(line.get("score_cp", 0))) if danger else None
+    return best, bad, best_cp
 
 
 class MoveHintBoardPanel:
@@ -364,21 +398,7 @@ class MoveHintBoardPanel:
         return str(line.get("score") or "eval n/a")
 
     def _risk_lines(self, lines, threshold_cp=150):
-        scored = [line for line in lines if isinstance(line.get("score_cp"), (int, float))]
-        if not scored:
-            return (lines[0] if lines else None), None, None
-        best = max(scored, key=lambda line: float(line["score_cp"]))
-        best_cp = float(best["score_cp"])
-        danger = []
-        for line in scored:
-            mate = line.get("mate_distance")
-            drop_cp = best_cp - float(line["score_cp"])
-            if (mate is not None and int(mate) < 0) or drop_cp >= threshold_cp:
-                line = dict(line)
-                line["drop_cp"] = max(0.0, drop_cp)
-                danger.append(line)
-        bad = min(danger, key=lambda line: float(line.get("score_cp", 0))) if danger else None
-        return best, bad, best_cp
+        return classify_variation_risk(lines, threshold_cp=threshold_cp)
 
     def _summary_text(self, lines, perspective, best_line, bad_line, best_cp):
         actor = "YOUR" if perspective == "you" else "OPPONENT"
@@ -406,7 +426,10 @@ class MoveHintBoardPanel:
                 loss = f"eval drops about {float(bad_line['drop_cp']) / 100:.1f} pawns vs best"
             else:
                 loss = "engine marks this line as dangerous"
-            rows.insert(1, f"AVOID {bad_move}: {loss}; line continues {response}")
+            reply_explanation = ""
+            if len(moves) > 1 and (moves[1].get("notes") or []):
+                reply_explanation = " (" + str(moves[1].get("explanation") or "") + ")"
+            rows.insert(1, f"AVOID {bad_move}: {loss}; line continues {response}{reply_explanation}")
         elif best_line and best_line.get("score_cp") is not None:
             rows.insert(1, "No clear blunder among these top lines at the current search depth.")
         return "\n".join(rows[:5])
