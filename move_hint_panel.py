@@ -17,6 +17,11 @@ PIECE_GLYPHS = {
 }
 
 
+def toggle_output_mode(mode: str) -> str:
+    """Return the other supported output mode without changing bot strategy."""
+    return "execute" if str(mode).strip().lower() in {"hint", "manual"} else "hint"
+
+
 def build_hint(board_fen: str, uci: str, san: str | None = None) -> dict:
     """Validate and describe a strategy-selected move without submitting it."""
     if chess is None:
@@ -160,7 +165,7 @@ class MoveHintBoardPanel:
         """Toggle only the move-output path; existing move selection is untouched."""
         if not self._alive:
             return "break"
-        next_mode = "execute" if self.mode == "hint" else "hint"
+        next_mode = toggle_output_mode(self.mode)
         self.mode = next_mode
         self._refresh_mode_button()
         self.clear_suggestion()
