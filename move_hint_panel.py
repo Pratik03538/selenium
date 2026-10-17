@@ -108,15 +108,36 @@ def build_coach_variations(board_fen: str, engine_infos, max_lines: int = 5, max
             if move not in board.legal_moves:
                 break
             san = board.san(move)
+            notes = []
+            if board.is_capture(move):
+                if board.is_en_passant(move):
+                    notes.append("captures pawn en passant")
+                else:
+                    captured = board.piece_at(move.to_square)
+                    notes.append(
+                        f"captures {chess.piece_name(captured.piece_type)}"
+                        if captured else "capture"
+                    )
+            if move.promotion:
+                notes.append(f"promotes to {chess.piece_name(move.promotion)}")
+            if board.is_castling(move):
+                notes.append("kingside castle" if chess.square_file(move.to_square) == 6 else "queenside castle")
+            side = "white" if board.turn == chess.WHITE else "black"
+            from_square, to_square = move.from_square, move.to_square
+            board.push(move)
+            if board.is_checkmate():
+                notes.append("checkmate")
+            elif board.is_check():
+                notes.append("check")
             steps.append({
                 "uci": move.uci(),
                 "san": san,
-                "from_square": move.from_square,
-                "to_square": move.to_square,
-                "side": "white" if board.turn == chess.WHITE else "black",
+                "from_square": from_square,
+                "to_square": to_square,
+                "side": side,
                 "ply": len(steps) + 1,
+                "notes": notes,
             })
-            board.push(move)
         if not steps:
             continue
 
@@ -527,11 +548,13 @@ class MoveHintBoardPanel:
             self.overlay.set_enabled(False)
         else:
             self.overlay.set_enabled(False)
-        actor = "You / candidate side" if self.coach_step_index % 2 == 0 else "Opponent reply"
+        actor = "Candidate-side move" if self.coach_step_index % 2 == 0 else "Opponent reply / continuation"
+        note_text = "; ".join(move.get("notes") or [])
+        tactical_note = f" Tactical note: {note_text}." if note_text else ""
         self.coach_step_status.set(
             f"Step {self.coach_step_index + 1}/{len(line['moves'])}: "
-            f"{actor} plays {move['san']} ({move['uci'][:2]} → {move['uci'][2:4]}). "
-            f"Yellow = candidate move; cyan = reply/continuation."
+            f"{actor} plays {move['san']} ({move['uci'][:2]} → {move['uci'][2:4]})."
+            f"{tactical_note} Yellow = candidate move; cyan = reply/continuation."
         )
 
     def _step_coach(self, delta):
