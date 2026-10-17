@@ -5415,34 +5415,26 @@ def main() -> int:
                                         flush=True,
                                     )
 
-                            # When Tactical Coach is open and it is the opponent's
-                            # turn, do a very short display-only MultiPV search. This keeps
-                            # the coach updating after either player's move without touching
-                            # the existing bot move-selection or submission branch.
+                            # Hint mode always previews the opponent's top three legal moves.
+                            # This short display-only search never selects or submits a move.
                             if (
                                 not our_turn
                                 and args.move_output == "hint"
                                 and hint_panel is not None
-                                and hint_panel.is_coach_open()
                                 and engine is not None
-                                and strategy_module is not None
                                 and not engine_board.is_game_over(claim_draw=True)
                             ):
                                 coach_key = f"{game_number}:{fen}"
                                 if coach_key != last_coach_analysis_key:
                                     try:
-                                        coach_multipv = max(
-                                            2, min(
-                                                4,
-                                                int(getattr(strategy_module, "TRAINING_MULTI_PV", 4)),
-                                            )
-                                        )
                                         coach_infos = engine.analyse(
                                             engine_board.copy(stack=True),
-                                            chess.engine.Limit(depth=8, time=0.035),
-                                            multipv=coach_multipv,
+                                            chess.engine.Limit(depth=8, time=0.025),
+                                            multipv=3,
                                         )
-                                        hint_panel.set_coach_variations(fen, coach_infos)
+                                        hint_panel.set_coach_variations(
+                                            fen, coach_infos, analysis_fen=fen,
+                                        )
                                     except (
                                         chess.engine.EngineError, ValueError,
                                         TypeError, RuntimeError,
@@ -5636,14 +5628,37 @@ def main() -> int:
                                     if chosen_move is None or chosen_move not in engine_board.legal_moves:
                                         raise RuntimeError("ChessKida selector did not return a legal move.")
 
-                                    # Tactical Coach consumes the already-computed MultiPV
-                                    # lines only; it does not run another search or change
-                                    # the selected move, its timing, or its submission path.
-                                    if hint_panel is not None:
-                                        try:
-                                            hint_panel.set_coach_variations(fen, engine_result)
-                                        except (ValueError, TypeError, RuntimeError):
-                                            pass
+                                    # The candidate move has already been selected. In Hint
+                                    # mode only, briefly analyze the replies after that candidate
+                                    # so the coach panel lists opponent options + our continuation.
+                                    # This is display-only; it does not alter selection or submission.
+                                    if (
+                                        args.move_output == "hint"
+                                        and hint_panel is not None
+                                        and engine is not None
+                                        and not engine_board.is_game_over(claim_draw=True)
+                                    ):
+                                        coach_key = f"{game_number}:{fen}:after:{chosen_move.uci()}"
+                                        if coach_key != last_coach_analysis_key:
+                                            try:
+                                                coach_board = engine_board.copy(stack=True)
+                                                coach_board.push(chosen_move)
+                                                coach_infos = engine.analyse(
+                                                    coach_board,
+                                                    chess.engine.Limit(depth=8, time=0.025),
+                                                    multipv=3,
+                                                )
+                                                hint_panel.set_coach_variations(
+                                                    fen, coach_infos,
+                                                    analysis_fen=coach_board.fen(),
+                                                )
+                                            except (
+                                                chess.engine.EngineError, ValueError,
+                                                TypeError, RuntimeError,
+                                            ):
+                                                pass
+                                            finally:
+                                                last_coach_analysis_key = coach_key
 
                                     chosen_san = engine_board.san(chosen_move)
                                     rank = selection_meta.get("rank") if isinstance(selection_meta, dict) else None
