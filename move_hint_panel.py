@@ -1,7 +1,7 @@
-"""Separate animated mirror board for manual move hints on an authorized test site.
+"""Controls for displaying legal move hints directly on the authorized test board.
 
-The panel never interacts with the source board. It mirrors FEN snapshots and
-renders an animated arrow for a legal move selected by the existing strategy.
+The existing move-selection strategy remains in the tracker. This module only
+validates the suggested move and manages hint/autoplay and visibility controls.
 """
 from __future__ import annotations
 
@@ -20,6 +20,11 @@ PIECE_GLYPHS = {
 def toggle_output_mode(mode: str) -> str:
     """Return the other supported output mode without changing bot strategy."""
     return "execute" if str(mode).strip().lower() in {"hint", "manual"} else "hint"
+
+
+def toggle_hint_visibility(enabled: bool) -> bool:
+    """Return the opposite visibility state for the main-board hint overlay."""
+    return not bool(enabled)
 
 
 def build_hint(board_fen: str, uci: str, san: str | None = None) -> dict:
