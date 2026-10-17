@@ -84,13 +84,14 @@ def square_to_display(square: int, bottom_side: str = "white") -> tuple[int, int
 
 
 class MoveHintBoardPanel:
-    """Separate control window; draws move suggestions on the actual board page."""
+    """Controls for a native overlay aligned with the live board window."""
 
     def __init__(self, parent, initial_mode="hint", on_mode_change=None, on_hint_change=None):
         import tkinter as tk
+        from main_board_overlay import MainBoardHintOverlay
+
         self.tk = tk
         self.on_mode_change = on_mode_change
-        self.on_hint_change = on_hint_change
         self.mode = "execute" if str(initial_mode).lower() in {"execute", "autoplay"} else "hint"
         self.hint_visible = True
         self.fen = ""
@@ -99,6 +100,7 @@ class MoveHintBoardPanel:
         self.suggestion = None
         self.premove_suggestion = None
         self._alive = True
+        self.overlay = MainBoardHintOverlay(parent)
 
         self.window = tk.Toplevel(parent)
         self.window.title("Board Hint Controls")
@@ -112,9 +114,8 @@ class MoveHintBoardPanel:
         ).pack(fill="x", padx=12, pady=(12, 4))
         tk.Label(
             self.window,
-            text="Move arrows are drawn on the live board. This window is only for controls.",
-            font=("Segoe UI", 9), bg="#f4f6f8", fg="#475569",
-            wraplength=450,
+            text="Arrows are a separate transparent overlay aligned over the live board.",
+            font=("Segoe UI", 9), bg="#f4f6f8", fg="#475569", wraplength=450,
         ).pack(fill="x", padx=12, pady=(0, 8))
         self.move_text = tk.StringVar(value="Waiting for live board position…")
         self.move_label = tk.Label(
@@ -129,8 +130,9 @@ class MoveHintBoardPanel:
         )
         self.mode_button.pack(fill="x", padx=12, pady=(0, 7))
         self.visibility_button = tk.Button(
-            self.window, text="", command=self.toggle_hint_visibility, font=("Segoe UI", 10, "bold"),
-            padx=12, pady=5, bg="#15803d", fg="white", activebackground="#166534",
+            self.window, text="", command=self.toggle_hint_visibility,
+            font=("Segoe UI", 10, "bold"), padx=12, pady=5,
+            bg="#15803d", fg="white", activebackground="#166534",
             activeforeground="white", relief="flat", cursor="hand2",
         )
         self.visibility_button.pack(fill="x", padx=12, pady=(0, 10))
@@ -166,34 +168,18 @@ class MoveHintBoardPanel:
                 bg="#475569", activebackground="#334155",
             )
 
-    def _send_hint(self, hint, color):
-        if not callable(self.on_hint_change):
-            return False
-        try:
-            return bool(self.on_hint_change(
-                self.fen, hint["uci"], self.bottom_side, color
-            ))
-        except Exception:
-            return False
-
-    def _clear_page_hint(self):
-        if callable(self.on_hint_change):
-            try:
-                self.on_hint_change(None, None, self.bottom_side, None)
-            except Exception:
-                pass
-
     def toggle_mode(self, _event=None):
         if not self._alive:
             return "break"
         self.mode = toggle_output_mode(self.mode)
         self._refresh_mode_button()
         self.clear_suggestion()
+        self.overlay.set_enabled(self.hint_visible and self.mode == "hint")
         if self.mode == "execute":
             self.move_text.set("AUTOPLAY MODE · existing bot output path is active")
             self.move_label.configure(fg="#b91c1c")
         else:
-            self.move_text.set("HINT MODE · move arrows appear on the live board")
+            self.move_text.set("HINT MODE · moves are shown over the main board")
             self.move_label.configure(fg="#166534")
         if callable(self.on_mode_change):
             self.on_mode_change(self.mode)
@@ -207,17 +193,15 @@ class MoveHintBoardPanel:
             return "break"
         self.hint_visible = toggle_hint_visibility(self.hint_visible)
         self._refresh_visibility_button()
+        self.overlay.set_enabled(self.hint_visible and self.mode == "hint")
         if not self.hint_visible:
-            self._clear_page_hint()
-            self.move_text.set("Hint overlay OFF · bot mode is unchanged")
+            self.move_text.set("Hint overlay OFF · bot output mode is unchanged")
         else:
             current = self.suggestion or self.premove_suggestion
             if self.mode == "hint" and current:
-                color = "red" if current is self.premove_suggestion else "yellow"
-                shown = self._send_hint(current, color)
-                self.move_text.set(
-                    "Hint overlay ON" if shown else "Hint overlay ON · waiting for board update"
-                )
+                color = "#ef4444" if self.premove_suggestion is current else "#facc15"
+                self.overlay.set_hint(current, self.bottom_side, color)
+                self.move_text.set("Hint overlay ON")
             else:
                 self.move_text.set("Hint overlay ON · waiting for the next hint")
         return "break"
@@ -246,7 +230,7 @@ class MoveHintBoardPanel:
         if not self._alive:
             return
         self._alive = False
-        self._clear_page_hint()
+        self.overlay.shutdown()
         try:
             self.window.destroy()
         except self.tk.TclError:
@@ -262,10 +246,11 @@ class MoveHintBoardPanel:
         side = "black" if str(bottom_side or "").strip().lower() == "black" else "white"
         changed = str(fen) != self.fen or side != self.bottom_side
         self.fen, self.board, self.bottom_side = str(fen), board, side
+        self.overlay.update_geometry(board_rect, side)
         if changed:
             self.suggestion = None
             self.premove_suggestion = None
-            self._clear_page_hint()
+            self.overlay.clear()
             self.move_text.set("Live position updated · waiting for the next hint")
             self.move_label.configure(fg="#475569")
 
@@ -280,17 +265,16 @@ class MoveHintBoardPanel:
             return False
         hint["rank"], hint["reason"] = str(rank or ""), str(reason or "")
         self.suggestion, self.premove_suggestion = hint, None
-        if not self.hint_visible:
+        if self.hint_visible:
+            self.overlay.set_hint(hint, self.bottom_side, "#facc15")
+            self.overlay.set_enabled(True)
+            detail = f"Suggested move: {hint['san']} · {hint['uci'][:2]} → {hint['uci'][2:4]}"
+            if hint["rank"]:
+                detail += f" · {hint['rank']}"
+            self.move_text.set(detail)
+            self.move_label.configure(fg="#166534")
+        else:
             self.move_text.set(f"Hint overlay OFF · selected {hint['san']}")
-            return True
-        if not self._send_hint(hint, "yellow"):
-            self.move_text.set("Hint selected · main-board overlay not available")
-            return False
-        detail = f"Suggested move: {hint['san']} · {hint['uci'][:2]} → {hint['uci'][2:4]}"
-        if hint["rank"]:
-            detail += f" · {hint['rank']}"
-        self.move_text.set(detail)
-        self.move_label.configure(fg="#166534")
         return True
 
     def set_premove_suggestion(self, position_fen: str, uci: str, predicted_reply_uci: str) -> bool:
@@ -301,22 +285,21 @@ class MoveHintBoardPanel:
         except (ValueError, RuntimeError):
             return False
         self.suggestion, self.premove_suggestion = None, hint
-        if not self.hint_visible:
+        if self.hint_visible:
+            self.overlay.set_hint(hint, self.bottom_side, "#ef4444")
+            self.overlay.set_enabled(True)
+            self.move_text.set(
+                f"RED PREMOVE: {hint['san']} · {hint['uci'][:2]} → {hint['uci'][2:4]} after {hint['predicted_reply_san']}"
+            )
+            self.move_label.configure(fg="#b91c1c")
+        else:
             self.move_text.set(f"Hint overlay OFF · premove {hint['san']}")
-            return True
-        if not self._send_hint(hint, "red"):
-            self.move_text.set("Premove selected · main-board overlay not available")
-            return False
-        self.move_text.set(
-            f"RED PREMOVE: {hint['san']} · {hint['uci'][:2]} → {hint['uci'][2:4]} after {hint['predicted_reply_san']}"
-        )
-        self.move_label.configure(fg="#b91c1c")
         return True
 
     def clear_suggestion(self):
         self.suggestion = None
         self.premove_suggestion = None
-        self._clear_page_hint()
+        self.overlay.clear()
         self.move_label.configure(fg="#475569")
         self.move_text.set("Live position updated · waiting for the next hint")
 
