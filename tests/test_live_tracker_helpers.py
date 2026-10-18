@@ -23,6 +23,7 @@ from seleniumbase_live_game_tracker import (
     infer_move_between_fens,
     premove_phase_allowed,
     reconstruct_history_from_dom_moves,
+    sync_dashboard_history,
     uci_move_reaches_fen,
 )
 
@@ -343,6 +344,49 @@ class DomHistoryRecoveryTests(unittest.TestCase):
         self.assertEqual(history[-1]["san"], "Bb5")
         self.assertEqual(history[-1]["game_ply"], str(len(sans)))
         self.assertIsNone(reconstruct_history_from_dom_moves(dom_moves[:-1], board.fen()))
+
+
+class DashboardHistorySyncTests(unittest.TestCase):
+    class FakeDashboard:
+        def __init__(self):
+            self.rows = {}
+
+        def record_observed_move(self, game_number, ply, move, eval_white_cp=None):
+            self.rows[(game_number, ply)] = {
+                "san": move.get("san"),
+                "uci": move.get("uci"),
+                "side": move.get("side"),
+            }
+
+    def test_syncs_every_observed_ply_without_requiring_bot_mode(self):
+        dashboard = self.FakeDashboard()
+        history = [
+            {"game_ply": "1", "san": "e4", "uci": "e2e4", "side": "white"},
+            {"game_ply": "2", "san": "e5", "uci": "e7e5", "side": "black"},
+            {"game_ply": "3", "san": "Nf3", "uci": "g1f3", "side": "white"},
+        ]
+
+        synced = sync_dashboard_history(dashboard, 2, history)
+
+        self.assertEqual(synced, 3)
+        self.assertEqual(len(dashboard.rows), 3)
+        self.assertEqual(dashboard.rows[(2, 1)]["san"], "e4")
+        self.assertEqual(dashboard.rows[(2, 2)]["san"], "e5")
+        self.assertEqual(dashboard.rows[(2, 3)]["san"], "Nf3")
+
+    def test_uses_history_index_when_ply_metadata_is_missing(self):
+        dashboard = self.FakeDashboard()
+        history = [
+            {"san": "d4", "uci": "d2d4", "side": "white"},
+            {"san": "d5", "uci": "d7d5", "side": "black"},
+        ]
+
+        self.assertEqual(sync_dashboard_history(dashboard, 1, history), 2)
+        self.assertIn((1, 1), dashboard.rows)
+        self.assertIn((1, 2), dashboard.rows)
+
+    def test_empty_history_is_safe(self):
+        self.assertEqual(sync_dashboard_history(self.FakeDashboard(), 1, []), 0)
 
 
 if __name__ == "__main__":
