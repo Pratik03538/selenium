@@ -368,6 +368,40 @@ def read_analyzer_autoplay_request(path: Path | None) -> bool | None:
     return value if isinstance(value, bool) else None
 
 
+def read_analyzer_move_reference(path: Path | None) -> dict[str, object] | None:
+    """Read one selected SHOW MOVE reference from the analyzer's private IPC file."""
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    reference = payload.get("move_reference") if isinstance(payload, dict) else None
+    if not isinstance(reference, dict):
+        return None
+    event_id = str(reference.get("event_id") or "").strip()
+    fen = str(reference.get("fen") or "").strip()
+    uci = str(reference.get("uci") or "").strip().lower()
+    if not event_id or not fen or not re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", uci):
+        return None
+    return reference
+
+
+def format_move_reference_label(reference: dict[str, object]) -> str:
+    """Return a compact, human-readable source/rank label for the dashboard."""
+    source = str(reference.get("source") or "CHESSKIDA").strip().upper().replace("_", " ")
+    if not source:
+        source = "CHESSKIDA"
+    try:
+        rank = int(reference.get("rank"))
+        rank_label = f"#{rank + 1}"
+    except (TypeError, ValueError):
+        rank_label = "FREE"
+    if source == "GM BOOK":
+        source = "BOOK"
+    return f"{source} {rank_label}"
+
+
 class RuntimeSettingsWindow:
     """Compact live dashboard and runtime controls for the current run."""
 
@@ -797,18 +831,20 @@ class RuntimeSettingsWindow:
             pass
 
     def _put_move(self, game_number, ply, side, san, rank=None,
-                  eval_white_cp=None, status="Observed"):
+                  eval_white_cp=None, status="Observed", row_suffix=None):
         try:
             game_number = int(game_number)
             ply = int(ply)
         except (TypeError, ValueError):
             return
-        key = (game_number, ply)
+        suffix = str(row_suffix or "").strip()
+        key = (game_number, ply, suffix) if suffix else (game_number, ply)
+        iid_suffix = f"_{suffix}" if suffix else ""
         row = self.move_rows.get(key)
         is_new = row is None
         if is_new:
             row = {
-                "iid": f"game{game_number}_ply{ply}",
+                "iid": f"game{game_number}_ply{ply}{iid_suffix}",
                 "game": game_number,
                 "ply": ply,
                 "side": side or "?",
@@ -854,6 +890,14 @@ class RuntimeSettingsWindow:
         self._put_move(
             game_number, ply, side, san, rank=rank,
             eval_white_cp=eval_white_cp, status=status,
+        )
+
+    def record_move_reference(self, game_number, ply, side, san, reference, eval_white_cp=None):
+        """Keep a SHOW MOVE reference beside—not in place of—the actual board move."""
+        self._put_move(
+            game_number, ply, side, san, rank=reference,
+            eval_white_cp=eval_white_cp, status="SHOW MOVE reference",
+            row_suffix="reference",
         )
 
     def record_observed_move(self, game_number, ply, move, eval_white_cp=None):
@@ -4683,6 +4727,7 @@ def main() -> int:
         last_dashboard_eval_fen = ""
         reconstructed_history: list[dict[str, str]] = []
         last_dashboard_history_signature = None
+        last_dashboard_reference_id = ""
         game_number = 1
         if chess is None:
             print("[NOTE] Full SAN move reconstruction needs python-chess: python -m pip install python-chess", flush=True)
@@ -5132,6 +5177,43 @@ def main() -> int:
                                 f"plies (game {game_number}; BOT-independent).",
                                 flush=True,
                             )
+
+                    # SHOW MOVE references come from the analyzer process. Keep them
+                    # in separate dashboard rows so actual board history is not overwritten.
+                    if settings_window is not None and chess is not None and fen:
+                        move_reference = read_analyzer_move_reference(autoplay_control_file)
+                        if isinstance(move_reference, dict):
+                            reference_id = str(move_reference.get("event_id") or "").strip()
+                            reference_fen = str(move_reference.get("fen") or "").strip()
+                            if (
+                                reference_id
+                                and reference_id != last_dashboard_reference_id
+                                and reference_fen == fen
+                            ):
+                                try:
+                                    reference_board = chess.Board(fen)
+                                    reference_move = chess.Move.from_uci(
+                                        str(move_reference.get("uci") or "").strip().lower()
+                                    )
+                                    if reference_move in reference_board.legal_moves:
+                                        selected_san = reference_board.san(reference_move)
+                                        selected_side = (
+                                            "White" if reference_board.turn == chess.WHITE else "Black"
+                                        )
+                                        selected_ply = reference_board.ply() + 1
+                                        reference_label = format_move_reference_label(move_reference)
+                                        settings_window.record_move_reference(
+                                            game_number, selected_ply, selected_side,
+                                            selected_san, reference_label,
+                                        )
+                                        print(
+                                            f"[DASHBOARD REFERENCE] {selected_san} | "
+                                            f"{reference_label} | ply={selected_ply}.",
+                                            flush=True,
+                                        )
+                                    last_dashboard_reference_id = reference_id
+                                except (ValueError, TypeError):
+                                    last_dashboard_reference_id = reference_id
 
                     # Keep a persistent python-chess board so the ChessKida strategy
                     # sees the same move_stack/history state as the original bot.
