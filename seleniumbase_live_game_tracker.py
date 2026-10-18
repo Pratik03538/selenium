@@ -390,6 +390,9 @@ class RuntimeSettingsWindow:
         self.cfg = cfg
         self.chosen_handle = chosen_handle
         self.stop_requested = False
+        self._resume_autoplay_after_show = bool(
+            getattr(args, "show_move_resume_autoplay", False)
+        )
         self.buttons = {}
         self.settings = {
             key: bool(getattr(args, key))
@@ -575,9 +578,13 @@ class RuntimeSettingsWindow:
         was_auto_play = bool(self.settings.get("auto_play"))
         self.settings[key] = not self.settings[key]
         setattr(self.args, key, self.settings[key])
+        if key in {"auto_play", "show_move_mode"}:
+            self.args._move_mode_changed = True
 
         # Move submission and show-only mode are mutually exclusive.
         if key == "show_move_mode" and self.settings[key]:
+            self._resume_autoplay_after_show = was_auto_play
+            self.args.show_move_resume_autoplay = was_auto_play
             if was_auto_play:
                 self.settings["auto_play"] = False
                 self.args.auto_play = False
@@ -599,6 +606,8 @@ class RuntimeSettingsWindow:
             if self.settings.get("show_move_mode"):
                 self.settings["show_move_mode"] = False
                 self.args.show_move_mode = False
+                self._resume_autoplay_after_show = False
+                self.args.show_move_resume_autoplay = False
                 self.refresh_button("show_move_mode")
                 clear_board_move_arrow(self.driver)
                 print("[SETTINGS] SHOW MOVE ONLY -> OFF (BOT selected).", flush=True)
@@ -607,10 +616,18 @@ class RuntimeSettingsWindow:
             self.status.set("Bot is OFF; the live reader and dashboard remain active.")
         elif key == "show_move_mode" and not self.settings[key]:
             clear_result = clear_board_move_arrow(self.driver)
-            if isinstance(clear_result, dict) and clear_result.get("ok"):
-                self.status.set("SHOW MOVE is OFF. The current hint arrow was cleared when possible.")
+            resume_autoplay = bool(self._resume_autoplay_after_show)
+            self.settings["auto_play"] = resume_autoplay
+            self.args.auto_play = resume_autoplay
+            self.refresh_button("auto_play")
+            self._resume_autoplay_after_show = False
+            self.args.show_move_resume_autoplay = False
+            if resume_autoplay:
+                self.status.set("SHOW MOVE is OFF. Restoring the BOT state that was active before show mode.")
+            elif isinstance(clear_result, dict) and clear_result.get("ok"):
+                self.status.set("SHOW MOVE is OFF. BOT remains OFF; the current hint arrow was cleared when possible.")
             else:
-                self.status.set("SHOW MOVE is OFF. Any board arrow can be cleared using the board's normal annotation gesture.")
+                self.status.set("SHOW MOVE is OFF. BOT remains OFF; any board arrow can be cleared using the board's normal annotation gesture.")
 
         self.refresh_button(key)
         state = "ON" if self.settings[key] else "OFF"
@@ -4631,8 +4648,11 @@ def main() -> int:
         show_setting = load_optional_txt_setting("show_move_mode").strip().lower()
         args.show_move_mode = show_setting in {"1", "true", "yes", "on", "enabled"}
     if args.show_move_mode and args.auto_play:
+        args.show_move_resume_autoplay = True
         args.auto_play = False
-        print("[CONFIG] Show Move Only is ON; autoplay is forced OFF.", flush=True)
+        print("[CONFIG] Show Move Only is ON; autoplay is paused until show mode is turned off.", flush=True)
+    else:
+        args.show_move_resume_autoplay = False
     print(f"[CONFIG] Show Move Only: {'enabled' if args.show_move_mode else 'disabled'}.", flush=True)
     if args.move_input is None:
         args.move_input = load_optional_txt_setting("move_input").strip().lower() or "cursor"
@@ -4979,11 +4999,20 @@ def main() -> int:
                 print("[GUI] Runtime settings window could not be opened; continuing with TXT/CLI settings.", flush=True)
 
             while True:
+                mode_changed = False
                 if settings_window is not None:
                     settings_window.pump()
                     if settings_window.stop_requested:
                         print("[STOP] Stop requested from runtime settings window.", flush=True)
                         break
+                if bool(getattr(args, "_move_mode_changed", False)):
+                    mode_changed = True
+                    args._move_mode_changed = False
+                    move_retry_gate = MoveAttemptRetryGate()
+                    last_auto_attempt_fen = ""
+                    last_premove_attempt_fen = ""
+                    last_low_clock_premove_fen = ""
+                    last_premove_gate_report_fen = ""
                 # If Bot was OFF at startup, initialize the engine only when it is switched ON.
                 if (args.auto_play or args.show_move_mode) and engine is None:
                     try:
@@ -5030,6 +5059,17 @@ def main() -> int:
                 except WebDriverException:
                     print("[STOP] Browser tab closed or DevTools disconnected. No URL was logged.", flush=True)
                     break
+
+                if mode_changed and not events:
+                    try:
+                        mode_snapshot = driver.execute_script(
+                            "return window.__liveGameApiReader ? "
+                            "window.__liveGameApiReader.current() : null;"
+                        )
+                    except WebDriverException:
+                        mode_snapshot = None
+                    if isinstance(mode_snapshot, dict):
+                        events = [mode_snapshot]
 
                 # If the queue is quiet, re-read the authoritative state when a retry is due.
                 if (
