@@ -517,6 +517,8 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
             compact = "MATE"
         elif "check" in note.lower():
             compact += "+"
+        elif "castles" in note:
+            compact += " CASTLE"
 
         if abs(step_delta) < 0.04:
             delta_compact = "Δ≈0.00"
@@ -531,15 +533,7 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
             "uci": current_move.uci(),
             "eval": compact,
         })
-        detail = f"{index}. {label.replace(' ', '', 1)} {compact} {delta_compact}"
-        if capture_tag:
-            detail += f" {capture_tag}"
-        if "CHECKMATE" in note:
-            detail += " MATE"
-        elif "check" in note.lower():
-            detail += " CHECK"
-        elif "castles" in note:
-            detail += " CASTLE"
+        detail = f"{index}· {label.replace(' ', '', 1)} {compact} {delta_compact}"
         details.append(detail[:58])
         previous_score = current_score
 
@@ -566,7 +560,6 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
         if eval_board.is_checkmate():
             break
 
-    end_eval = details[-1].split(" ", 2)[2] if details else starting_eval
     title = f"{from_sq}→{to_sq} · {starting_eval} · continuation arrows: {drawn_count}"
     try:
         result = driver.execute_script(
