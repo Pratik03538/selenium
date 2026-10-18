@@ -1,6 +1,9 @@
 """Regression tests for the live tracker safety and history helpers."""
+import json
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import chess
@@ -24,6 +27,8 @@ from seleniumbase_live_game_tracker import (
     premove_phase_allowed,
     reconstruct_history_from_dom_moves,
     sync_dashboard_history,
+    read_analyzer_move_reference,
+    format_move_reference_label,
     uci_move_reaches_fen,
 )
 
@@ -344,6 +349,55 @@ class DomHistoryRecoveryTests(unittest.TestCase):
         self.assertEqual(history[-1]["san"], "Bb5")
         self.assertEqual(history[-1]["game_ply"], str(len(sans)))
         self.assertIsNone(reconstruct_history_from_dom_moves(dom_moves[:-1], board.fen()))
+
+
+
+class DashboardMoveReferenceTests(unittest.TestCase):
+    def test_reads_move_reference_and_formats_source_rank(self):
+        reference_payload = {
+            "autoplay_enabled": False,
+            "move_reference": {
+                "event_id": "test-event-1",
+                "fen": chess.Board().fen(),
+                "uci": "e2e4",
+                "san": "e4",
+                "ply": 1,
+                "side": "White",
+                "rank": 1,
+                "source": "CHESSKIDA",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            path.write_text(json.dumps(reference_payload), encoding="utf-8")
+            reference = read_analyzer_move_reference(path)
+
+        self.assertIsNotNone(reference)
+        self.assertEqual(reference["uci"], "e2e4")
+        self.assertEqual(format_move_reference_label(reference), "CHESSKIDA #2")
+
+    def test_book_reference_uses_book_label(self):
+        self.assertEqual(
+            format_move_reference_label({"source": "GM_BOOK", "rank": 0}),
+            "BOOK #1",
+        )
+
+    def test_rejects_invalid_or_missing_reference(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "mode.json"
+            path.write_text(json.dumps({"autoplay_enabled": False}), encoding="utf-8")
+            self.assertIsNone(read_analyzer_move_reference(path))
+            path.write_text(
+                json.dumps({
+                    "move_reference": {
+                        "event_id": "bad-event",
+                        "fen": chess.Board().fen(),
+                        "uci": "not-a-uci",
+                    }
+                }),
+                encoding="utf-8",
+            )
+            self.assertIsNone(read_analyzer_move_reference(path))
 
 
 class DashboardHistorySyncTests(unittest.TestCase):
