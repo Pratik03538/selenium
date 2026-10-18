@@ -405,6 +405,19 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
             compact = "MATE B"
         elif compact == "Draw":
             compact = "DRAW"
+        if "captures" in note:
+            captured_piece = next(
+                (piece for piece in ("queen", "rook", "bishop", "knight", "pawn") if piece in note),
+                "",
+            )
+            captured_side = "W" if "captures White " in note else ("B" if "captures Black " in note else "")
+            piece_letter = {"queen": "Q", "rook": "R", "bishop": "B", "knight": "N", "pawn": "P"}.get(captured_piece, "")
+            if piece_letter:
+                compact += f" x{captured_side}{piece_letter}"
+        if "CHECKMATE" in note:
+            compact = "MATE"
+        elif "check" in note.lower():
+            compact += "+"
         board_labels.append({"number": index, "uci": current_move.uci(), "eval": compact})
         previous_score = current_score
 
