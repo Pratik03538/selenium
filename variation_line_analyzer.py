@@ -347,6 +347,10 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
         status_var.set("Current board FEN could not be read.")
         return
     clear_generated(driver, generated)
+    try:
+        driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
+    except Exception:
+        pass
     uci = from_sq + to_sq
     move = chess.Move.from_uci(uci)
     if move not in board.legal_moves:
@@ -473,6 +477,8 @@ def main() -> int:
     args = parser.parse_args()
     args.plies = max(2, min(16, int(args.plies)))
     args.search_time = max(0.05, min(2.0, float(args.search_time)))
+    driver = None
+    engine = None
 
     try:
         blocked = tracker.load_blocked_platforms()
@@ -637,6 +643,16 @@ def main() -> int:
         print("\n[STOP] Analyzer stopped.")
         return 0
     except Exception as exc:
+        if driver is not None:
+            try:
+                driver.execute_script("window.__variationLineAnalyzer?.stop?.()")
+            except Exception:
+                pass
+        if engine is not None:
+            try:
+                engine.quit()
+            except Exception:
+                pass
         print(f"[ERROR] Analyzer failed ({type(exc).__name__}): {exc}", file=sys.stderr)
         return 2
 
