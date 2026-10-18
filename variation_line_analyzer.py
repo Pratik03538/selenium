@@ -112,7 +112,7 @@ function ensureOverlay() {
   overlay.setAttribute('height', String(rect.height));
   return {board, rect, svg:overlay};
 }
-function drawLabels(items) {
+function drawLabels(items, details = [], statusText = '') {
   const setup = ensureOverlay();
   if (!setup) return {ok:false, reason:'board-label-layer-unavailable'};
   const {board, rect, svg} = setup;
@@ -154,7 +154,56 @@ function drawLabels(items) {
     }
     svg.appendChild(group);
   }
-  return {ok:true, count:svg.childNodes.length};
+
+  // Compact results panel is part of the board's own SVG layer, not a separate window.
+  const lines = Array.isArray(details) ? details : [];
+  const pad = 6;
+  const rowHeight = Math.max(11, Math.min(16, rect.height / 34));
+  const rowCount = Math.ceil(Math.min(lines.length, 16) / 2);
+  const panelHeight = lines.length
+    ? Math.min(rect.height * 0.42, 24 + rowCount * rowHeight + 7)
+    : 0;
+  if (lines.length) {
+    const panelY = rect.height - panelHeight - 3;
+    svg.appendChild(make('rect', {
+      x:3, y:panelY, width:rect.width-6, height:panelHeight,
+      rx:5, fill:'#111827', 'fill-opacity':0.93, stroke:'#f9fafb',
+      'stroke-width':0.8, 'stroke-opacity':0.85
+    }));
+    const title = String(statusText || 'HYPOTHETICAL LINE').slice(0, 90);
+    svg.appendChild(make('text', {
+      x:pad+2, y:panelY+13, 'font-family':'Segoe UI, Arial, sans-serif',
+      'font-size':Math.max(9, Math.min(11, rect.width/42)),
+      'font-weight':'700', fill:'#ffffff'
+    }, title));
+    const colWidth = (rect.width - 2*pad - 8) / 2;
+    for (let i = 0; i < Math.min(lines.length, 16); i++) {
+      const row = Math.floor(i/2);
+      const col = i%2;
+      const value = String(lines[i] || '').slice(0, 58);
+      svg.appendChild(make('text', {
+        x:pad+col*(colWidth+8), y:panelY+25+row*rowHeight,
+        'font-family':'Consolas, monospace',
+        'font-size':Math.max(8, Math.min(10, rect.width/48)),
+        'font-weight':i===0?'700':'500',
+        fill:'#f9fafb'
+      }, value));
+    }
+  } else if (statusText) {
+    const label = String(statusText).slice(0, 95);
+    const fontSize = Math.max(10, Math.min(13, rect.width/38));
+    const textWidth = Math.min(rect.width-8, Math.max(160, label.length*fontSize*0.58+18));
+    svg.appendChild(make('rect', {
+      x:4, y:4, width:textWidth, height:fontSize+12,
+      rx:5, fill:'#111827', 'fill-opacity':0.93,
+      stroke:'#f9fafb', 'stroke-width':0.8
+    }));
+    svg.appendChild(make('text', {
+      x:12, y:fontSize+8, 'font-family':'Segoe UI, Arial, sans-serif',
+      'font-size':fontSize, 'font-weight':'700', fill:'#ffffff'
+    }, label));
+  }
+  return {ok:true, count:svg.childNodes.length, boardFound:true};
 }
 function matchingBoard(event) {
   const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
@@ -173,9 +222,12 @@ function squareAt(board, x, y, side) {
   const rank = side === 'white' ? 8-rowOnScreen : rowOnScreen+1;
   return String.fromCharCode(97+file) + String(rank);
 }
+function isRightButton(event) {
+  return event.button === 2 || event.which === 3;
+}
 function onDown(event) {
   if (suppress) { down = null; return; }
-  if (event.button !== 2) return;
+  if (!isRightButton(event)) return;
   const board = matchingBoard(event);
   if (!board) { down = null; return; }
   const state = api.current() || {};
@@ -191,7 +243,7 @@ function onDown(event) {
 }
 function onUp(event) {
   if (suppress) { down = null; return; }
-  if (!down || event.button !== 2) return;
+  if (!down || !isRightButton(event)) return;
   const saved = down;
   down = null;
   const to = squareAt(saved.board, event.clientX, event.clientY, saved.side);
@@ -206,9 +258,17 @@ function onUp(event) {
     at:Date.now()
   });
   if (queue.length > 20) queue.splice(0, queue.length-20);
+  drawLabels([], [], 'Arrow detected: ' + saved.from + ' → ' + to + ' · analyzing…');
+}
+function onContextMenu(event) {
+  if (matchingBoard(event)) event.preventDefault();
 }
 window.addEventListener('pointerdown', onDown, true);
 window.addEventListener('pointerup', onUp, true);
+// Mouse listeners are a fallback for boards/browser wrappers that don't forward pointer events.
+window.addEventListener('mousedown', onDown, true);
+window.addEventListener('mouseup', onUp, true);
+window.addEventListener('contextmenu', onContextMenu, true);
 window.__variationLineAnalyzer = {
   queue,
   drawLabels,
@@ -218,6 +278,9 @@ window.__variationLineAnalyzer = {
   stop:() => {
     window.removeEventListener('pointerdown', onDown, true);
     window.removeEventListener('pointerup', onUp, true);
+    window.removeEventListener('mousedown', onDown, true);
+    window.removeEventListener('mouseup', onUp, true);
+    window.removeEventListener('contextmenu', onContextMenu, true);
     clearLabels();
     queue.length = 0;
     delete window.__variationLineAnalyzer;
