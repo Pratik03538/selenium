@@ -128,12 +128,24 @@ PIECE_NAMES = {
 
 
 def eval_white(engine, board: chess.Board, seconds: float) -> tuple[str, float]:
+    # Stockfish cannot analyse an already-terminal position on some builds.
+    # Handle mate/draw states before asking the engine.
+    if board.is_checkmate():
+        winner = not board.turn
+        side = "White" if winner == chess.WHITE else "Black"
+        value = 100000.0 if winner == chess.WHITE else -100000.0
+        return f"Mate for {side}", value
+    if board.is_game_over(claim_draw=True):
+        return "Draw", 0.0
+
     info = engine.analyse(board, chess.engine.Limit(time=seconds))
     score = info["score"].pov(chess.WHITE)
     mate = score.mate()
     if mate is not None:
         side = "White" if mate > 0 else "Black"
-        return f"Mate for {side} in {abs(mate)}", (100000.0 if mate > 0 else -100000.0) + (-abs(mate) if mate > 0 else abs(mate))
+        value = (100000.0 if mate > 0 else -100000.0)
+        value -= abs(mate) if mate > 0 else -abs(mate)
+        return f"Mate for {side} in {abs(mate)}", value
     cp = score.score(mate_score=100000)
     value = (cp or 0) / 100.0
     if value > 0.04:
@@ -229,8 +241,11 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
         starting_eval, start_score = eval_white(engine, board, search_time)
         line_board = board.copy()
         line_board.push(move)
-        first_info = engine.analyse(line_board, chess.engine.Limit(time=search_time))
-        pv = list(first_info.get("pv") or [])
+        if line_board.is_game_over(claim_draw=True):
+            pv = []
+        else:
+            first_info = engine.analyse(line_board, chess.engine.Limit(time=search_time))
+            pv = list(first_info.get("pv") or [])
         line = [move] + pv[:max(0, max_plies-1)]
     except Exception as exc:
         status_var.set(f"Engine analysis failed ({type(exc).__name__}).")
