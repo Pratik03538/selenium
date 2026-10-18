@@ -445,7 +445,7 @@ function onUp(event) {
   if (to === saved.from) {
     // A right-click without a drag is the user's explicit clear-all gesture.
     userArrows.clear();
-    queue.push({action:'clear_all', fen, at:Date.now()});
+    queue.push({action:'clear_all', fen, remainingArrows:0, at:Date.now()});
     if (queue.length > 20) queue.splice(0, queue.length-20);
     drawLabels([], [], 'Queue cleared · draw a new legal arrow to begin');
     return;
@@ -461,6 +461,7 @@ function onUp(event) {
     from:saved.from, to, uci, fen,
     geometry:saved.rect,
     bottomSide:saved.side,
+    remainingArrows:userArrows.size,
     at:Date.now()
   });
   if (queue.length > 20) queue.splice(0, queue.length-20);
@@ -937,9 +938,10 @@ def main() -> int:
         accepted_steps = 0
         pending_hints: list[dict] = []
         branch_active = False
+        awaiting_clear = False
 
         def show_next_step() -> None:
-            nonlocal pending_hints
+            nonlocal pending_hints, awaiting_clear
             if not branch_active:
                 pending_hints = []
                 show_hints(driver, [], "Queue empty · draw a legal arrow to begin")
@@ -947,11 +949,16 @@ def main() -> int:
 
             if accepted_steps >= args.plies:
                 pending_hints = []
+                awaiting_clear = True
                 show_hints(
                     driver, [],
-                    f"Preview complete · {accepted_steps}/{args.plies} moves · clear arrows to start a new line"
+                    f"Preview complete · {accepted_steps}/{args.plies} moves · manually clear ALL your arrows to restart"
                 )
-                print(f"[DONE] Sequential preview finished after {accepted_steps} moves.", flush=True)
+                print(
+                    f"[DONE] Preview finished after {accepted_steps} moves. "
+                    "Your arrows are untouched; clear all of them manually to restart.",
+                    flush=True,
+                )
                 return
 
             hints, reason = calculate_next_hints(
@@ -960,8 +967,17 @@ def main() -> int:
             )
             if not hints:
                 pending_hints = []
-                show_hints(driver, [], reason or "No further legal move")
-                print(f"[END] {reason or 'No further legal move'}.", flush=True)
+                awaiting_clear = bool(branch_active)
+                show_hints(
+                    driver, [],
+                    (reason or "No further legal move") +
+                    (" · manually clear all arrows to restart" if awaiting_clear else "")
+                )
+                print(
+                    f"[END] {reason or 'No further legal move'}." +
+                    (" Clear all native arrows manually to restart." if awaiting_clear else ""),
+                    flush=True,
+                )
                 return
 
             pending_hints = hints[:2]
@@ -982,7 +998,7 @@ def main() -> int:
         show_hints(driver, [], "Queue empty · draw a legal arrow to begin")
         print("[READY] No suggestions are shown until you draw a native right-click arrow.", flush=True)
         print("[READY] Your drawn arrow selects the starting move; the next two suggestions then appear.", flush=True)
-        print("[READY] Drawing the first hinted move continues that line; clearing an arrow resets the queue.", flush=True)
+        print("[READY] Drawing the first hinted move continues that line; clear ALL your arrows to return to the real board position.", flush=True)
         print("[READY] Nothing is played or premoved. Preview is limited to four plies.", flush=True)
         print("[READY] Press Ctrl+C in this terminal to stop.", flush=True)
 
@@ -1010,6 +1026,7 @@ def main() -> int:
                         accepted_steps = 0
                         pending_hints = []
                         branch_active = False
+                        awaiting_clear = False
                         show_hints(driver, [], "Board position changed · queue reset · draw a new arrow")
                         print("[RESET] Board position changed; waiting for your next arrow.", flush=True)
 
@@ -1029,8 +1046,26 @@ def main() -> int:
 
                         action = str(event.get("action") or "draw").lower()
                         if action in {"clear", "clear_all"}:
-                            # Removing one tracked arrow or explicitly clearing the
-                            # board resets the hypothetical line. Wait for a fresh arrow.
+                            remaining_arrows = int(event.get("remainingArrows", 0) or 0)
+                            if action == "clear" and remaining_arrows > 0:
+                                # Preserve both the native arrows still on screen and
+                                # the current variation queue until the user has cleared
+                                # every tracked arrow themselves.
+                                print(
+                                    f"[ARROW] One of your arrows was toggled off; "
+                                    f"{remaining_arrows} tracked arrow(s) remain. "
+                                    "Queue retained; clear all arrows to restart.",
+                                    flush=True,
+                                )
+                                if awaiting_clear:
+                                    show_hints(
+                                        driver, [],
+                                        f"Preview complete · {remaining_arrows} arrow(s) remain · clear them manually to restart"
+                                    )
+                                continue
+
+                            # Only a clear-all gesture or removal of the final tracked
+                            # arrow resets the hypothetical line back to actual board FEN.
                             reset_fen = current_fen or last_fen
                             try:
                                 analysis_board = chess.Board(reset_fen)
@@ -1041,14 +1076,23 @@ def main() -> int:
                             accepted_steps = 0
                             pending_hints = []
                             branch_active = False
-                            show_hints(driver, [], "Queue cleared · draw a new legal arrow to begin")
+                            awaiting_clear = False
+                            show_hints(driver, [], "Queue cleared · real board position restored · draw a new arrow")
                             print(
-                                "[RESET] User cleared/toggled off an arrow; variation queue cleared.",
+                                "[RESET] All tracked user arrows are cleared. "
+                                "Returned to the actual board position; waiting for a new arrow.",
                                 flush=True,
                             )
                             continue
 
                         if action != "draw":
+                            continue
+                        if awaiting_clear:
+                            print(
+                                "[WAIT] Clear all your existing native arrows first; "
+                                "they will not be removed automatically.",
+                                flush=True,
+                            )
                             continue
                         event_uci = str(event.get("uci") or (
                             str(event.get("from") or "").lower()
