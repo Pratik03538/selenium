@@ -847,11 +847,6 @@ class RuntimeSettingsWindow:
         if is_new:
             self.moves_tree.move(iid, "", 0)
 
-        while len(self.move_order) > 200:
-            old_key = self.move_order.pop()
-            old = self.move_rows.pop(old_key, None)
-            if old and self.moves_tree.exists(old["iid"]):
-                self.moves_tree.delete(old["iid"])
 
     def record_selected_move(
         self, game_number, ply, side, san, rank, eval_white_cp=None, status="Selected"
@@ -2278,6 +2273,30 @@ def reconstruct_history_from_dom_moves(
     if board.ply() != target.ply() or not _same_chess_position(board, target):
         return None
     return history
+
+
+def sync_dashboard_history(settings_window, game_number: int, history: list[dict[str, str]]) -> int:
+    """Publish every validated on-board ply to the dashboard, regardless of move source."""
+    if settings_window is None or not history:
+        return 0
+    synced = 0
+    for index, item in enumerate(history, start=1):
+        if not isinstance(item, dict):
+            continue
+        try:
+            ply = int(item.get("game_ply") or index)
+        except (TypeError, ValueError):
+            continue
+        try:
+            settings_window.record_observed_move(
+                game_number, ply, item, eval_white_cp=None
+            )
+            synced += 1
+        except Exception:
+            # A single malformed row must not prevent the rest of the game
+            # history from being rendered.
+            continue
+    return synced
 
 
 def format_move_history(history: list[dict[str, str]], limit: int = 16) -> str:
@@ -4663,6 +4682,7 @@ def main() -> int:
         previous_fen = ""
         last_dashboard_eval_fen = ""
         reconstructed_history: list[dict[str, str]] = []
+        last_dashboard_history_signature = None
         game_number = 1
         if chess is None:
             print("[NOTE] Full SAN move reconstruction needs python-chess: python -m pip install python-chess", flush=True)
@@ -5061,21 +5081,6 @@ def main() -> int:
                                 except (ValueError, IndexError):
                                     last_move["game_ply"] = str(len(reconstructed_history) + 1)
                                 reconstructed_history.append(last_move)
-                                if settings_window is not None:
-                                    try:
-                                        observed_ply = (
-                                            chess.Board(fen).ply()
-                                            if chess is not None and fen
-                                            else len(reconstructed_history)
-                                        )
-                                        settings_window.record_observed_move(
-                                            game_number,
-                                            observed_ply,
-                                            last_move,
-                                            eval_white_cp=settings_window.last_eval_white_cp,
-                                        )
-                                    except Exception:
-                                        pass
                                 note = "Move reconstructed from consecutive FEN states"
                             elif is_start_position(fen) and not is_start_position(previous_fen):
                                 game_number += 1
@@ -5098,17 +5103,35 @@ def main() -> int:
                                 f"[HISTORY SYNC] Reconciled {len(dom_history)} plies against current FEN.",
                                 flush=True,
                             )
-                            if settings_window is not None:
-                                for history_item in dom_history:
-                                    try:
-                                        settings_window.record_observed_move(
-                                            game_number,
-                                            int(history_item["game_ply"]),
-                                            history_item,
-                                            eval_white_cp=settings_window.last_eval_white_cp,
-                                        )
-                                    except Exception:
-                                        pass
+                    # Send the complete validated history through one idempotent
+                    # dashboard path. This is independent of BOT state and catches
+                    # manual moves plus fast bot/reply transitions missed by polling.
+                    dashboard_history_signature = (
+                        game_number,
+                        tuple(
+                            (
+                                str(item.get("game_ply") or index + 1),
+                                str(item.get("uci") or ""),
+                                str(item.get("san") or ""),
+                            )
+                            for index, item in enumerate(reconstructed_history)
+                            if isinstance(item, dict)
+                        ),
+                    )
+                    if (
+                        settings_window is not None
+                        and dashboard_history_signature != last_dashboard_history_signature
+                    ):
+                        synced_moves = sync_dashboard_history(
+                            settings_window, game_number, reconstructed_history
+                        )
+                        last_dashboard_history_signature = dashboard_history_signature
+                        if synced_moves:
+                            print(
+                                f"[DASHBOARD HISTORY] Synced {synced_moves} actual on-board "
+                                f"plies (game {game_number}; BOT-independent).",
+                                flush=True,
+                            )
 
                     # Keep a persistent python-chess board so the ChessKida strategy
                     # sees the same move_stack/history state as the original bot.
