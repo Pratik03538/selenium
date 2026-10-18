@@ -271,6 +271,107 @@ function drawLabels(items, details = [], statusText = '') {
   }
   return {ok:true, count:svg.childNodes.length, boardFound:true};
 }
+function drawSuggestion(item) {
+  const setup = ensureOverlay();
+  if (!setup || !setup.ok) return {ok:false, reason:setup?.reason || 'board-label-layer-unavailable'};
+  const {board, rect, svg} = setup;
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+  const state = api.current() || {};
+  const side = resolveBottomSide(board, state);
+  if (!['white','black'].includes(side)) return {ok:false, reason:'board-orientation-unknown'};
+
+  const uci = String(item?.uci || '').toLowerCase();
+  if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uci)) return {ok:false, reason:'invalid-suggested-move'};
+  const make = (tag, attrs, textValue) => {
+    const node = document.createElementNS(svgNS, tag);
+    for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, String(value));
+    if (textValue !== undefined) node.textContent = String(textValue);
+    return node;
+  };
+  const squarePoint = (square) => {
+    const file = square.charCodeAt(0)-97;
+    const rank = Number(square[1]);
+    const boardFile = side === 'white' ? file : 7-file;
+    const boardRow = side === 'white' ? 8-rank : rank-1;
+    return {x:(boardFile+0.5)*rect.width/8, y:(boardRow+0.5)*rect.height/8};
+  };
+  const a = squarePoint(uci.slice(0,2));
+  const b = squarePoint(uci.slice(2,4));
+  const dx = b.x-a.x, dy = b.y-a.y;
+  const length = Math.max(1, Math.hypot(dx,dy));
+  const ux = dx/length, uy = dy/length;
+  const inset = Math.min(rect.width,rect.height)/19;
+  const x2 = b.x-ux*inset, y2 = b.y-uy*inset;
+  const opacity = 0.28; // intentionally faint so the position remains visible.
+  const markerId = 'variation-next-arrow-head';
+
+  const defs = make('defs');
+  defs.appendChild(make('marker', {
+    id:markerId, markerWidth:9, markerHeight:9,
+    refX:7, refY:4.5, orient:'auto',
+    markerUnits:'userSpaceOnUse'
+  }));
+  defs.firstChild.appendChild(make('path',{d:'M0,0 L9,4.5 L0,9 z',fill:'#2563eb',opacity}));
+  svg.appendChild(defs);
+
+  // Soft translucent line only: it does not intercept mouse/right-click input.
+  svg.appendChild(make('line', {
+    x1:a.x, y1:a.y, x2, y2,
+    stroke:'#2563eb', 'stroke-width':Math.max(4,rect.width/90),
+    'stroke-linecap':'round', 'stroke-dasharray':'5 5',
+    opacity, 'marker-end':'url(#'+markerId+')'
+  }));
+  svg.appendChild(make('circle',{
+    cx:a.x,cy:a.y,r:Math.max(5,rect.width/100),
+    fill:'#2563eb',opacity:opacity*0.8
+  }));
+
+  // A small translucent tag confirms the move and evaluation without listing
+  // the rest of the PV; the next move is only calculated after the user traces it.
+  const tagText = String(item?.san || uci);
+  const evalText = String(item?.eval || '');
+  const deltaText = String(item?.delta || '');
+  const statusText = String(item?.title || 'NEXT MOVE');
+  const noteText = String(item?.note || '');
+  const tagWidth = Math.min(rect.width-10, Math.max(70, (tagText.length+evalText.length+4)*6.2));
+  const tagHeight = Math.min(66, Math.max(43, rect.height*0.12));
+  let tagX = b.x + 7;
+  if (tagX+tagWidth > rect.width-3) tagX = b.x-tagWidth-7;
+  tagX = Math.max(3,tagX);
+  let tagY = b.y-tagHeight-7;
+  if (tagY < 3) tagY = Math.min(rect.height-tagHeight-3,b.y+7);
+  const group = make('g', {'data-suggested-move':uci});
+  group.appendChild(make('rect',{
+    x:tagX,y:tagY,width:tagWidth,height:tagHeight,rx:5,
+    fill:'#dbeafe','fill-opacity':0.83,
+    stroke:'#2563eb','stroke-width':1,opacity:0.93
+  }));
+  group.appendChild(make('text',{
+    x:tagX+6,y:tagY+12,'font-family':'Segoe UI, Arial, sans-serif',
+    'font-size':Math.max(9,Math.min(11,rect.width/42)),
+    'font-weight':'700',fill:'#1e3a8a'
+  },statusText.slice(0,60)));
+  group.appendChild(make('text',{
+    x:tagX+6,y:tagY+25,'font-family':'Segoe UI, Arial, sans-serif',
+    'font-size':Math.max(10,Math.min(13,rect.width/36)),
+    'font-weight':'700',fill:'#1e40af'
+  },tagText+' · '+evalText));
+  group.appendChild(make('text',{
+    x:tagX+6,y:tagY+37,'font-family':'Segoe UI, Arial, sans-serif',
+    'font-size':Math.max(8,Math.min(10,rect.width/48)),
+    'font-weight':'600',fill:'#1e3a8a'
+  },deltaText.slice(0,60)));
+  if (noteText) {
+    group.appendChild(make('text',{
+      x:tagX+6,y:tagY+49,'font-family':'Segoe UI, Arial, sans-serif',
+      'font-size':Math.max(8,Math.min(10,rect.width/48)),
+      'font-weight':'600',fill:'#1e3a8a'
+    },noteText.slice(0,60)));
+  }
+  svg.appendChild(group);
+  return {ok:true, uci, boardFound:true};
+}
 function matchingBoard(event) {
   const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
   for (const node of path) {
@@ -343,13 +444,11 @@ function onContextMenu(event) {
 }
 window.addEventListener('pointerdown', onDown, true);
 window.addEventListener('pointerup', onUp, true);
-// Mouse listeners are a fallback for boards/browser wrappers that don't forward pointer events.
-window.addEventListener('mousedown', onDown, true);
-window.addEventListener('mouseup', onUp, true);
 window.addEventListener('contextmenu', onContextMenu, true);
 window.__variationLineAnalyzer = {
   queue,
   drawLabels,
+  drawSuggestion,
   clearLabels,
   diagnostics:() => {
     const found = findBoard();
@@ -366,8 +465,6 @@ window.__variationLineAnalyzer = {
   stop:() => {
     window.removeEventListener('pointerdown', onDown, true);
     window.removeEventListener('pointerup', onUp, true);
-    window.removeEventListener('mousedown', onDown, true);
-    window.removeEventListener('mouseup', onUp, true);
     window.removeEventListener('contextmenu', onContextMenu, true);
     clearLabels();
     queue.length = 0;
