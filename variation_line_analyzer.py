@@ -1,9 +1,10 @@
-"""Standalone hypothetical-line analyzer for an authorized study/test board.
+"""Interactive hypothetical-line analyzer for an authorized study/test board.
 
 Reuses the tracker’s allowlist, Chrome attach, board reader, and native-arrow
-helpers without modifying the tracker. It shows up to two faint sequential
-Stockfish move suggestions on the board; tracing the first suggestion advances
-the hypothetical position. It never submits a chess move or premove.
+helpers without modifying the tracker. It shows two faint sequential Stockfish
+suggestions; drawing any legal arrow selects that move and recalculates the next
+two suggestions from the resulting hypothetical position. It never submits a
+chess move or premove.
 """
 from __future__ import annotations
 
@@ -945,8 +946,8 @@ def main() -> int:
 
         show_next_step()
         print("[READY] At most two faint numbered arrows are shown on the board.", flush=True)
-        print("[READY] Draw the FIRST hinted arrow; then the next two suggestions will appear.", flush=True)
-        print("[READY] Nothing is played or premoved. Preview is limited to four confirmed plies.", flush=True)
+        print("[READY] Draw the first hint to follow its line, or any other legal move arrow to branch elsewhere.", flush=True)
+        print("[READY] Nothing is played or premoved. Each selected line previews up to four plies.", flush=True)
         print("[READY] Press Ctrl+C in this terminal to stop.", flush=True)
 
         try:
@@ -991,47 +992,93 @@ def main() -> int:
                             str(event.get("from") or "").lower()
                             + str(event.get("to") or "").lower()
                         )
-                        if pending_hints:
-                            expected_uci = str(pending_hints[0].get("uci") or "").lower()
-                            # Only the first move is confirmed at each stage. The
-                            # second arrow is a preview of the following reply.
-                            if event_uci[:4] == expected_uci[:4]:
-                                try:
-                                    accepted_move = chess.Move.from_uci(expected_uci)
-                                    if accepted_move not in analysis_board.legal_moves:
-                                        raise ValueError("hint is no longer legal")
-                                    accepted_san = analysis_board.san(accepted_move)
-                                    # Remove the solid native arrow the user just drew.
-                                    remove_unconfirmed_native_arrow(driver, event)
-                                    analysis_board.push(accepted_move)
-                                    accepted_steps += 1
-                                    pending_hints = []
-                                    print(
-                                        f"[CONFIRMED] {accepted_san} · "
-                                        f"{accepted_steps}/{args.plies}",
-                                        flush=True,
-                                    )
-                                    show_next_step()
-                                except Exception as exc:
-                                    print(f"[STEP ERROR] Could not advance virtual position ({type(exc).__name__}).", flush=True)
-                                    show_next_step()
-                            else:
-                                # A different line was drawn. Remove that annotation
-                                # and keep both suggestions unchanged.
+                        if len(event_uci) < 4:
+                            continue
+
+                        chosen_move = None
+                        followed_hint = False
+                        first_hint_uci = (
+                            str(pending_hints[0].get("uci") or "").lower()
+                            if pending_hints else ""
+                        )
+
+                        # Following the first displayed arrow continues that
+                        # line. Any other legal arrow starts a fresh branch.
+                        if first_hint_uci and event_uci[:4] == first_hint_uci[:4]:
+                            try:
+                                suggested_move = chess.Move.from_uci(first_hint_uci)
+                                if suggested_move in analysis_board.legal_moves:
+                                    chosen_move = suggested_move
+                                    followed_hint = True
+                            except ValueError:
+                                chosen_move = None
+
+                        if chosen_move is None:
+                            try:
+                                from_square = chess.parse_square(event_uci[:2])
+                                to_square = chess.parse_square(event_uci[2:4])
+                            except ValueError:
                                 remove_unconfirmed_native_arrow(driver, event)
-                                show_hints(driver, pending_hints)
-                                expected_san = pending_hints[0].get("san", "first hinted move")
+                                show_hints(driver, pending_hints, "Invalid arrow · draw a legal move")
+                                continue
+
+                            legal_candidates = [
+                                move for move in analysis_board.legal_moves
+                                if move.from_square == from_square
+                                and move.to_square == to_square
+                            ]
+                            if legal_candidates:
+                                # A drawn arrow cannot encode promotion choice;
+                                # prefer queen promotion when several choices exist.
+                                chosen_move = next(
+                                    (move for move in legal_candidates if move.promotion == chess.QUEEN),
+                                    legal_candidates[0],
+                                )
+
+                        if chosen_move is None:
+                            remove_unconfirmed_native_arrow(driver, event)
+                            show_hints(driver, pending_hints)
+                            print(
+                                f"[MOVE IGNORED] {event_uci[:4]} is not legal in the current "
+                                "hypothetical position. Draw a legal move arrow to choose a branch.",
+                                flush=True,
+                            )
+                            continue
+
+                        try:
+                            accepted_san = analysis_board.san(chosen_move)
+                            remove_unconfirmed_native_arrow(driver, event)
+
+                            if not followed_hint:
+                                # Switching to an unhinted move starts a new
+                                # four-ply preview budget from that branch.
+                                accepted_steps = 0
+
+                            analysis_board.push(chosen_move)
+                            accepted_steps += 1
+                            pending_hints = []
+
+                            if followed_hint:
                                 print(
-                                    f"[HINT] Still waiting for {expected_san}; "
-                                    f"'{event_uci}' did not match the first arrow.",
+                                    f"[CONFIRMED] {accepted_san} · "
+                                    f"{accepted_steps}/{args.plies} · continuing hinted line",
                                     flush=True,
                                 )
-                        else:
-                            remove_unconfirmed_native_arrow(driver, event)
-                            show_hints(
-                                driver, [],
-                                f"Preview ended · {accepted_steps}/{args.plies} moves · restart analyzer to begin again"
+                            else:
+                                print(
+                                    f"[BRANCH] {accepted_san} · new hypothetical line "
+                                    f"({accepted_steps}/{args.plies})",
+                                    flush=True,
+                                )
+                            show_next_step()
+                        except Exception as exc:
+                            print(
+                                f"[STEP ERROR] Could not advance virtual position "
+                                f"({type(exc).__name__}).",
+                                flush=True,
                             )
+                            show_next_step()
+
                 except tracker.WebDriverException as exc:
                     print(f"[BROWSER ERROR] Board read failed ({type(exc).__name__}).", file=sys.stderr, flush=True)
                 time.sleep(0.12)
