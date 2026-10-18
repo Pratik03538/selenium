@@ -273,7 +273,7 @@ function drawLabels(items, details = [], statusText = '') {
   }
   return {ok:true, count:svg.childNodes.length, boardFound:true};
 }
-function drawSuggestions(items) {
+function drawSuggestions(items, statusText = '') {
   const setup = ensureOverlay();
   if (!setup || !setup.ok) return {ok:false, reason:setup?.reason || 'board-label-layer-unavailable'};
   const {board, rect, svg} = setup;
@@ -337,13 +337,13 @@ function drawSuggestions(items) {
     const badgeRadius=Math.max(8,Math.min(rect.width,rect.height)/48);
     svg.appendChild(make('circle',{
       cx:midX, cy:midY, r:badgeRadius, fill:color,
-      stroke:'#ffffff','stroke-width':1.2,opacity:0.48
+      stroke:'#ffffff','stroke-width':1.2,opacity:0.68
     }));
     svg.appendChild(make('text',{
       x:midX,y:midY+4,'text-anchor':'middle',
       'font-family':'Segoe UI, Arial, sans-serif',
       'font-size':Math.max(9,badgeRadius*1.05),
-      'font-weight':'700',fill:'#ffffff',opacity:0.88
+      'font-weight':'700',fill:'#ffffff',opacity:0.98
     },String(index+1)));
 
     const san = String(item.san || uci);
@@ -360,25 +360,40 @@ function drawSuggestions(items) {
     const group = make('g', {'data-suggested-move':uci,'data-suggestion-index':index+1});
     group.appendChild(make('rect',{
       x:tagX,y:tagY,width:tagWidth,height:tagHeight,rx:4,
-      fill:'#eff6ff','fill-opacity':0.68,
-      stroke:color,'stroke-width':0.8,opacity:0.8
+      fill:'#eff6ff','fill-opacity':0.82,
+      stroke:color,'stroke-width':0.8,opacity:0.94
     }));
     group.appendChild(make('text',{
       x:tagX+5,y:tagY+11,'font-family':'Segoe UI, Arial, sans-serif',
       'font-size':Math.max(8,Math.min(10,rect.width/47)),
-      'font-weight':'700',fill:color,opacity:0.9
+      'font-weight':'700',fill:color,opacity:0.98
     },String(index+1)+'. '+titleText));
     group.appendChild(make('text',{
       x:tagX+5,y:tagY+23,'font-family':'Segoe UI, Arial, sans-serif',
       'font-size':Math.max(9,Math.min(12,rect.width/39)),
-      'font-weight':'700',fill:'#1e3a8a',opacity:0.9
+      'font-weight':'700',fill:'#1e3a8a',opacity:0.98
     },san+' '+evalText));
     group.appendChild(make('text',{
       x:tagX+5,y:tagY+34,'font-family':'Segoe UI, Arial, sans-serif',
       'font-size':Math.max(8,Math.min(9,rect.width/51)),
-      'font-weight':'600',fill:'#1e3a8a',opacity:0.9
+      'font-weight':'600',fill:'#1e3a8a',opacity:0.98
     },(deltaText+(noteText ? ' · '+noteText : '')).slice(0,70)));
     svg.appendChild(group);
+  }
+
+  if (statusText) {
+    const label = String(statusText).slice(0, 100);
+    const fontSize = Math.max(10, Math.min(13, rect.width/38));
+    const textWidth = Math.min(rect.width-8, Math.max(150, label.length*fontSize*0.56+18));
+    svg.appendChild(make('rect', {
+      x:4, y:4, width:textWidth, height:fontSize+12,
+      rx:5, fill:'#7f1d1d', 'fill-opacity':0.94,
+      stroke:'#fecaca', 'stroke-width':0.8
+    }));
+    svg.appendChild(make('text', {
+      x:12, y:fontSize+8, 'font-family':'Segoe UI, Arial, sans-serif',
+      'font-size':fontSize, 'font-weight':'700', fill:'#ffffff', opacity:0.98
+    }, label));
   }
   return {ok:true, count:hints.length, boardFound:true};
 }
@@ -715,7 +730,7 @@ def calculate_next_hints(
             elif line_board.is_stalemate():
                 note = (note + " · " if note else "") + "STALEMATE"
 
-            after_eval, after_value = eval_white(engine, line_board, search_time)
+            after_eval, after_value = eval_white(engine, line_board, min(search_time, 0.01))
             capture_short = ""
             if "captures" in note:
                 piece_name = next(
@@ -774,8 +789,8 @@ def show_hints(driver, hints: list[dict], message: str = "") -> bool:
             )
         else:
             result = driver.execute_script(
-                "return window.__variationLineAnalyzer?.drawSuggestions?.(arguments[0]) || {ok:false};",
-                hints[:2],
+                "return window.__variationLineAnalyzer?.drawSuggestions?.(arguments[0], arguments[1]) || {ok:false};",
+                hints[:2], message,
             )
         if isinstance(result, dict) and result.get("ok"):
             return True
@@ -814,7 +829,7 @@ def main() -> int:
     parser.add_argument("--board-selector", default="chess-board")
     parser.add_argument("--stockfish-path", default="")
     parser.add_argument("--plies", type=int, default=4, help="Maximum sequential suggestions before stopping (default 4, maximum 4).")
-    parser.add_argument("--search-time", type=float, default=0.20, help="Stockfish search time per position in seconds (0.05-2.0).")
+    parser.add_argument("--search-time", type=float, default=0.05, help="Fast Stockfish search time per position in seconds (0.05-2.0).")
     args = parser.parse_args()
     args.plies = max(1, min(4, int(args.plies)))
     args.search_time = max(0.05, min(2.0, float(args.search_time)))
@@ -1125,7 +1140,9 @@ def main() -> int:
                                 from_square = chess.parse_square(event_uci[:2])
                                 to_square = chess.parse_square(event_uci[2:4])
                             except ValueError:
-                                print(f"[MOVE IGNORED] Invalid arrow coordinates: {event_uci[:4]}.", flush=True)
+                                message = f"INVALID ARROW · {event_uci[:4]} · draw a legal move"
+                                show_hints(driver, pending_hints, message)
+                                print(f"[MOVE IGNORED] {message}.", flush=True)
                                 continue
 
                             legal_candidates = [
@@ -1142,10 +1159,11 @@ def main() -> int:
                                 )
 
                         if chosen_move is None:
+                            message = f"ILLEGAL MOVE · {event_uci[:4]} · draw a legal move"
+                            show_hints(driver, pending_hints, message)
                             print(
                                 f"[MOVE IGNORED] {event_uci[:4]} is not legal in the current "
-                                "hypothetical position. The arrow stays on the board; clear arrows "
-                                "to reset, or draw a legal move to continue.",
+                                "hypothetical position. Your arrow is left on the board.",
                                 flush=True,
                             )
                             continue
