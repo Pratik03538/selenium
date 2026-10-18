@@ -360,7 +360,6 @@ class RuntimeSettingsWindow:
 
     LABELS = {
         "auto_play": "BOT",
-        "show_move_mode": "SHOW MOVE ONLY",
         "auto_next_game": "NEW MATCH",
         "auto_rematch": "REMATCH",
         "premove_enabled": "NORMAL PREMOVES",
@@ -369,7 +368,6 @@ class RuntimeSettingsWindow:
     }
     BUTTON_LABELS = {
         "auto_play": "BOT",
-        "show_move_mode": "SHOW MOVE",
         "auto_next_game": "NEW MATCH",
         "auto_rematch": "REMATCH",
         "premove_enabled": "PREMOVES",
@@ -390,9 +388,6 @@ class RuntimeSettingsWindow:
         self.cfg = cfg
         self.chosen_handle = chosen_handle
         self.stop_requested = False
-        self._resume_autoplay_after_show = bool(
-            getattr(args, "show_move_resume_autoplay", False)
-        )
         self.buttons = {}
         self.settings = {
             key: bool(getattr(args, key))
@@ -575,70 +570,17 @@ class RuntimeSettingsWindow:
         )
 
     def toggle(self, key):
-        was_auto_play = bool(self.settings.get("auto_play"))
         self.settings[key] = not self.settings[key]
         setattr(self.args, key, self.settings[key])
-        if key in {"auto_play", "show_move_mode"}:
-            self.args._move_mode_changed = True
-
-        # Move submission and show-only mode are mutually exclusive.
-        if key == "show_move_mode" and self.settings[key]:
-            self._resume_autoplay_after_show = was_auto_play
-            self.args.show_move_resume_autoplay = was_auto_play
-            if was_auto_play:
-                self.settings["auto_play"] = False
-                self.args.auto_play = False
-                self.refresh_button("auto_play")
-                print("[SETTINGS] BOT -> OFF (Show Move Only selected).", flush=True)
-                cancel_result = cancel_pending_site_premove(self.driver)
-            else:
-                cancel_result = {"ok": True, "cancelled": False, "reason": "autoplay-was-off"}
-            cancel_confirmed = (
-                isinstance(cancel_result, dict)
-                and cancel_result.get("ok")
-                and cancel_result.get("cancelled") is True
-            )
-            if was_auto_play and not cancel_confirmed:
-                self.status.set(
-                    "SHOW MOVE is ON, but cancellation of any already-queued premove could not be confirmed. "
-                    "Cancel a queued premove manually if one is visible. New moves/premoves will not be submitted."
-                )
-            else:
-                self.status.set(
-                    "SHOW MOVE is ON: only native board arrows are shown; no new move or premove is submitted."
-                )
-        elif key == "auto_play" and self.settings[key]:
-            if self.settings.get("show_move_mode"):
-                self.settings["show_move_mode"] = False
-                self.args.show_move_mode = False
-                self._resume_autoplay_after_show = False
-                self.args.show_move_resume_autoplay = False
-                self.refresh_button("show_move_mode")
-                clear_board_move_arrow(self.driver)
-                print("[SETTINGS] SHOW MOVE ONLY -> OFF (BOT selected).", flush=True)
-            self.status.set("Bot enabled. It will start after required engine checks pass.")
-        elif key == "auto_play":
-            self.status.set("Bot is OFF; the live reader and dashboard remain active.")
-        elif key == "show_move_mode" and not self.settings[key]:
-            clear_result = clear_board_move_arrow(self.driver)
-            resume_autoplay = bool(self._resume_autoplay_after_show)
-            self.settings["auto_play"] = resume_autoplay
-            self.args.auto_play = resume_autoplay
-            self.refresh_button("auto_play")
-            self._resume_autoplay_after_show = False
-            self.args.show_move_resume_autoplay = False
-            if resume_autoplay:
-                self.status.set("SHOW MOVE is OFF. Restoring the BOT state that was active before show mode.")
-            elif isinstance(clear_result, dict) and clear_result.get("ok"):
-                self.status.set("SHOW MOVE is OFF. BOT remains OFF; the current hint arrow was cleared when possible.")
-            else:
-                self.status.set("SHOW MOVE is OFF. BOT remains OFF; any board arrow can be cleared using the board's normal annotation gesture.")
-
         self.refresh_button(key)
         state = "ON" if self.settings[key] else "OFF"
         print(f"[SETTINGS] {self.LABELS[key]} -> {state}.", flush=True)
         if key in {"auto_next_game", "auto_rematch"}:
             self.sync_game_actions()
+        if key == "auto_play" and self.settings[key]:
+            self.status.set("Bot enabled. It will start after required engine checks pass.")
+        elif key == "auto_play":
+            self.status.set("Bot is OFF; the live reader and dashboard remain active.")
 
     def set_enabled(self, key, value):
         self.settings[key] = bool(value)
@@ -994,15 +936,11 @@ def prepare_bot_components(args, allowed_host, installed):
         print("[BOOK] Opening book loaded.", flush=True)
     else:
         print("[BOOK] Opening book unavailable; using Stockfish strategy.", flush=True)
-    if args.show_move_mode and not args.auto_play:
-        print("[HINT] ChessKida move-selection behavior enabled in show-only mode.", flush=True)
-        print("[INPUT] Native right-click board-arrow mode enabled; selected moves and premoves are not submitted.", flush=True)
+    print("[AUTO] ChessKida move-selection behavior enabled for the configured, non-blocked test site.", flush=True)
+    if args.move_input == "cursor":
+        print("[INPUT] Cursor drag mode enabled for the configured test board; public competitive hosts remain blocked.", flush=True)
     else:
-        print("[AUTO] ChessKida move-selection behavior enabled for the configured, non-blocked test site.", flush=True)
-        if args.move_input == "cursor":
-            print("[INPUT] Cursor drag mode enabled for the configured test board; public competitive hosts remain blocked.", flush=True)
-        else:
-            print("[INPUT] Direct game API mode enabled.", flush=True)
+        print("[INPUT] Direct game API mode enabled.", flush=True)
     print(
         f"[ENGINE] Threads=2 | Hash=128 MB | depth=12 | "
         f"MultiPV={strategy_module.TRAINING_MULTI_PV} | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s.",
@@ -2038,25 +1976,6 @@ window.__liveGameApiReader = {
       premoveOnly: isPremove
     };
   },
-  cancelPremove: () => {
-    const board = getBoard();
-    const game = board && board.game;
-    const sources = [game, board].filter(Boolean);
-    const before = window.__liveGameApiReader?.premoveStatus?.() || {pending:false};
-    if (!before.pending) return {ok:true, cancelled:false, reason:'no-exposed-premove'};
-    for (const target of sources) {
-      for (const name of ['cancelPremove', 'clearPremove', 'unsetPremove', 'cancelQueuedPremove', 'clearQueuedPremove']) {
-        try {
-          if (typeof target[name] !== 'function') continue;
-          const returned = target[name]();
-          if (returned === false) continue;
-          const after = window.__liveGameApiReader?.premoveStatus?.() || {pending:false};
-          if (!after.pending) return {ok:true, cancelled:true, source:name};
-        } catch (_) {}
-      }
-    }
-    return {ok:false, reason:'site-cancel-method-unavailable', source:before.source || 'unknown'};
-  },
   premoveStatus: () => {
     const board = getBoard();
     const game = board && board.game;
@@ -2789,238 +2708,6 @@ def _direct_cdp_page_for_driver(driver):
         return cached
     except Exception:
         return None
-
-
-def _dispatch_native_board_arrow(
-    cdp: _DirectCDPPage, uci: str, left: float, top: float,
-    width: float, height: float, bottom_side: str,
-) -> dict[str, object]:
-    """Use the board's own right-click drag gesture to toggle a native arrow."""
-    text = str(uci or "").lower()
-    if not re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", text):
-        return {"ok": False, "reason": "invalid-uci"}
-    if (
-        width <= 0 or height <= 0
-        or abs(width - height) > max(8.0, width * 0.08)
-        or bottom_side not in {"white", "black"}
-    ):
-        return {"ok": False, "reason": "invalid-board-geometry"}
-
-    def square_point(square: str) -> tuple[float, float]:
-        file_index = ord(square[0]) - ord("a")
-        rank = int(square[1])
-        board_file = file_index if bottom_side == "white" else 7 - file_index
-        board_row = 8 - rank if bottom_side == "white" else rank - 1
-        return (
-            left + (board_file + 0.5) * width / 8.0,
-            top + (board_row + 0.5) * height / 8.0,
-        )
-
-    source_x, source_y = square_point(text[:2])
-    dest_x, dest_y = square_point(text[2:4])
-    middle_x = (source_x + dest_x) / 2.0
-    middle_y = (source_y + dest_y) / 2.0
-    command_ids: set[int] = set()
-    try:
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseMoved", "x": source_x, "y": source_y,
-            "button": "none", "buttons": 0, "pointerType": "mouse",
-        }))
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mousePressed", "x": source_x, "y": source_y,
-            "button": "right", "buttons": 2, "clickCount": 1,
-            "pointerType": "mouse",
-        }))
-        time.sleep(0.004)
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseMoved", "x": middle_x, "y": middle_y,
-            "button": "right", "buttons": 2, "pointerType": "mouse",
-        }))
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseMoved", "x": dest_x, "y": dest_y,
-            "button": "right", "buttons": 2, "pointerType": "mouse",
-        }))
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseReleased", "x": dest_x, "y": dest_y,
-            "button": "right", "buttons": 0, "clickCount": 1,
-            "pointerType": "mouse",
-        }))
-        cdp.wait_for(command_ids, timeout=1.0)
-    except Exception as exc:
-        try:
-            cdp.send("Input.dispatchMouseEvent", {
-                "type": "mouseReleased", "button": "right",
-                "buttons": 0, "pointerType": "mouse",
-            })
-        except Exception:
-            pass
-        return {
-            "ok": False, "reason": "native-arrow-gesture-failed",
-            "error_type": type(exc).__name__,
-        }
-    return {"ok": True, "uci": text}
-
-
-def show_board_move_arrow(
-    driver, uci: str, expected_fen: str, expected_color: str | None,
-    *, allow_premove: bool = False,
-) -> dict[str, object]:
-    """Show a hint with the site's native right-click arrow; never submit a move."""
-    text = str(uci or "").lower()
-    if not re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", text):
-        return {"ok": False, "reason": "invalid-uci"}
-    cdp = _direct_cdp_page_for_driver(driver)
-    if cdp is None:
-        return {"ok": False, "reason": "direct-cdp-unavailable"}
-
-    args_json = json.dumps([text, expected_fen, expected_color, bool(allow_premove)])
-    expression = (
-        "(() => { const a = " + args_json + "; "
-        "const api = window.__liveGameApiReader; "
-        "if (!api || typeof api.dragTarget !== 'function') "
-        "return {ok:false,reason:'reader-not-installed'}; "
-        "const t = api.dragTarget(a[0],a[1],a[2],a[3]); "
-        "if (!t || !t.ok) return t || {ok:false,reason:'invalid-board-target'}; "
-        "const r = t.boardElement.getBoundingClientRect(); "
-        "const s = api.current() || {}; "
-        "return {ok:true,left:r.left,top:r.top,width:r.width,height:r.height,"
-        "bottomSide:t.bottomSide,fen:String(s.fen || '')}; })()"
-    )
-    try:
-        target = cdp.evaluate(expression, timeout=0.8)
-    except Exception:
-        return {"ok": False, "reason": "native-arrow-target-check-failed"}
-    if not isinstance(target, dict) or not target.get("ok"):
-        return target if isinstance(target, dict) else {
-            "ok": False, "reason": "invalid-board-target"
-        }
-    if str(target.get("fen") or "").strip() != str(expected_fen or "").strip():
-        return {"ok": False, "reason": "position-changed-before-hint"}
-    try:
-        geometry = {
-            "left": float(target["left"]),
-            "top": float(target["top"]),
-            "width": float(target["width"]),
-            "height": float(target["height"]),
-            "bottom_side": str(target["bottomSide"]),
-        }
-    except (KeyError, TypeError, ValueError):
-        return {"ok": False, "reason": "invalid-board-geometry"}
-
-    previous = getattr(driver, "_live_tracker_last_hint", None)
-    if isinstance(previous, dict) and previous.get("fen") == expected_fen:
-        if previous.get("uci") == text:
-            return {"ok": True, "already_shown": True, "uci": text}
-        # The old arrow is known to have been drawn in this same position.
-        # Repeating its right-drag toggles it off on native annotation boards.
-        old_uci = str(previous.get("uci") or "")
-        if old_uci:
-            _dispatch_native_board_arrow(cdp, old_uci, **geometry)
-    else:
-        # Do not replay an old gesture after a move: that could create a stale arrow.
-        try:
-            delattr(driver, "_live_tracker_last_hint")
-        except Exception:
-            pass
-
-    drawn = _dispatch_native_board_arrow(cdp, text, **geometry)
-    if not drawn.get("ok"):
-        return drawn
-    try:
-        actual_fen = cdp.evaluate(
-            "(() => { const api = window.__liveGameApiReader; "
-            "return api ? String((api.current() || {}).fen || '') : ''; })()",
-            timeout=0.5,
-        )
-    except Exception:
-        actual_fen = ""
-    if str(actual_fen or "").strip() != str(expected_fen or "").strip():
-        return {"ok": False, "reason": "position-changed-during-hint", "uci": text}
-    setattr(driver, "_live_tracker_last_hint", {
-        "fen": str(expected_fen), "uci": text,
-        "color": expected_color, "allow_premove": bool(allow_premove),
-    })
-    return {"ok": True, "uci": text, "native_arrow": True}
-
-
-def clear_board_move_arrow(driver) -> dict[str, object]:
-    """Toggle off this tracker's current native arrow if it is still on the same position."""
-    previous = getattr(driver, "_live_tracker_last_hint", None)
-    if not isinstance(previous, dict):
-        return {"ok": True, "cleared": False}
-    cdp = _direct_cdp_page_for_driver(driver)
-    if cdp is None:
-        return {"ok": False, "reason": "direct-cdp-unavailable"}
-    try:
-        current_fen = cdp.evaluate(
-            "(() => { const api = window.__liveGameApiReader; "
-            "return api ? String((api.current() || {}).fen || '') : ''; })()",
-            timeout=0.5,
-        )
-    except Exception:
-        current_fen = ""
-    if str(current_fen or "").strip() != str(previous.get("fen") or "").strip():
-        try:
-            delattr(driver, "_live_tracker_last_hint")
-        except Exception:
-            pass
-        return {"ok": True, "cleared": False, "reason": "position-already-changed"}
-
-    args_json = json.dumps([
-        previous.get("uci", ""), previous.get("fen", ""),
-        previous.get("color"), bool(previous.get("allow_premove")),
-    ])
-    expression = (
-        "(() => { const a = " + args_json + "; "
-        "const api = window.__liveGameApiReader; "
-        "if (!api || typeof api.dragTarget !== 'function') "
-        "return {ok:false,reason:'reader-not-installed'}; "
-        "const t = api.dragTarget(a[0],a[1],a[2],a[3]); "
-        "if (!t || !t.ok) return t || {ok:false,reason:'invalid-board-target'}; "
-        "const r = t.boardElement.getBoundingClientRect(); "
-        "return {ok:true,left:r.left,top:r.top,width:r.width,height:r.height,"
-        "bottomSide:t.bottomSide}; })()"
-    )
-    try:
-        target = cdp.evaluate(expression, timeout=0.8)
-    except Exception:
-        return {"ok": False, "reason": "native-arrow-clear-target-failed"}
-    if not isinstance(target, dict) or not target.get("ok"):
-        return target if isinstance(target, dict) else {
-            "ok": False, "reason": "invalid-board-target"
-        }
-    try:
-        result = _dispatch_native_board_arrow(
-            cdp, str(previous.get("uci") or ""),
-            left=float(target["left"]), top=float(target["top"]),
-            width=float(target["width"]), height=float(target["height"]),
-            bottom_side=str(target["bottomSide"]),
-        )
-    except (KeyError, TypeError, ValueError):
-        return {"ok": False, "reason": "invalid-board-geometry"}
-    if result.get("ok"):
-        try:
-            delattr(driver, "_live_tracker_last_hint")
-        except Exception:
-            pass
-        return {"ok": True, "cleared": True}
-    return result
-
-
-def cancel_pending_site_premove(driver) -> dict[str, object]:
-    """Cancel a queued premove only through an explicitly exposed site cancel method."""
-    try:
-        result = driver.execute_script(
-            "return window.__liveGameApiReader && "
-            "typeof window.__liveGameApiReader.cancelPremove === 'function' "
-            "? window.__liveGameApiReader.cancelPremove() "
-            ": {ok:false,reason:'reader-not-installed'};"
-        )
-    except Exception:
-        return {"ok": False, "reason": "premove-cancel-unavailable"}
-    return result if isinstance(result, dict) else {
-        "ok": False, "reason": "invalid-premove-cancel-response"
-    }
 
 
 def _perform_cursor_drag_once(
@@ -4599,16 +4286,6 @@ def parse_args() -> argparse.Namespace:
         help="Disable autoplay even if auto_play=true is present in TXT settings.",
     )
     parser.set_defaults(auto_play=None)
-    show_move_group = parser.add_mutually_exclusive_group()
-    show_move_group.add_argument(
-        "--show-move", dest="show_move_mode", action="store_true",
-        help="Analyze with the same move-selection logic but show a native board arrow instead of submitting moves.",
-    )
-    show_move_group.add_argument(
-        "--no-show-move", dest="show_move_mode", action="store_false",
-        help="Disable native board-arrow hint mode.",
-    )
-    parser.set_defaults(show_move_mode=None)
     parser.add_argument("--stockfish-path", default="", help="Stockfish executable path; can also be set as stockfish_path=... in TXT settings.")
     parser.add_argument("--engine-time", type=float, default=0.75, help="Maximum Stockfish search time per move in seconds; effective time is adapted to the remaining clock.")
     parser.add_argument("--move-input", choices=("api", "cursor"), default=None, help="Move submission method; defaults to cursor; can also be set with move_input=api|cursor in tracker_settings.txt.")
@@ -4649,16 +4326,6 @@ def main() -> int:
     if args.auto_play is None:
         auto_setting = load_optional_txt_setting("auto_play").strip().lower()
         args.auto_play = auto_setting in {"1", "true", "yes", "on", "enabled"}
-    if args.show_move_mode is None:
-        show_setting = load_optional_txt_setting("show_move_mode").strip().lower()
-        args.show_move_mode = show_setting in {"1", "true", "yes", "on", "enabled"}
-    if args.show_move_mode and args.auto_play:
-        args.show_move_resume_autoplay = True
-        args.auto_play = False
-        print("[CONFIG] Show Move Only is ON; autoplay is paused until show mode is turned off.", flush=True)
-    else:
-        args.show_move_resume_autoplay = False
-    print(f"[CONFIG] Show Move Only: {'enabled' if args.show_move_mode else 'disabled'}.", flush=True)
     if args.move_input is None:
         args.move_input = load_optional_txt_setting("move_input").strip().lower() or "cursor"
     if args.move_input not in {"api", "cursor"}:
@@ -4708,7 +4375,7 @@ def main() -> int:
     configured_player_name = load_optional_txt_setting("player_name").strip()
     configured_bot_color_raw = load_optional_txt_setting("bot_color")
     configured_bot_color = normalize_chess_color(configured_bot_color_raw)
-    if (args.auto_play or args.show_move_mode) and configured_bot_color_raw and configured_bot_color is None:
+    if args.auto_play and configured_bot_color_raw and configured_bot_color is None:
         print("[CONFIG ERROR] bot_color must be exactly white or black.", file=sys.stderr, flush=True)
         return 2
 
@@ -4722,9 +4389,9 @@ def main() -> int:
         )
         configured_bot_color = None
 
-    if (args.auto_play or args.show_move_mode) and configured_bot_color:
+    if args.auto_play and configured_bot_color:
         print(f"[CONFIG] Fallback bot color loaded: {configured_bot_color}.", flush=True)
-    if (args.auto_play or args.show_move_mode) and configured_player_name:
+    if args.auto_play and configured_player_name:
         print("[CONFIG] Player-name side detection enabled; configured name is hidden.", flush=True)
     print(f"[CONFIG] Settings loaded from the {settings_source}.", flush=True)
 
@@ -4971,7 +4638,7 @@ def main() -> int:
         elif not installed.get("gameApiFound"):
             print("[NOTE] Board found, but the game API methods are not accessible.", flush=True)
 
-        if args.auto_play or args.show_move_mode:
+        if args.auto_play:
             engine, book, strategy_module = prepare_bot_components(args, allowed_host, installed)
 
         csv_path = Path(args.csv).expanduser().resolve()
@@ -5004,22 +4671,13 @@ def main() -> int:
                 print("[GUI] Runtime settings window could not be opened; continuing with TXT/CLI settings.", flush=True)
 
             while True:
-                mode_changed = False
                 if settings_window is not None:
                     settings_window.pump()
                     if settings_window.stop_requested:
                         print("[STOP] Stop requested from runtime settings window.", flush=True)
                         break
-                if bool(getattr(args, "_move_mode_changed", False)):
-                    mode_changed = True
-                    args._move_mode_changed = False
-                    move_retry_gate = MoveAttemptRetryGate()
-                    last_auto_attempt_fen = ""
-                    last_premove_attempt_fen = ""
-                    last_low_clock_premove_fen = ""
-                    last_premove_gate_report_fen = ""
                 # If Bot was OFF at startup, initialize the engine only when it is switched ON.
-                if (args.auto_play or args.show_move_mode) and engine is None:
+                if args.auto_play and engine is None:
                     try:
                         if chosen_handle not in driver.window_handles:
                             raise RuntimeError("Selected browser tab is unavailable.")
@@ -5036,12 +4694,10 @@ def main() -> int:
                             },
                         )
                     except (RuntimeError, WebDriverException):
-                        print("[ENGINE] BOT/SHOW MOVE could not be enabled; check Stockfish, strategy files, and the allowed-site board API.", flush=True)
+                        print("[AUTO] Bot could not be enabled; check Stockfish, strategy files, and the allowed-site board API.", flush=True)
                         args.auto_play = False
-                        args.show_move_mode = False
                         if settings_window is not None:
                             settings_window.set_enabled("auto_play", False)
-                            settings_window.set_enabled("show_move_mode", False)
                 # Closing the chosen tab often yields current_url=None in ChromeDriver.
                 if chosen_handle not in driver.window_handles:
                     print("[STOP] Selected browser tab was closed. No URL was logged.", flush=True)
@@ -5065,17 +4721,6 @@ def main() -> int:
                     print("[STOP] Browser tab closed or DevTools disconnected. No URL was logged.", flush=True)
                     break
 
-                if mode_changed and not events:
-                    try:
-                        mode_snapshot = driver.execute_script(
-                            "return window.__liveGameApiReader ? "
-                            "window.__liveGameApiReader.current() : null;"
-                        )
-                    except WebDriverException:
-                        mode_snapshot = None
-                    if isinstance(mode_snapshot, dict):
-                        events = [mode_snapshot]
-
                 # If the queue is quiet, re-read the authoritative state when a retry is due.
                 if (
                     not events
@@ -5098,7 +4743,7 @@ def main() -> int:
                 # Side resolution needs repeated evidence even when the board is
                 # quiet. Do not turn this probe into a normal queued event: that
                 # would duplicate CSV rows and live move processing every loop.
-                if not events and (args.auto_play or args.show_move_mode) and active_bot_color is None:
+                if not events and args.auto_play and active_bot_color is None:
                     try:
                         side_probe = driver.execute_script(
                             "return window.__liveGameApiReader ? "
@@ -5462,7 +5107,7 @@ def main() -> int:
                                 else None
                             )
                             bot_to_move = (
-                                (args.auto_play or args.show_move_mode)
+                                args.auto_play
                                 and bot_color_value is not None
                                 and dashboard_board.turn == bot_color_value
                             )
@@ -5633,7 +5278,7 @@ def main() -> int:
 
                     # Autoplay side detection must use the player-color API or an
                     # explicit bot_color setting. Board orientation is presentation only.
-                    if (args.auto_play or args.show_move_mode) and engine is not None and strategy_module is not None and fen and strategy_board is not None:
+                    if args.auto_play and engine is not None and strategy_module is not None and fen and strategy_board is not None:
                         api_my_turn = event.get("isMyTurn")
                         api_bot_color, autoplay_api_color_conflict = normalize_api_bot_color(
                             event.get("playingAsColor"), event.get("playingAs")
@@ -5988,12 +5633,7 @@ def main() -> int:
                                         wait_for_manual_verification(driver, allowed_host, cfg)
                                     if settings_window is not None:
                                         settings_window.pump()
-                                    if args.show_move_mode and not args.auto_play:
-                                        submit = show_board_move_arrow(
-                                            driver, chosen_move.uci(), fen, active_bot_color,
-                                            allow_premove=False,
-                                        )
-                                    elif not args.auto_play:
+                                    if not args.auto_play:
                                         submit = {"ok": False, "reason": "bot-disabled-in-settings"}
                                     elif args.move_input == "cursor":
                                         # Use a real direct pointer drag so the visible piece
@@ -6043,15 +5683,10 @@ def main() -> int:
                                                 f"| waypoints={int(submit.get('waypoints', 0))}.",
                                                 flush=True,
                                             )
-                                        if args.show_move_mode and not args.auto_play:
-                                            print(f"[HINT] Native board arrow shown for {chosen_san} ({chosen_move.uci()}); no move was submitted.", flush=True)
-                                            move_status = "Hint shown"
-                                        else:
-                                            print(f"[AUTO] Submitted selected move: {chosen_san} ({chosen_move.uci()}).", flush=True)
-                                            move_status = "Submitted"
+                                        print(f"[AUTO] Submitted selected move: {chosen_san} ({chosen_move.uci()}).", flush=True)
                                         if settings_window is not None:
                                             settings_window.update_move_status(
-                                                game_number, pending_ply, move_status
+                                                game_number, pending_ply, "Submitted"
                                             )
 
                                         after_board = engine_board.copy(stack=True)
@@ -6122,7 +5757,7 @@ def main() -> int:
                                     move_retry_gate.finish_exception()
                                     print("[AUTO] Strategy calculation/submission failed; bounded retry remains available if no move was accepted.", flush=True)
                             elif (
-                                (args.auto_play or args.show_move_mode)
+                                args.auto_play
                                 and args.premove_enabled
                                 and active_bot_color in {"white", "black"}
                                 and not side_matches_bot
@@ -6236,12 +5871,7 @@ def main() -> int:
                                                     time.sleep(wait_remaining)
                                         if settings_window is not None:
                                             settings_window.pump()
-                                        if args.show_move_mode and not args.auto_play and args.premove_enabled:
-                                            premove_submit = show_board_move_arrow(
-                                                driver, chosen_premove_uci, fen, active_bot_color,
-                                                allow_premove=True,
-                                            )
-                                        elif not args.auto_play or not args.premove_enabled:
+                                        if not args.auto_play or not args.premove_enabled:
                                             premove_submit = {"ok": False, "reason": "bot-or-extra-premove-disabled-in-settings"}
                                         elif args.move_input == "cursor" and low_clock_premove_mode:
                                             # Prefer the configured site's queue API for every premove,
@@ -6306,28 +5936,17 @@ def main() -> int:
                                                     f"overrun={max(0.0, premove_elapsed - low_clock_premove_budget_seconds):.3f}s.",
                                                     flush=True,
                                                 )
-                                            if args.show_move_mode and not args.auto_play:
-                                                print(
-                                                    f"[HINT] Native premove arrow shown for {engine_board.san(premove_move) if premove_move in engine_board.legal_moves else premove_move.uci()} "
-                                                    f"after predicted reply {predicted_san}; no premove was queued.",
-                                                    flush=True,
-                                                )
-                                                if settings_window is not None:
-                                                    settings_window.update_move_status(
-                                                        game_number, engine_board.ply() + 1, "Premove hint"
-                                                    )
+                                            if premove_submit.get("premove_confirmed"):
+                                                confirmation = f"confirmed via {premove_submit.get('premove_source', 'site status')}"
+                                            elif premove_submit.get("confirmed"):
+                                                confirmation = f"accepted by {premove_submit.get('source', 'site premove API')}"
                                             else:
-                                                if premove_submit.get("premove_confirmed"):
-                                                    confirmation = f"confirmed via {premove_submit.get('premove_source', 'site status')}"
-                                                elif premove_submit.get("confirmed"):
-                                                    confirmation = f"accepted by {premove_submit.get('source', 'site premove API')}"
-                                                else:
-                                                    confirmation = "gesture sent; site queue status is not exposed, normal-turn fallback remains enabled"
-                                                print(
-                                                    f"[PREMOVE] {engine_board.san(premove_move) if premove_move in engine_board.legal_moves else premove_move.uci()} "
-                                                    f"queued-attempt after predicted reply {predicted_san} | {confirmation}.",
-                                                    flush=True,
-                                                )
+                                                confirmation = "gesture sent; site queue status is not exposed, normal-turn fallback remains enabled"
+                                            print(
+                                                f"[PREMOVE] {engine_board.san(premove_move) if premove_move in engine_board.legal_moves else premove_move.uci()} "
+                                                f"queued-attempt after predicted reply {predicted_san} | {confirmation}.",
+                                                flush=True,
+                                            )
                                         else:
                                             reason = premove_submit.get("reason", "premove-submit-failed") if isinstance(premove_submit, dict) else "premove-submit-failed"
                                             print(
@@ -6339,8 +5958,8 @@ def main() -> int:
                             else:
                                 if fen and fen != last_premove_gate_report_fen:
                                     last_premove_gate_report_fen = fen
-                                    if not args.auto_play and not args.show_move_mode:
-                                        gate_reason = "autoplay-and-show-mode-disabled"
+                                    if not args.auto_play:
+                                        gate_reason = "autoplay-disabled"
                                     elif not args.premove_enabled:
                                         gate_reason = "premove-disabled"
                                     elif active_bot_color not in {"white", "black"}:
