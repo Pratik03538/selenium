@@ -747,10 +747,10 @@ def main() -> int:
     parser.add_argument("--allowed-domain", default="")
     parser.add_argument("--board-selector", default="chess-board")
     parser.add_argument("--stockfish-path", default="")
-    parser.add_argument("--plies", type=int, default=8, help="Total half-moves shown, including your drawn first move (2-16).")
-    parser.add_argument("--search-time", type=float, default=0.20, help="Stockfish search time per evaluated position in seconds (0.05-2.0).")
+    parser.add_argument("--plies", type=int, default=4, help="Maximum sequential suggestions before stopping (default 4, maximum 4).")
+    parser.add_argument("--search-time", type=float, default=0.20, help="Stockfish search time per position in seconds (0.05-2.0).")
     args = parser.parse_args()
-    args.plies = max(2, min(16, int(args.plies)))
+    args.plies = max(1, min(4, int(args.plies)))
     args.search_time = max(0.05, min(2.0, float(args.search_time)))
     driver = None
     engine = None
@@ -855,14 +855,57 @@ def main() -> int:
         initial = driver.execute_script(
             "return window.__liveGameApiReader?.current?.() || {};"
         ) or {}
-        last_fen = str(initial.get("fen") or "")
-        set_board_status(
-            driver,
-            f"Analyzer ready · right-click drag a line · max {args.plies} plies"
-        )
-        print("[READY] No separate window will open.", flush=True)
-        print("[READY] Draw a right-click arrow directly on the authorized board.", flush=True)
-        print("[READY] Numbered arrows, evaluation, captures/check/mate, and the move list will appear on that board.", flush=True)
+        last_fen = str(initial.get("fen") or "").strip()
+        if not last_fen:
+            print("[BOARD ERROR] The authorized test board did not expose a usable FEN.", file=sys.stderr, flush=True)
+            driver.execute_script("window.__variationLineAnalyzer?.stop?.();")
+            engine.quit()
+            return 2
+        try:
+            analysis_board = chess.Board(last_fen)
+        except ValueError:
+            print("[BOARD ERROR] The board FEN is invalid; no hint was drawn.", file=sys.stderr, flush=True)
+            driver.execute_script("window.__variationLineAnalyzer?.stop?.();")
+            engine.quit()
+            return 2
+
+        accepted_steps = 0
+        pending_hint: dict | None = None
+
+        def show_next_step() -> None:
+            nonlocal pending_hint
+            if accepted_steps >= args.plies:
+                pending_hint = None
+                show_hint(
+                    driver, None,
+                    f"Preview complete · {accepted_steps}/{args.plies} moves confirmed · restart analyzer to begin again"
+                )
+                print(f"[DONE] Sequential preview finished after {accepted_steps} moves.", flush=True)
+                return
+
+            hint, reason = calculate_next_hint(
+                engine, analysis_board, args.search_time,
+                accepted_steps + 1, args.plies,
+            )
+            if hint is None:
+                pending_hint = None
+                show_hint(driver, None, reason or "No further legal move")
+                print(f"[END] {reason or 'No further legal move'}.", flush=True)
+                return
+
+            pending_hint = hint
+            if show_hint(driver, pending_hint):
+                note = f" · {hint['note']}" if hint.get("note") else ""
+                print(
+                    f"[HINT] {hint['title']} · {hint['san']} · "
+                    f"after={hint['eval']} · {hint['delta']}{note}",
+                    flush=True,
+                )
+                print("[HINT] Trace this same faint arrow with right-click drag to reveal only the next move.", flush=True)
+
+        show_next_step()
+        print("[READY] One faint move is shown at a time; no move is played or premoved.", flush=True)
+        print("[READY] Draw the exact shown arrow to confirm it. Up to four plies total.", flush=True)
         print("[READY] Press Ctrl+C in this terminal to stop.", flush=True)
 
         try:
@@ -871,22 +914,23 @@ def main() -> int:
                     state = driver.execute_script(
                         "return window.__liveGameApiReader?.current?.() || {};"
                     ) or {}
-                    current_fen = str(state.get("fen") or "")
+                    current_fen = str(state.get("fen") or "").strip()
 
-                    if current_fen and last_fen and current_fen != last_fen:
+                    # If the real board is played/reset, discard the hypothetical
+                    # continuation and start one fresh single-move hint.
+                    if current_fen and current_fen != last_fen:
                         clear_generated(driver, generated)
                         try:
-                            driver.execute_script(
-                                "window.__variationLineAnalyzer?.clearLabels?.();"
-                            )
+                            driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
+                            analysis_board = chess.Board(current_fen)
                         except Exception:
-                            pass
-                        set_board_status(
-                            driver,
-                            "Board position changed · old analysis cleared · draw a new arrow"
-                        )
-                    if current_fen:
+                            set_board_status(driver, "Board changed · could not reset analysis position")
+                            time.sleep(0.12)
+                            continue
                         last_fen = current_fen
+                        accepted_steps = 0
+                        pending_hint = None
+                        show_next_step()
 
                     queued = driver.execute_script(
                         "return window.__variationLineAnalyzer ? "
@@ -898,27 +942,59 @@ def main() -> int:
                     for event in queued:
                         if not isinstance(event, dict):
                             continue
-                        try:
-                            # Ignore gestures captured before a position change.
-                            if current_fen and str(event.get("fen") or "") != current_fen:
-                                set_board_status(driver, "Position changed during drag · draw the arrow again")
-                                continue
-                            analyze_arrow(
-                                driver, engine, event, args.plies,
-                                args.search_time, generated
-                            )
-                        except Exception as exc:
-                            set_board_status(
-                                driver,
-                                f"Analysis error · {type(exc).__name__} · see terminal"
-                            )
-                            print(
-                                f"[ANALYSIS ERROR] {type(exc).__name__}: {exc}",
-                                file=sys.stderr, flush=True
+                        event_fen = str(event.get("fen") or "").strip()
+                        if current_fen and event_fen and event_fen != current_fen:
+                            continue
+
+                        event_uci = (
+                            str(event.get("from") or "").lower()
+                            + str(event.get("to") or "").lower()
+                        )
+                        if pending_hint is not None:
+                            expected_uci = str(pending_hint.get("uci") or "").lower()
+                            # Promotion can be drawn as a four-square arrow, so compare
+                            # the source and destination while preserving the engine's
+                            # selected promotion piece in the virtual analysis board.
+                            if event_uci[:4] == expected_uci[:4]:
+                                try:
+                                    accepted_move = chess.Move.from_uci(expected_uci)
+                                    if accepted_move not in analysis_board.legal_moves:
+                                        raise ValueError("hint is no longer legal")
+                                    accepted_san = analysis_board.san(accepted_move)
+                                    analysis_board.push(accepted_move)
+                                    accepted_steps += 1
+                                    pending_hint = None
+                                    try:
+                                        driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
+                                    except Exception:
+                                        pass
+                                    print(
+                                        f"[CONFIRMED] {accepted_san} · "
+                                        f"{accepted_steps}/{args.plies}",
+                                        flush=True,
+                                    )
+                                    show_next_step()
+                                except Exception as exc:
+                                    print(f"[STEP ERROR] Could not advance virtual position ({type(exc).__name__}).", flush=True)
+                                    show_next_step()
+                            else:
+                                # Remove the mistaken solid board annotation and keep
+                                # the one translucent suggestion waiting for confirmation.
+                                remove_unconfirmed_native_arrow(driver, event)
+                                show_hint(pending_hint)
+                                print(
+                                    f"[HINT] Still waiting for {pending_hint.get('san')}; "
+                                    f"'{event_uci}' did not match the faint arrow.",
+                                    flush=True,
+                                )
+                        else:
+                            remove_unconfirmed_native_arrow(driver, event)
+                            show_hint(
+                                driver, None,
+                                f"Preview ended · {accepted_steps}/{args.plies} moves · restart analyzer to begin again"
                             )
                 except tracker.WebDriverException as exc:
-                    set_board_status(driver, f"Browser read failed · {type(exc).__name__}")
-                    print(f"[BROWSER ERROR] {type(exc).__name__}", file=sys.stderr, flush=True)
+                    print(f"[BROWSER ERROR] Board read failed ({type(exc).__name__}).", file=sys.stderr, flush=True)
                 time.sleep(0.12)
         finally:
             try:
