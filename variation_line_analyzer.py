@@ -296,10 +296,10 @@ function drawSuggestions(items) {
     return {x:(boardFile+0.5)*rect.width/8, y:(boardRow+0.5)*rect.height/8};
   };
   const colors = ['#2563eb', '#c2410c'];
-  const opacity = 0.32;
   const defs = make('defs');
   hints.forEach((item, index) => {
     const color = colors[index % colors.length];
+    const opacity = index === 0 ? 0.32 : 0.20;
     const markerId = 'variation-next-arrow-head-' + (index + 1);
     const marker = make('marker', {
       id:markerId, markerWidth:9, markerHeight:9,
@@ -316,6 +316,7 @@ function drawSuggestions(items) {
     const uci = String(item.uci || '').toLowerCase();
     if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uci)) continue;
     const color = colors[index % colors.length];
+    const opacity = index === 0 ? 0.32 : 0.20;
     const a = squarePoint(uci.slice(0,2));
     const b = squarePoint(uci.slice(2,4));
     const dx = b.x-a.x, dy = b.y-a.y;
@@ -347,7 +348,7 @@ function drawSuggestions(items) {
     const evalText = String(item.eval || '');
     const deltaText = String(item.delta || '');
     const noteText = String(item.capture || item.note || '');
-    const titleText = String(item.side || (index===0?'Next':'Reply'));
+    const titleText = String(item.title || item.side || (index===0?'Next':'Reply'));
     const tagWidth = Math.min(rect.width*0.48-4, Math.max(86,(san.length+evalText.length+5)*5.4));
     const tagHeight = noteText ? 42 : 32;
     let tagX = b.x + (index===0 ? 7 : -tagWidth-7);
@@ -634,94 +635,124 @@ def short_eval(value: str) -> str:
     )
 
 
-def calculate_next_hint(
+def calculate_next_hints(
     engine,
     board: chess.Board,
     search_time: float,
     step_number: int,
     max_steps: int,
-) -> tuple[dict | None, str]:
-    """Return exactly one best move for the current virtual position."""
+) -> tuple[list[dict], str]:
+    """Return at most two consecutive PV moves without executing either one."""
     if board.is_game_over(claim_draw=True):
         outcome = board.outcome(claim_draw=True)
         if outcome and outcome.winner is not None:
-            return None, ("Checkmate · White wins" if outcome.winner == chess.WHITE
-                          else "Checkmate · Black wins")
-        return None, "Draw · no further moves"
+            return [], ("Checkmate · White wins" if outcome.winner == chess.WHITE
+                        else "Checkmate · Black wins")
+        return [], "Draw · no further moves"
 
     try:
         info = engine.analyse(board, chess.engine.Limit(time=search_time))
         pv = list(info.get("pv") or [])
         if not pv:
-            return None, "Stockfish returned no legal continuation"
-        move = pv[0]
-        if move not in board.legal_moves:
-            return None, "Stockfish returned an invalid move"
+            return [], "Stockfish returned no legal continuation"
 
-        root_eval, root_value = format_white_score(info["score"].pov(chess.WHITE))
-        san = board.san(move)
-        side = "White" if board.turn == chess.WHITE else "Black"
-        move_prefix = (
-            f"{board.fullmove_number}."
-            if board.turn == chess.WHITE
-            else f"{board.fullmove_number}..."
-        )
-        note = capture_description(board, move)
-        after = board.copy(stack=False)
-        after.push(move)
-        if after.is_checkmate():
-            note = (note + " · " if note else "") + "CHECKMATE"
-        elif after.is_check():
-            note = (note + " · " if note else "") + "CHECK"
-        elif after.is_stalemate():
-            note = (note + " · " if note else "") + "STALEMATE"
+        _, root_value = format_white_score(info["score"].pov(chess.WHITE))
+        remaining_steps = max(0, max_steps - step_number + 1)
+        moves_to_show = min(2, remaining_steps, len(pv))
+        if moves_to_show < 1:
+            return [], "Preview complete"
 
-        after_eval, after_value = eval_white(engine, after, search_time)
-        delta = delta_text(root_value, after_value)
-        capture_short = ""
-        if "captures" in note:
-            piece_name = next(
-                (p for p in ("queen", "rook", "bishop", "knight", "pawn") if p in note),
-                "",
+        line_board = board.copy(stack=False)
+        previous_value = root_value
+        hints: list[dict] = []
+
+        for offset, move in enumerate(pv[:moves_to_show]):
+            if move not in line_board.legal_moves:
+                break
+
+            san = line_board.san(move)
+            side = "White" if line_board.turn == chess.WHITE else "Black"
+            move_prefix = (
+                f"{line_board.fullmove_number}."
+                if line_board.turn == chess.WHITE
+                else f"{line_board.fullmove_number}..."
             )
-            captured_side = "W" if "captures White " in note else ("B" if "captures Black " in note else "")
-            letter = {"queen": "Q", "rook": "R", "bishop": "B", "knight": "N", "pawn": "P"}.get(piece_name, "")
-            if letter:
-                capture_short = f"captures {captured_side}{letter}"
+            note = capture_description(line_board, move)
+            line_board.push(move)
 
-        return {
-            "uci": move.uci(),
-            "san": f"{move_prefix}{san}",
-            "side": side,
-            "eval": short_eval(after_eval),
-            "root_eval": short_eval(root_eval),
-            "delta": delta,
-            "note": note,
-            "capture": capture_short,
-            "title": f"NEXT {step_number}/{max_steps} · {side}",
-            "step": step_number,
-        }, ""
+            if line_board.is_checkmate():
+                note = (note + " · " if note else "") + "CHECKMATE"
+            elif line_board.is_check():
+                note = (note + " · " if note else "") + "CHECK"
+            elif line_board.is_stalemate():
+                note = (note + " · " if note else "") + "STALEMATE"
+
+            after_eval, after_value = eval_white(engine, line_board, search_time)
+            capture_short = ""
+            if "captures" in note:
+                piece_name = next(
+                    (p for p in ("queen", "rook", "bishop", "knight", "pawn") if p in note),
+                    "",
+                )
+                captured_side = (
+                    "W" if "captures White " in note
+                    else ("B" if "captures Black " in note else "")
+                )
+                letter = {
+                    "queen": "Q", "rook": "R", "bishop": "B",
+                    "knight": "N", "pawn": "P",
+                }.get(piece_name, "")
+                if letter:
+                    capture_short = f"captures {captured_side}{letter}"
+
+            if "CHECKMATE" in note:
+                display_eval = "MATE"
+            elif "STALEMATE" in note:
+                display_eval = "DRAW"
+            else:
+                display_eval = short_eval(after_eval)
+
+            hints.append({
+                "uci": move.uci(),
+                "san": f"{move_prefix}{san}",
+                "side": side,
+                "eval": display_eval,
+                "root_eval": short_eval(after_eval),
+                "delta": delta_text(previous_value, after_value),
+                "note": note,
+                "capture": capture_short,
+                "title": f"MOVE {step_number + offset} · {side}",
+                "step": step_number + offset,
+            })
+            previous_value = after_value
+
+            if line_board.is_game_over(claim_draw=True):
+                break
+
+        if not hints:
+            return [], "No legal continuation found"
+        return hints, ""
     except Exception as exc:
-        return None, f"Stockfish error · {type(exc).__name__}"
+        return [], f"Stockfish error · {type(exc).__name__}"
 
 
-def show_hint(driver, hint: dict | None, message: str = "") -> bool:
-    """Display one faint candidate arrow and compact eval on the same board."""
+def show_hints(driver, hints: list[dict], message: str = "") -> bool:
+    """Display at most two faint candidate arrows directly over the same board."""
     try:
-        if hint is None:
+        if not hints:
             result = driver.execute_script(
                 "return window.__variationLineAnalyzer?.drawLabels?.([], [], arguments[0]) || {ok:false};",
                 message or "No suggested continuation",
             )
         else:
             result = driver.execute_script(
-                "return window.__variationLineAnalyzer?.drawSuggestion?.(arguments[0]) || {ok:false};",
-                hint,
+                "return window.__variationLineAnalyzer?.drawSuggestions?.(arguments[0]) || {ok:false};",
+                hints[:2],
             )
         if isinstance(result, dict) and result.get("ok"):
             return True
         reason = result.get("reason", "unknown") if isinstance(result, dict) else "invalid-response"
-        print(f"[BOARD DISPLAY] Could not render the single move hint ({reason}).", flush=True)
+        print(f"[BOARD DISPLAY] Could not render the two-move preview ({reason}).", flush=True)
         return False
     except Exception as exc:
         print(f"[BOARD DISPLAY] Hint display failed ({type(exc).__name__}).", flush=True)
