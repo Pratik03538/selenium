@@ -97,6 +97,46 @@ function findBoard(root = document) {
   }
   return null;
 }
+function resolveBottomSide(board, state = {}) {
+  const apiSide = String(state.bottomSide || '').trim().toLowerCase();
+  if (apiSide === 'white' || apiSide === 'black') return apiSide;
+  let node = board;
+  for (let depth=0; node && depth<6; depth++) {
+    for (const attr of ['data-orientation', 'data-board-orientation', 'orientation']) {
+      const value = String(node.getAttribute?.(attr) || '').trim().toLowerCase();
+      if (value === 'white' || value === 'black') return value;
+    }
+    const tokens = String(node.className?.baseVal || node.className || '').toLowerCase().split(/\s+/);
+    if (tokens.some(t => ['flipped','orientation-black','black-bottom'].includes(t))) return 'black';
+    if (tokens.some(t => ['orientation-white','white-bottom'].includes(t))) return 'white';
+    node = node.parentElement || node.getRootNode?.().host || null;
+  }
+  const roots = [board];
+  if (board?.shadowRoot) roots.push(board.shadowRoot);
+  const visited = new Set();
+  for (let i=0; i<roots.length; i++) {
+    const root = roots[i];
+    if (!root || visited.has(root)) continue;
+    visited.add(root);
+    try {
+      for (const el of root.querySelectorAll('*')) if (el.shadowRoot) roots.push(el.shadowRoot);
+      for (const coords of root.querySelectorAll('.coordinates')) {
+        let y1 = null, y8 = null;
+        for (const child of Array.from(coords.children || [])) {
+          const label = String(child.innerText || child.textContent || '').trim();
+          if (label !== '1' && label !== '8') continue;
+          const r = child.getBoundingClientRect?.();
+          if (!r || !r.width || !r.height) continue;
+          const y = r.top + r.height/2;
+          if (label === '1') y1 = y;
+          if (label === '8') y8 = y;
+        }
+        if (y1 !== null && y8 !== null && Math.abs(y1-y8) > 20) return y1 > y8 ? 'white' : 'black';
+      }
+    } catch (_) {}
+  }
+  return '';
+}
 function clearLabels() {
   if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
   overlay = null;
@@ -142,8 +182,10 @@ function drawLabels(items, details = [], statusText = '') {
   const {board, rect, svg} = setup;
   while (svg.firstChild) svg.removeChild(svg.firstChild);
   const state = api.current() || {};
-  const side = String(state.bottomSide || '').toLowerCase();
-  if (!['white','black'].includes(side)) return {ok:false, reason:'board-orientation-unknown'};
+  const side = resolveBottomSide(board, state);
+  if (!['white','black'].includes(side) && Array.isArray(items) && items.length) {
+    return {ok:false, reason:'board-orientation-unknown'};
+  }
   const make = (tag, attrs, textValue) => {
     const node = document.createElementNS(svgNS, tag);
     for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, String(value));
@@ -263,8 +305,12 @@ function onDown(event) {
   const board = matchingBoard(event);
   if (!board) { down = null; return; }
   const state = api.current() || {};
-  const side = String(state.bottomSide || '').toLowerCase();
-  if (!['white','black'].includes(side)) { down = null; return; }
+  const side = resolveBottomSide(board, state);
+  if (!['white','black'].includes(side)) {
+    down = null;
+    drawLabels([], [], 'Board orientation not detected · check board settings');
+    return;
+  }
   const rect = board.getBoundingClientRect();
   const from = squareAt(board, event.clientX, event.clientY, side);
   if (!from) { down = null; return; }
@@ -305,6 +351,16 @@ window.__variationLineAnalyzer = {
   queue,
   drawLabels,
   clearLabels,
+  diagnostics:() => {
+    const found = findBoard();
+    const rect = found?.getBoundingClientRect?.();
+    return {
+      boardFound:!!found, boardTag:found?.tagName || '',
+      boardWidth:rect?.width || 0, boardHeight:rect?.height || 0,
+      bottomSide:resolveBottomSide(found, api.current() || {}) || 'unknown',
+      selectors:boardSelectors
+    };
+  },
   get suppress() { return suppress; },
   set suppress(value) { suppress = !!value; },
   stop:() => {
@@ -715,6 +771,20 @@ def main() -> int:
         if not isinstance(watch_result, dict) or not watch_result.get("ok"):
             print("[BOARD ERROR] Could not install the right-click line listener.", file=sys.stderr)
             return 2
+        try:
+            diagnostics = driver.execute_script(
+                "return window.__variationLineAnalyzer?.diagnostics?.() || {};"
+            ) or {}
+            print(
+                "[BOARD] Listener installed | "
+                f"boardFound={diagnostics.get('boardFound')} | "
+                f"tag={diagnostics.get('boardTag') or 'unknown'} | "
+                f"size={diagnostics.get('boardWidth', 0)}x{diagnostics.get('boardHeight', 0)} | "
+                f"orientation={diagnostics.get('bottomSide', 'unknown')}",
+                flush=True,
+            )
+        except Exception:
+            pass
 
         configured_path = args.stockfish_path.strip() or tracker.load_optional_txt_setting("stockfish_path") or "stockfish.exe"
         engine_path = Path(configured_path).expanduser()
