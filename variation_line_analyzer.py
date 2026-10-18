@@ -1,11 +1,9 @@
-"""Standalone hypothetical-line analyzer for the configured authorized chess board.
+"""Standalone hypothetical-line analyzer for an authorized study/test board.
 
-The existing seleniumbase_live_game_tracker.py is imported only for its established
-Chrome attach, site allowlist, board observer, and native-arrow helpers. This file
-does not modify the tracker or submit chess moves. It watches user-drawn right-click
-arrows, treats a legal arrow as a hypothetical first move, and draws a Stockfish PV
-as additional native board arrows while showing numbered SAN/evaluation/capture
-details in a companion window.
+Reuses the tracker’s allowlist, Chrome attach, board reader, and native-arrow
+helpers without modifying the tracker. It shows up to two faint sequential
+Stockfish move suggestions on the board; tracing the first suggestion advances
+the hypothetical position. It never submits a chess move or premove.
 """
 from __future__ import annotations
 
@@ -908,42 +906,47 @@ def main() -> int:
             return 2
 
         accepted_steps = 0
-        pending_hint: dict | None = None
+        pending_hints: list[dict] = []
 
         def show_next_step() -> None:
-            nonlocal pending_hint
+            nonlocal pending_hints
             if accepted_steps >= args.plies:
-                pending_hint = None
-                show_hint(
-                    driver, None,
+                pending_hints = []
+                show_hints(
+                    driver, [],
                     f"Preview complete · {accepted_steps}/{args.plies} moves confirmed · restart analyzer to begin again"
                 )
                 print(f"[DONE] Sequential preview finished after {accepted_steps} moves.", flush=True)
                 return
 
-            hint, reason = calculate_next_hint(
+            hints, reason = calculate_next_hints(
                 engine, analysis_board, args.search_time,
                 accepted_steps + 1, args.plies,
             )
-            if hint is None:
-                pending_hint = None
-                show_hint(driver, None, reason or "No further legal move")
+            if not hints:
+                pending_hints = []
+                show_hints(driver, [], reason or "No further legal move")
                 print(f"[END] {reason or 'No further legal move'}.", flush=True)
                 return
 
-            pending_hint = hint
-            if show_hint(driver, pending_hint):
-                note = f" · {hint['note']}" if hint.get("note") else ""
+            pending_hints = hints[:2]
+            if show_hints(driver, pending_hints):
+                for hint in pending_hints:
+                    note = f" · {hint['note']}" if hint.get("note") else ""
+                    print(
+                        f"[HINT {hint['step']}] {hint['title']} · {hint['san']} · "
+                        f"after={hint['eval']} · {hint['delta']}{note}",
+                        flush=True,
+                    )
                 print(
-                    f"[HINT] {hint['title']} · {hint['san']} · "
-                    f"after={hint['eval']} · {hint['delta']}{note}",
+                    "[HINT] The first arrow advances the sequence. Draw it to refresh the next two hints.",
                     flush=True,
                 )
-                print("[HINT] Trace this same faint arrow with right-click drag to reveal only the next move.", flush=True)
 
         show_next_step()
-        print("[READY] One faint move is shown at a time; no move is played or premoved.", flush=True)
-        print("[READY] Draw the exact shown arrow to confirm it. Up to four plies total.", flush=True)
+        print("[READY] At most two faint numbered arrows are shown on the board.", flush=True)
+        print("[READY] Draw the FIRST hinted arrow; then the next two suggestions will appear.", flush=True)
+        print("[READY] Nothing is played or premoved. Preview is limited to four confirmed plies.", flush=True)
         print("[READY] Press Ctrl+C in this terminal to stop.", flush=True)
 
         try:
@@ -954,8 +957,8 @@ def main() -> int:
                     ) or {}
                     current_fen = str(state.get("fen") or "").strip()
 
-                    # If the real board is played/reset, discard the hypothetical
-                    # continuation and start one fresh single-move hint.
+                    # A real board move resets the hypothetical branch to the
+                    # actual position. Drawing annotations alone leaves FEN unchanged.
                     if current_fen and current_fen != last_fen:
                         clear_generated(driver, generated)
                         try:
@@ -967,7 +970,7 @@ def main() -> int:
                             continue
                         last_fen = current_fen
                         accepted_steps = 0
-                        pending_hint = None
+                        pending_hints = []
                         show_next_step()
 
                     queued = driver.execute_script(
@@ -988,24 +991,21 @@ def main() -> int:
                             str(event.get("from") or "").lower()
                             + str(event.get("to") or "").lower()
                         )
-                        if pending_hint is not None:
-                            expected_uci = str(pending_hint.get("uci") or "").lower()
-                            # Promotion can be drawn as a four-square arrow, so compare
-                            # the source and destination while preserving the engine's
-                            # selected promotion piece in the virtual analysis board.
+                        if pending_hints:
+                            expected_uci = str(pending_hints[0].get("uci") or "").lower()
+                            # Only the first move is confirmed at each stage. The
+                            # second arrow is a preview of the following reply.
                             if event_uci[:4] == expected_uci[:4]:
                                 try:
                                     accepted_move = chess.Move.from_uci(expected_uci)
                                     if accepted_move not in analysis_board.legal_moves:
                                         raise ValueError("hint is no longer legal")
                                     accepted_san = analysis_board.san(accepted_move)
+                                    # Remove the solid native arrow the user just drew.
+                                    remove_unconfirmed_native_arrow(driver, event)
                                     analysis_board.push(accepted_move)
                                     accepted_steps += 1
-                                    pending_hint = None
-                                    try:
-                                        driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
-                                    except Exception:
-                                        pass
+                                    pending_hints = []
                                     print(
                                         f"[CONFIRMED] {accepted_san} · "
                                         f"{accepted_steps}/{args.plies}",
@@ -1016,19 +1016,20 @@ def main() -> int:
                                     print(f"[STEP ERROR] Could not advance virtual position ({type(exc).__name__}).", flush=True)
                                     show_next_step()
                             else:
-                                # Remove the mistaken solid board annotation and keep
-                                # the one translucent suggestion waiting for confirmation.
+                                # A different line was drawn. Remove that annotation
+                                # and keep both suggestions unchanged.
                                 remove_unconfirmed_native_arrow(driver, event)
-                                show_hint(pending_hint)
+                                show_hints(driver, pending_hints)
+                                expected_san = pending_hints[0].get("san", "first hinted move")
                                 print(
-                                    f"[HINT] Still waiting for {pending_hint.get('san')}; "
-                                    f"'{event_uci}' did not match the faint arrow.",
+                                    f"[HINT] Still waiting for {expected_san}; "
+                                    f"'{event_uci}' did not match the first arrow.",
                                     flush=True,
                                 )
                         else:
                             remove_unconfirmed_native_arrow(driver, event)
-                            show_hint(
-                                driver, None,
+                            show_hints(
+                                driver, [],
                                 f"Preview ended · {accepted_steps}/{args.plies} moves · restart analyzer to begin again"
                             )
                 except tracker.WebDriverException as exc:
