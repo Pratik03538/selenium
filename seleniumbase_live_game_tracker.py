@@ -977,12 +977,10 @@ def prepare_bot_components(args, allowed_host, installed):
         print("[INPUT] Native right-click board-arrow mode enabled; selected moves and premoves are not submitted.", flush=True)
     else:
         print("[AUTO] ChessKida move-selection behavior enabled for the configured, non-blocked test site.", flush=True)
-    if args.show_move_mode and not args.auto_play:
-        pass
-    elif args.move_input == "cursor":
-        print("[INPUT] Cursor drag mode enabled for the configured test board; public competitive hosts remain blocked.", flush=True)
-    else:
-        print("[INPUT] Direct game API mode enabled.", flush=True)
+        if args.move_input == "cursor":
+            print("[INPUT] Cursor drag mode enabled for the configured test board; public competitive hosts remain blocked.", flush=True)
+        else:
+            print("[INPUT] Direct game API mode enabled.", flush=True)
     print(
         f"[ENGINE] Threads=2 | Hash=128 MB | depth=12 | "
         f"MultiPV={strategy_module.TRAINING_MULTI_PV} | time={max(0.005, min(float(args.engine_time), 5.0)):.3f}s.",
