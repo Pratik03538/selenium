@@ -1,10 +1,9 @@
-"""Interactive hypothetical-line analyzer for an authorized study/test board.
+"""Interactive line analyzer for an authorized study/test board.
 
-Reuses the tracker’s allowlist, Chrome attach, board reader, and native-arrow
-helpers without modifying the tracker. It shows two faint sequential Stockfish
-suggestions; drawing any legal arrow selects that move and recalculates the next
-two suggestions from the resulting hypothetical position. It never submits a
-chess move or premove.
+Reuses the tracker's allowlist, Chrome attach, board reader, and native-arrow
+helpers. When launched by the tracker, SHOW MOVE ON switches its existing BOT
+off and shows hints; SHOW MOVE OFF switches the tracker BOT on. This analyzer
+does not submit moves itself, and public competitive hosts remain blocked.
 """
 from __future__ import annotations
 
