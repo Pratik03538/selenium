@@ -20,6 +20,7 @@ import subprocess
 import zipfile
 import sys
 import threading
+import tempfile
 import time
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -353,6 +354,18 @@ def load_optional_txt_setting(setting_key: str) -> str:
                 return value.strip().strip('"').strip("'")
     return ""
 
+
+
+def read_analyzer_autoplay_request(path: Path | None) -> bool | None:
+    """Read the analyzer's atomic mode request; invalid/partial files are ignored."""
+    if path is None:
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    value = payload.get("autoplay_enabled") if isinstance(payload, dict) else None
+    return value if isinstance(value, bool) else None
 
 
 class RuntimeSettingsWindow:
@@ -4308,6 +4321,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    analyzer_process: subprocess.Popen | None = None
+    autoplay_control_file: Path | None = None
+    last_analyzer_mode: bool | None = None
     try:
         blocked_platforms = load_blocked_platforms()
     except RuntimeError:
@@ -4670,12 +4686,86 @@ def main() -> int:
             except Exception:
                 print("[GUI] Runtime settings window could not be opened; continuing with TXT/CLI settings.", flush=True)
 
+            # The tracker remains the only move-submission process. The analyzer
+            # is launched as a companion and controls this existing BOT switch
+            # through a private temporary mode file.
+            analyzer_path = BASE_DIR / "variation_line_analyzer.py"
+            if args.browser_mode == "attach" and analyzer_path.is_file():
+                try:
+                    if is_public_competitive_host(allowed_host):
+                        raise RuntimeError("public competitive host is blocked")
+                    temp_handle = tempfile.NamedTemporaryFile(
+                        prefix="variation_line_mode_", suffix=".json",
+                        dir=str(BASE_DIR), delete=False,
+                    )
+                    autoplay_control_file = Path(temp_handle.name)
+                    temp_handle.close()
+                    analyzer_command = [
+                        sys.executable, str(analyzer_path),
+                        "--debugger-address", args.debugger_address,
+                        "--allowed-domain", allowed_host,
+                        "--board-selector", args.board_selector,
+                        "--window-handle", str(chosen_handle),
+                        "--autoplay-control-file", str(autoplay_control_file),
+                    ]
+                    if args.stockfish_path.strip():
+                        analyzer_command.extend(["--stockfish-path", args.stockfish_path.strip()])
+                    analyzer_process = subprocess.Popen(
+                        analyzer_command, cwd=str(BASE_DIR)
+                    )
+                    print(
+                        "[ANALYZER] variation_line_analyzer.py started automatically. "
+                        "SHOW MOVE: ON pauses tracker autoplay; OFF selects autoplay mode "
+                        "for the configured authorized test site.",
+                        flush=True,
+                    )
+                except (OSError, RuntimeError) as exc:
+                    print(
+                        f"[ANALYZER] Auto-start skipped ({type(exc).__name__}); "
+                        "the live tracker remains available.",
+                        flush=True,
+                    )
+                    if autoplay_control_file is not None:
+                        try:
+                            autoplay_control_file.unlink()
+                        except OSError:
+                            pass
+                        autoplay_control_file = None
+            elif args.browser_mode != "attach":
+                print(
+                    "[ANALYZER] Auto-start requires browser_mode=attach; "
+                    "the UC-mode tracker continues unchanged.",
+                    flush=True,
+                )
+
             while True:
                 if settings_window is not None:
                     settings_window.pump()
                     if settings_window.stop_requested:
                         print("[STOP] Stop requested from runtime settings window.", flush=True)
                         break
+                requested_autoplay = read_analyzer_autoplay_request(autoplay_control_file)
+                if requested_autoplay is not None and requested_autoplay != last_analyzer_mode:
+                    last_analyzer_mode = requested_autoplay
+                    if requested_autoplay and is_public_competitive_host(allowed_host):
+                        args.auto_play = False
+                        if settings_window is not None:
+                            settings_window.set_enabled("auto_play", False)
+                        print("[MODE] Autoplay request rejected for a public competitive host.", flush=True)
+                    else:
+                        args.auto_play = requested_autoplay
+                        if settings_window is not None:
+                            settings_window.set_enabled("auto_play", requested_autoplay)
+                            settings_window.status.set(
+                                "SHOW MOVE is OFF; tracker autoplay is active on the configured test site."
+                                if requested_autoplay else
+                                "SHOW MOVE is ON; tracker autoplay is paused."
+                            )
+                        print(
+                            "[MODE] SHOW MOVE: "
+                            + ("OFF -> tracker BOT ON." if requested_autoplay else "ON -> tracker BOT OFF."),
+                            flush=True,
+                        )
                 # If Bot was OFF at startup, initialize the engine only when it is switched ON.
                 if args.auto_play and engine is None:
                     try:
@@ -5997,6 +6087,22 @@ def main() -> int:
         print("[ERROR] Browser session or site-tab selection failed. Site details were not logged.", file=sys.stderr, flush=True)
         return 2
     finally:
+        if analyzer_process is not None:
+            try:
+                if analyzer_process.poll() is None:
+                    analyzer_process.terminate()
+                    try:
+                        analyzer_process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        analyzer_process.kill()
+                        analyzer_process.wait(timeout=2)
+            except Exception:
+                pass
+        if autoplay_control_file is not None:
+            try:
+                autoplay_control_file.unlink()
+            except OSError:
+                pass
         if book is not None:
             try:
                 book.close()
