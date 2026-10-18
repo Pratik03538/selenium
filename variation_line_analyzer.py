@@ -55,6 +55,9 @@ if (window.__variationLineAnalyzer) {
   try { window.__variationLineAnalyzer.stop(); } catch (_) {}
 }
 const queue = [];
+// Track only native arrows drawn through this listener. Repeating the same
+// right-drag toggles that annotation off, which must reset the line queue.
+const userArrows = new Set();
 let down = null;
 let suppress = false;
 let overlay = null;
@@ -433,18 +436,40 @@ function onUp(event) {
   const saved = down;
   down = null;
   const to = squareAt(saved.board, event.clientX, event.clientY, saved.side);
-  if (!to || to === saved.from) return;
+  // Releasing outside the board is an interrupted gesture, not a queue reset.
+  if (!to) return;
   const state = api.current() || {};
   const fen = String(state.fen || '');
   if (!fen || fen !== saved.fen) return;
+
+  if (to === saved.from) {
+    // A right-click without a drag is the user's explicit clear-all gesture.
+    userArrows.clear();
+    queue.push({action:'clear_all', fen, at:Date.now()});
+    if (queue.length > 20) queue.splice(0, queue.length-20);
+    drawLabels([], [], 'Queue cleared · draw a new legal arrow to begin');
+    return;
+  }
+
+  const uci = saved.from + to;
+  const wasDrawnByUser = userArrows.has(uci);
+  if (wasDrawnByUser) userArrows.delete(uci);
+  else userArrows.add(uci);
+
   queue.push({
-    from:saved.from, to, fen,
+    action:wasDrawnByUser ? 'clear' : 'draw',
+    from:saved.from, to, uci, fen,
     geometry:saved.rect,
     bottomSide:saved.side,
     at:Date.now()
   });
   if (queue.length > 20) queue.splice(0, queue.length-20);
-  drawLabels([], [], 'Arrow detected: ' + saved.from + ' → ' + to + ' · analyzing…');
+  drawLabels(
+    [], [],
+    wasDrawnByUser
+      ? 'Arrow toggled off · queue cleared'
+      : 'Your arrow detected: ' + saved.from + ' → ' + to + ' · analyzing…'
+  );
 }
 function onContextMenu(event) {
   if (matchingBoard(event)) event.preventDefault();
@@ -464,6 +489,7 @@ window.__variationLineAnalyzer = {
       boardFound:!!found, boardTag:found?.tagName || '',
       boardWidth:rect?.width || 0, boardHeight:rect?.height || 0,
       bottomSide:resolveBottomSide(found, api.current() || {}) || 'unknown',
+      trackedUserArrows:userArrows.size,
       selectors:boardSelectors
     };
   },
@@ -475,6 +501,7 @@ window.__variationLineAnalyzer = {
     window.removeEventListener('contextmenu', onContextMenu, true);
     clearLabels();
     queue.length = 0;
+    userArrows.clear();
     delete window.__variationLineAnalyzer;
   }
 };
@@ -908,14 +935,20 @@ def main() -> int:
 
         accepted_steps = 0
         pending_hints: list[dict] = []
+        branch_active = False
 
         def show_next_step() -> None:
             nonlocal pending_hints
+            if not branch_active:
+                pending_hints = []
+                show_hints(driver, [], "Queue empty · draw a legal arrow to begin")
+                return
+
             if accepted_steps >= args.plies:
                 pending_hints = []
                 show_hints(
                     driver, [],
-                    f"Preview complete · {accepted_steps}/{args.plies} moves confirmed · restart analyzer to begin again"
+                    f"Preview complete · {accepted_steps}/{args.plies} moves · clear arrows to start a new line"
                 )
                 print(f"[DONE] Sequential preview finished after {accepted_steps} moves.", flush=True)
                 return
@@ -940,14 +973,16 @@ def main() -> int:
                         flush=True,
                     )
                 print(
-                    "[HINT] The first arrow advances the sequence. Draw it to refresh the next two hints.",
+                    "[HINT] Draw the first hint to continue; another legal arrow selects a branch. "
+                    "Clear/toggle off an arrow to reset the queue.",
                     flush=True,
                 )
 
-        show_next_step()
-        print("[READY] At most two faint numbered arrows are shown on the board.", flush=True)
-        print("[READY] Draw the first hint to follow its line, or any other legal move arrow to branch elsewhere.", flush=True)
-        print("[READY] Nothing is played or premoved. Each selected line previews up to four plies.", flush=True)
+        show_hints(driver, [], "Queue empty · draw a legal arrow to begin")
+        print("[READY] No suggestions are shown until you draw a native right-click arrow.", flush=True)
+        print("[READY] Your drawn arrow selects the starting move; the next two suggestions then appear.", flush=True)
+        print("[READY] Drawing the first hinted move continues that line; clearing an arrow resets the queue.", flush=True)
+        print("[READY] Nothing is played or premoved. Preview is limited to four plies.", flush=True)
         print("[READY] Press Ctrl+C in this terminal to stop.", flush=True)
 
         try:
@@ -972,7 +1007,9 @@ def main() -> int:
                         last_fen = current_fen
                         accepted_steps = 0
                         pending_hints = []
-                        show_next_step()
+                        branch_active = False
+                        show_hints(driver, [], "Board position changed · queue reset · draw a new arrow")
+                        print("[RESET] Board position changed; waiting for your next arrow.", flush=True)
 
                     queued = driver.execute_script(
                         "return window.__variationLineAnalyzer ? "
@@ -988,10 +1025,33 @@ def main() -> int:
                         if current_fen and event_fen and event_fen != current_fen:
                             continue
 
-                        event_uci = (
+                        action = str(event.get("action") or "draw").lower()
+                        if action in {"clear", "clear_all"}:
+                            # Removing one tracked arrow or explicitly clearing the
+                            # board resets the hypothetical line. Wait for a fresh arrow.
+                            reset_fen = current_fen or last_fen
+                            try:
+                                analysis_board = chess.Board(reset_fen)
+                                last_fen = reset_fen
+                            except ValueError:
+                                show_hints(driver, [], "Queue cleared · current board position is invalid")
+                                continue
+                            accepted_steps = 0
+                            pending_hints = []
+                            branch_active = False
+                            show_hints(driver, [], "Queue cleared · draw a new legal arrow to begin")
+                            print(
+                                "[RESET] User cleared/toggled off an arrow; variation queue cleared.",
+                                flush=True,
+                            )
+                            continue
+
+                        if action != "draw":
+                            continue
+                        event_uci = str(event.get("uci") or (
                             str(event.get("from") or "").lower()
                             + str(event.get("to") or "").lower()
-                        )
+                        )).lower()
                         if len(event_uci) < 4:
                             continue
 
@@ -999,11 +1059,12 @@ def main() -> int:
                         followed_hint = False
                         first_hint_uci = (
                             str(pending_hints[0].get("uci") or "").lower()
-                            if pending_hints else ""
+                            if branch_active and pending_hints else ""
                         )
 
-                        # Following the first displayed arrow continues that
-                        # line. Any other legal arrow starts a fresh branch.
+                        # The user's first arrow starts the queue. While a queue
+                        # exists, tracing its first hint continues it; any other
+                        # legal move starts a different branch from this position.
                         if first_hint_uci and event_uci[:4] == first_hint_uci[:4]:
                             try:
                                 suggested_move = chess.Move.from_uci(first_hint_uci)
@@ -1018,8 +1079,7 @@ def main() -> int:
                                 from_square = chess.parse_square(event_uci[:2])
                                 to_square = chess.parse_square(event_uci[2:4])
                             except ValueError:
-                                remove_unconfirmed_native_arrow(driver, event)
-                                show_hints(driver, pending_hints, "Invalid arrow · draw a legal move")
+                                print(f"[MOVE IGNORED] Invalid arrow coordinates: {event_uci[:4]}.", flush=True)
                                 continue
 
                             legal_candidates = [
@@ -1036,26 +1096,24 @@ def main() -> int:
                                 )
 
                         if chosen_move is None:
-                            remove_unconfirmed_native_arrow(driver, event)
-                            show_hints(driver, pending_hints)
                             print(
                                 f"[MOVE IGNORED] {event_uci[:4]} is not legal in the current "
-                                "hypothetical position. Draw a legal move arrow to choose a branch.",
+                                "hypothetical position. The arrow stays on the board; clear arrows "
+                                "to reset, or draw a legal move to continue.",
                                 flush=True,
                             )
                             continue
 
                         try:
                             accepted_san = analysis_board.san(chosen_move)
-                            remove_unconfirmed_native_arrow(driver, event)
-
-                            if not followed_hint:
-                                # Switching to an unhinted move starts a new
-                                # four-ply preview budget from that branch.
+                            if not branch_active or not followed_hint:
+                                # A first arrow starts the sequence. A different legal
+                                # arrow during a sequence starts a new branch here.
                                 accepted_steps = 0
 
                             analysis_board.push(chosen_move)
                             accepted_steps += 1
+                            branch_active = True
                             pending_hints = []
 
                             if followed_hint:
@@ -1064,10 +1122,16 @@ def main() -> int:
                                     f"{accepted_steps}/{args.plies} · continuing hinted line",
                                     flush=True,
                                 )
+                            elif accepted_steps == 1:
+                                print(
+                                    f"[START] Your arrow selected {accepted_san} · "
+                                    f"starting the variation ({accepted_steps}/{args.plies})",
+                                    flush=True,
+                                )
                             else:
                                 print(
-                                    f"[BRANCH] {accepted_san} · new hypothetical line "
-                                    f"({accepted_steps}/{args.plies})",
+                                    f"[BRANCH] Your arrow selected {accepted_san} · "
+                                    f"new variation from this position ({accepted_steps}/{args.plies})",
                                     flush=True,
                                 )
                             show_next_step()
