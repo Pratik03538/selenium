@@ -335,7 +335,7 @@ function drawSuggestion(item) {
   const statusText = String(item?.title || 'NEXT MOVE');
   const noteText = String(item?.note || '');
   const tagWidth = Math.min(rect.width-10, Math.max(70, (tagText.length+evalText.length+4)*6.2));
-  const tagHeight = Math.min(66, Math.max(43, rect.height*0.12));
+  const tagHeight = Math.min(70, Math.max(noteText ? 57 : 43, rect.height*0.14));
   let tagX = b.x + 7;
   if (tagX+tagWidth > rect.width-3) tagX = b.x-tagWidth-7;
   tagX = Math.max(3,tagX);
