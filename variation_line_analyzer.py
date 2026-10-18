@@ -60,6 +60,12 @@ const queue = [];
 const userArrows = new Set();
 let down = null;
 let suppress = false;
+let turnHintEnabled = false;
+let turnHintStatus = 'OFF · no move is played';
+let turnControl = null;
+let turnControlButton = null;
+let turnControlStatus = null;
+let turnHintOverlay = null;
 let overlay = null;
 let overlayHost = null;
 let originalHostPosition = '';
@@ -397,6 +403,160 @@ function drawSuggestions(items, statusText = '') {
   }
   return {ok:true, count:hints.length, boardFound:true};
 }
+function refreshTurnControlText() {
+  if (turnControlButton) {
+    turnControlButton.textContent = 'SHOW MOVE: ' + (turnHintEnabled ? 'ON' : 'OFF');
+    turnControlButton.style.background = turnHintEnabled ? '#166534' : '#334155';
+    turnControlButton.style.borderColor = turnHintEnabled ? '#86efac' : '#94a3b8';
+    turnControlButton.setAttribute('aria-pressed', turnHintEnabled ? 'true' : 'false');
+  }
+  if (turnControlStatus) {
+    turnControlStatus.textContent = String(turnHintStatus || '');
+  }
+}
+function setTurnHintStatus(message) {
+  turnHintStatus = String(message || '');
+  refreshTurnControlText();
+  return {ok:true, status:turnHintStatus};
+}
+function positionTurnControl() {
+  if (!turnControl) return;
+  const board = findBoard();
+  const rect = board?.getBoundingClientRect?.();
+  const panelWidth = 142;
+  let left = rect && rect.width ? rect.right + 10 : 12;
+  // Keep the control adjacent to the board's right edge whenever the viewport allows it.
+  if (left + panelWidth > window.innerWidth - 4) {
+    left = Math.max(4, window.innerWidth - panelWidth - 4);
+  }
+  const top = rect && rect.height
+    ? Math.max(8, Math.min(rect.top + 6, window.innerHeight - 92))
+    : 12;
+  turnControl.style.left = Math.round(left) + 'px';
+  turnControl.style.top = Math.round(top) + 'px';
+}
+function ensureTurnControl() {
+  if (!turnControl || !turnControl.isConnected) {
+    turnControl = document.createElement('div');
+    turnControl.setAttribute('data-variation-turn-control', 'true');
+    turnControl.style.cssText = [
+      'position:fixed','width:142px','box-sizing:border-box','padding:7px',
+      'border:1px solid #cbd5e1','border-radius:8px','background:rgba(15,23,42,.98)',
+      'box-shadow:0 4px 14px rgba(0,0,0,.28)','z-index:2147483647',
+      'font-family:Segoe UI,Arial,sans-serif','pointer-events:auto'
+    ].join(';');
+
+    turnControlButton = document.createElement('button');
+    turnControlButton.type = 'button';
+    turnControlButton.style.cssText = [
+      'width:100%','min-height:34px','border:1px solid #94a3b8','border-radius:6px',
+      'color:#fff','font-weight:800','font-size:12px','letter-spacing:.2px',
+      'cursor:pointer','padding:6px 4px','opacity:1'
+    ].join(';');
+    turnControlButton.addEventListener('click', () => {
+      turnHintEnabled = !turnHintEnabled;
+      turnHintStatus = turnHintEnabled
+        ? 'ON · checking whose turn it is'
+        : 'OFF · no move is played';
+      if (!turnHintEnabled) clearTurnSuggestion();
+      else clearTurnSuggestion();
+      refreshTurnControlText();
+    });
+
+    turnControlStatus = document.createElement('div');
+    turnControlStatus.style.cssText = [
+      'margin-top:7px','color:#f8fafc','font-size:10px','line-height:1.35',
+      'font-weight:650','overflow-wrap:anywhere','opacity:1'
+    ].join(';');
+    turnControlStatus.textContent = turnHintStatus;
+    turnControl.appendChild(turnControlButton);
+    turnControl.appendChild(turnControlStatus);
+    (document.body || document.documentElement).appendChild(turnControl);
+    refreshTurnControlText();
+  }
+  positionTurnControl();
+  return {ok:true, enabled:turnHintEnabled};
+}
+function clearTurnSuggestion() {
+  if (turnHintOverlay && turnHintOverlay.parentNode) {
+    turnHintOverlay.parentNode.removeChild(turnHintOverlay);
+  }
+  turnHintOverlay = null;
+  return {ok:true};
+}
+function drawTurnSuggestion(item) {
+  const setup = ensureOverlay();
+  if (!setup || !setup.ok) return {ok:false, reason:setup?.reason || 'board-element-not-found'};
+  const {board, rect} = setup;
+  const side = resolveBottomSide(board, api.current() || {});
+  if (!['white','black'].includes(side)) return {ok:false, reason:'board-orientation-unknown'};
+  const uci = String(item?.uci || '').toLowerCase();
+  if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uci)) return {ok:false, reason:'invalid-selected-move'};
+
+  if (turnHintOverlay && turnHintOverlay.parentNode) {
+    turnHintOverlay.parentNode.removeChild(turnHintOverlay);
+  }
+  const svg = document.createElementNS(svgNS, 'svg');
+  svg.setAttribute('data-variation-turn-hint', 'true');
+  svg.setAttribute('viewBox', '0 0 ' + rect.width + ' ' + rect.height);
+  svg.setAttribute('width', String(rect.width));
+  svg.setAttribute('height', String(rect.height));
+  svg.style.cssText = [
+    'position:fixed','left:'+rect.left+'px','top:'+rect.top+'px',
+    'width:'+rect.width+'px','height:'+rect.height+'px','margin:0','padding:0',
+    'overflow:hidden','pointer-events:none','z-index:2147483646'
+  ].join(';');
+
+  const make = (tag, attrs, textValue) => {
+    const node = document.createElementNS(svgNS, tag);
+    for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, String(value));
+    if (textValue !== undefined) node.textContent = String(textValue);
+    return node;
+  };
+  const point = square => {
+    const file = square.charCodeAt(0)-97;
+    const rank = Number(square[1]);
+    const boardFile = side === 'white' ? file : 7-file;
+    const boardRow = side === 'white' ? 8-rank : rank-1;
+    return {x:(boardFile+0.5)*rect.width/8, y:(boardRow+0.5)*rect.height/8};
+  };
+  const a=point(uci.slice(0,2)), b=point(uci.slice(2,4));
+  const dx=b.x-a.x, dy=b.y-a.y;
+  const length=Math.max(1,Math.hypot(dx,dy));
+  const ux=dx/length, uy=dy/length;
+  const inset=Math.min(rect.width,rect.height)/19;
+  const marker=make('marker',{id:'variation-turn-head',markerWidth:10,markerHeight:10,refX:8,refY:5,orient:'auto',markerUnits:'userSpaceOnUse'});
+  marker.appendChild(make('path',{d:'M0,0 L10,5 L0,10 z',fill:'#16a34a',opacity:0.30}));
+  const defs=make('defs');
+  defs.appendChild(marker);
+  svg.appendChild(defs);
+  svg.appendChild(make('line',{
+    x1:a.x,y1:a.y,x2:b.x-ux*inset,y2:b.y-uy*inset,
+    stroke:'#15803d','stroke-width':Math.max(3,rect.width/125),
+    'stroke-linecap':'round','stroke-dasharray':'5 5',
+    opacity:0.30,'marker-end':'url(#variation-turn-head)'
+  }));
+
+  const text='TURN MOVE · '+String(item?.san || uci);
+  const fontSize=Math.max(10,Math.min(12,rect.width/48));
+  const boxWidth=Math.min(rect.width-8,Math.max(108,text.length*fontSize*0.58+16));
+  let x=Math.min(rect.width-boxWidth-4,Math.max(4,b.x+7));
+  let y=b.y+9;
+  if (y+27>rect.height) y=Math.max(4,b.y-32);
+  svg.appendChild(make('rect',{
+    x,y,width:boxWidth,height:25,rx:5,
+    fill:'#f0fdf4','fill-opacity':0.97,stroke:'#15803d','stroke-width':1.1,opacity:0.98
+  }));
+  svg.appendChild(make('text',{
+    x:x+8,y:y+16,'font-family':'Segoe UI,Arial,sans-serif',
+    'font-size':fontSize,'font-weight':'800',fill:'#14532d',opacity:0.99
+  },text));
+  (document.body || document.documentElement).appendChild(svg);
+  turnHintOverlay=svg;
+  positionTurnControl();
+  return {ok:true, uci, san:String(item?.san || uci)};
+}
+
 function matchingBoard(event) {
   const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
   for (const node of path) {
@@ -499,6 +659,11 @@ window.__variationLineAnalyzer = {
   drawSuggestions,
   clearLabels,
   resetTrackedArrows:() => { userArrows.clear(); return true; },
+  getTurnHintState:() => ({enabled:turnHintEnabled,status:turnHintStatus}),
+  setTurnHintStatus,
+  drawTurnSuggestion,
+  clearTurnSuggestion,
+  ensureTurnControl,
   diagnostics:() => {
     const found = findBoard();
     const rect = found?.getBoundingClientRect?.();
@@ -516,12 +681,22 @@ window.__variationLineAnalyzer = {
     window.removeEventListener('pointerdown', onDown, true);
     window.removeEventListener('pointerup', onUp, true);
     window.removeEventListener('contextmenu', onContextMenu, true);
+    window.removeEventListener('resize', positionTurnControl, true);
+    window.removeEventListener('scroll', positionTurnControl, true);
     clearLabels();
+    clearTurnSuggestion();
+    if (turnControl && turnControl.parentNode) turnControl.parentNode.removeChild(turnControl);
+    turnControl = null;
+    turnControlButton = null;
+    turnControlStatus = null;
     queue.length = 0;
     userArrows.clear();
     delete window.__variationLineAnalyzer;
   }
 };
+ensureTurnControl();
+window.addEventListener('resize', positionTurnControl, true);
+window.addEventListener('scroll', positionTurnControl, true);
 return {ok:true};
 """
 
@@ -1137,12 +1312,18 @@ def main() -> int:
             print("[BOOK] GM opening book unavailable; continuing with the ChessKida selector.", flush=True)
             book = None
 
+        configured_turn_color = tracker.normalize_chess_color(
+            tracker.load_optional_txt_setting("bot_color")
+        )
         accepted_steps = 0
         pending_hints: list[dict] = []
         branch_active = False
         awaiting_clear = False
         queued_followup_hint: dict | None = None
         line_previous_eval_white_cp: int | None = None
+        turn_hint_was_enabled = False
+        turn_hint_last_fen = ""
+        turn_hint_last_status = "OFF"
 
         def show_next_step() -> None:
             nonlocal pending_hints, awaiting_clear, queued_followup_hint
@@ -1243,6 +1424,118 @@ def main() -> int:
                         show_hints(driver, [], "Board position changed · queue reset · draw a new arrow")
                         print("[RESET] Board position changed; waiting for your next arrow.", flush=True)
 
+                    turn_hint_ui = driver.execute_script(
+                        "return window.__variationLineAnalyzer?.getTurnHintState?.() || {enabled:false};"
+                    ) or {}
+                    turn_hint_enabled = bool(turn_hint_ui.get("enabled"))
+                    if not turn_hint_enabled:
+                        if turn_hint_was_enabled or turn_hint_last_status != "OFF":
+                            driver.execute_script(
+                                "window.__variationLineAnalyzer?.clearTurnSuggestion?.();"
+                                "window.__variationLineAnalyzer?.setTurnHintStatus?.('OFF · no move is played');"
+                            )
+                        turn_hint_was_enabled = False
+                        turn_hint_last_fen = ""
+                        turn_hint_last_status = "OFF"
+                    else:
+                        if not turn_hint_was_enabled:
+                            turn_hint_last_fen = ""
+                            turn_hint_was_enabled = True
+                        if current_fen and current_fen != turn_hint_last_fen:
+                            turn_hint_last_fen = current_fen
+                            try:
+                                turn_board = chess.Board(current_fen)
+                                turn_side = "white" if turn_board.turn == chess.WHITE else "black"
+                                api_player_color = tracker.normalize_chess_color(
+                                    state.get("playingAsColor")
+                                    or state.get("playingAs")
+                                    or state.get("playerNameColor")
+                                )
+                                side_conflict = bool(
+                                    configured_turn_color
+                                    and api_player_color
+                                    and configured_turn_color != api_player_color
+                                )
+                                api_is_my_turn = state.get("isMyTurn")
+                                player_color = configured_turn_color or api_player_color
+                                if side_conflict:
+                                    driver.execute_script(
+                                        "window.__variationLineAnalyzer?.clearTurnSuggestion?.();"
+                                        "window.__variationLineAnalyzer?.setTurnHintStatus?.(arguments[0]);",
+                                        "SIDE MISMATCH · check bot_color setting",
+                                    )
+                                    print("[TURN HINT] Side mismatch; no arrow shown.", flush=True)
+                                elif player_color and api_is_my_turn is not True and turn_side != player_color:
+                                    driver.execute_script(
+                                        "window.__variationLineAnalyzer?.clearTurnSuggestion?.();"
+                                        "window.__variationLineAnalyzer?.setTurnHintStatus?.('ON · waiting for your turn');"
+                                    )
+                                    turn_hint_last_status = "WAITING"
+                                elif api_is_my_turn is False:
+                                    driver.execute_script(
+                                        "window.__variationLineAnalyzer?.clearTurnSuggestion?.();"
+                                        "window.__variationLineAnalyzer?.setTurnHintStatus?.('ON · waiting for your turn');"
+                                    )
+                                    turn_hint_last_status = "WAITING"
+                                elif not player_color and api_is_my_turn is not True:
+                                    driver.execute_script(
+                                        "window.__variationLineAnalyzer?.clearTurnSuggestion?.();"
+                                        "window.__variationLineAnalyzer?.setTurnHintStatus?.('ON · set bot_color=white/black');"
+                                    )
+                                    turn_hint_last_status = "SIDE UNKNOWN"
+                                else:
+                                    selected_move, _selected_info, selection_meta, _root_label, _root_value, _root_cp, selection_error = select_strategy_move(
+                                        engine, book, strategy_module, turn_board,
+                                        args.search_time, None,
+                                    )
+                                    if selected_move is None:
+                                        message = "ON · no legal move selected"
+                                        driver.execute_script(
+                                            "window.__variationLineAnalyzer?.clearTurnSuggestion?.();"
+                                            "window.__variationLineAnalyzer?.setTurnHintStatus?.(arguments[0]);",
+                                            message,
+                                        )
+                                        turn_hint_last_status = message
+                                        print(
+                                            f"[TURN HINT] Could not select a move: {selection_error}",
+                                            flush=True,
+                                        )
+                                    else:
+                                        selected_san = turn_board.san(selected_move)
+                                        shown = driver.execute_script(
+                                            "return window.__variationLineAnalyzer?.drawTurnSuggestion?.(arguments[0]) || {ok:false};",
+                                            {
+                                                "uci": selected_move.uci(),
+                                                "san": selected_san,
+                                                "rank": selection_meta.get("rank"),
+                                                "source": selection_meta.get("source", "CHESSKIDA"),
+                                            },
+                                        )
+                                        message = "ON · your turn · " + selected_san
+                                        driver.execute_script(
+                                            "window.__variationLineAnalyzer?.setTurnHintStatus?.(arguments[0]);",
+                                            message,
+                                        )
+                                        turn_hint_last_status = message
+                                        if isinstance(shown, dict) and shown.get("ok"):
+                                            print(
+                                                f"[TURN HINT] {selected_san} | "
+                                                f"source={selection_meta.get('source', 'CHESSKIDA')} | "
+                                                f"rank={selection_meta.get('rank', '—')} | no move submitted.",
+                                                flush=True,
+                                            )
+                            except Exception as exc:
+                                driver.execute_script(
+                                    "window.__variationLineAnalyzer?.clearTurnSuggestion?.();"
+                                    "window.__variationLineAnalyzer?.setTurnHintStatus?.(arguments[0]);",
+                                    f"ON · analysis error · {type(exc).__name__}",
+                                )
+                                turn_hint_last_status = "ERROR"
+                                print(
+                                    f"[TURN HINT] Analysis failed ({type(exc).__name__}).",
+                                    flush=True,
+                                )
+
                     queued = driver.execute_script(
                         "return window.__variationLineAnalyzer ? "
                         "window.__variationLineAnalyzer.queue.splice(0) : [];"
@@ -1293,6 +1586,7 @@ def main() -> int:
                             queued_followup_hint = None
                             line_previous_eval_white_cp = None
                             show_hints(driver, [], "Queue cleared · real board position restored · draw a new arrow")
+                            # Turn-only suggestion remains independent and refreshes only on the next FEN.
                             print(
                                 "[RESET] All tracked user arrows are cleared. "
                                 "Returned to the actual board position; waiting for a new arrow.",
