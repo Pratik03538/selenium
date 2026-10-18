@@ -593,10 +593,15 @@ class RuntimeSettingsWindow:
                 cancel_result = cancel_pending_site_premove(self.driver)
             else:
                 cancel_result = {"ok": True, "cancelled": False, "reason": "autoplay-was-off"}
-            if isinstance(cancel_result, dict) and not cancel_result.get("ok"):
+            cancel_confirmed = (
+                isinstance(cancel_result, dict)
+                and cancel_result.get("ok")
+                and cancel_result.get("cancelled") is True
+            )
+            if was_auto_play and not cancel_confirmed:
                 self.status.set(
-                    "SHOW MOVE is ON, but this site did not expose premove cancellation. "
-                    "Cancel any premove already queued before switching modes. New moves/premoves will not be submitted."
+                    "SHOW MOVE is ON, but cancellation of any already-queued premove could not be confirmed. "
+                    "Cancel a queued premove manually if one is visible. New moves/premoves will not be submitted."
                 )
             else:
                 self.status.set(
