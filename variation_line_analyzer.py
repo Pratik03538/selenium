@@ -1425,8 +1425,14 @@ def main() -> int:
             print("[BOOK] GM opening book unavailable; continuing with the ChessKida selector.", flush=True)
             book = None
 
-        configured_turn_color = tracker.normalize_chess_color(
-            tracker.load_optional_txt_setting("bot_color")
+        # Match the tracker's side-resolution policy: when player_name is
+        # configured, the player's detected side takes priority over fixed bot_color.
+        configured_player_name = tracker.load_optional_txt_setting("player_name").strip()
+        configured_turn_color = (
+            None if configured_player_name
+            else tracker.normalize_chess_color(
+                tracker.load_optional_txt_setting("bot_color")
+            )
         )
         accepted_steps = 0
         pending_hints: list[dict] = []
@@ -1435,7 +1441,7 @@ def main() -> int:
         queued_followup_hint: dict | None = None
         line_previous_eval_white_cp: int | None = None
         turn_hint_was_enabled = False
-        turn_hint_last_fen = ""
+        turn_hint_last_key = ""
         turn_hint_last_status = "OFF"
         last_published_autoplay_state: bool | None = None
         off_hint_status = (
@@ -1566,29 +1572,55 @@ def main() -> int:
                                 off_hint_status,
                             )
                         turn_hint_was_enabled = False
-                        turn_hint_last_fen = ""
+                        turn_hint_last_key = ""
                         turn_hint_last_status = "OFF"
                     else:
                         if not turn_hint_was_enabled:
-                            turn_hint_last_fen = ""
+                            turn_hint_last_key = ""
                             turn_hint_was_enabled = True
-                        if current_fen and current_fen != turn_hint_last_fen:
-                            turn_hint_last_fen = current_fen
+                        # FEN alone is not enough to cache a side-detection result:
+                        # the tracker may expose playerNameColor/isMyTurn a little
+                        # after the position snapshot, without changing the FEN.
+                        turn_hint_key = json.dumps(
+                            [
+                                current_fen,
+                                state.get("playingAsColor"),
+                                state.get("playingAs"),
+                                state.get("playerNameColor"),
+                                state.get("isMyTurn"),
+                                configured_turn_color,
+                            ],
+                            sort_keys=True,
+                            default=str,
+                        )
+                        if current_fen and turn_hint_key != turn_hint_last_key:
+                            turn_hint_last_key = turn_hint_key
                             try:
                                 turn_board = chess.Board(current_fen)
                                 turn_side = "white" if turn_board.turn == chess.WHITE else "black"
-                                api_player_color = tracker.normalize_chess_color(
-                                    state.get("playingAsColor")
-                                    or state.get("playingAs")
-                                    or state.get("playerNameColor")
+                                api_player_color, api_color_conflict = tracker.normalize_api_bot_color(
+                                    state.get("playingAsColor"),
+                                    state.get("playingAs"),
                                 )
+                                player_name_color = tracker.normalize_chess_color(
+                                    state.get("playerNameColor")
+                                )
+                                detected_color = api_player_color or player_name_color
                                 side_conflict = bool(
-                                    configured_turn_color
-                                    and api_player_color
-                                    and configured_turn_color != api_player_color
+                                    api_color_conflict
+                                    or (
+                                        api_player_color
+                                        and player_name_color
+                                        and api_player_color != player_name_color
+                                    )
+                                    or (
+                                        configured_turn_color
+                                        and detected_color
+                                        and configured_turn_color != detected_color
+                                    )
                                 )
                                 api_is_my_turn = state.get("isMyTurn")
-                                player_color = configured_turn_color or api_player_color
+                                player_color = configured_turn_color or detected_color
                                 if side_conflict:
                                     driver.execute_script(
                                         "window.__variationLineAnalyzer?.clearTurnSuggestion?.();"
@@ -1611,8 +1643,15 @@ def main() -> int:
                                 elif not player_color and api_is_my_turn is not True:
                                     driver.execute_script(
                                         "window.__variationLineAnalyzer?.clearTurnSuggestion?.();"
-                                        "window.__variationLineAnalyzer?.setTurnHintStatus?.('ON · set bot_color=white/black');"
+                                        "window.__variationLineAnalyzer?.setTurnHintStatus?.("
+                                        "'ON · side unknown · check player_name/bot_color');"
                                     )
+                                    if turn_hint_last_status != "SIDE UNKNOWN":
+                                        print(
+                                            "[TURN HINT] Side unresolved. Check player_name in "
+                                            "tracker_settings.txt, or set bot_color=white/black.",
+                                            flush=True,
+                                        )
                                     turn_hint_last_status = "SIDE UNKNOWN"
                                 else:
                                     selected_move, _selected_info, selection_meta, _root_label, _root_value, _root_cp, selection_error = select_strategy_move(
