@@ -399,32 +399,57 @@ def clear_generated(driver, generated: list[tuple[str, dict]]) -> None:
     generated.clear()
 
 
+def set_board_status(driver, message: str) -> None:
+    """Render operational status directly on the board instead of opening a window."""
+    try:
+        result = driver.execute_script(
+            "return window.__variationLineAnalyzer?.drawLabels?.([], [], arguments[0]) || {ok:false};",
+            str(message),
+        )
+        if isinstance(result, dict) and not result.get("ok"):
+            print(f"[BOARD DISPLAY] Status could not be drawn on the board ({result.get('reason', 'unknown')}).", flush=True)
+    except Exception as exc:
+        print(f"[BOARD DISPLAY] Could not update board status ({type(exc).__name__}).", flush=True)
+
+
 def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: float,
-                  generated: list[tuple[str, dict]], text_widget, status_var) -> None:
+                  generated: list[tuple[str, dict]]) -> None:
     from_sq, to_sq = str(event.get("from", "")), str(event.get("to", ""))
     fen = str(event.get("fen", ""))
     geom = event.get("geometry") or {}
     try:
         board = chess.Board(fen)
     except Exception:
-        status_var.set("Current board FEN could not be read.")
+        set_board_status(driver, "FEN read failed · redraw the right-click arrow")
+        print("[ANALYSIS ERROR] Board FEN could not be read.", flush=True)
         return
+
     clear_generated(driver, generated)
     try:
         driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
     except Exception:
         pass
+
     uci = from_sq + to_sq
-    move = chess.Move.from_uci(uci)
+    try:
+        move = chess.Move.from_uci(uci)
+    except ValueError:
+        set_board_status(driver, f"Invalid arrow {from_sq} → {to_sq} · draw from one square to another")
+        return
     if move not in board.legal_moves:
         # Promotion arrows need a promotion suffix; queen is the conventional default.
-        if len(uci) == 4 and board.piece_at(move.from_square) and board.piece_at(move.from_square).piece_type == chess.PAWN and chess.square_rank(move.to_square) in (0, 7):
+        if (
+            len(uci) == 4 and board.piece_at(move.from_square)
+            and board.piece_at(move.from_square).piece_type == chess.PAWN
+            and chess.square_rank(move.to_square) in (0, 7)
+        ):
             move = chess.Move.from_uci(uci + "q")
         if move not in board.legal_moves:
-            status_var.set(f"{uci}: not a legal move in the current position.")
-            text_widget.insert("end", f"\n{from_sq} → {to_sq}: not legal in the current position.\n")
-            text_widget.see("end")
+            set_board_status(driver, f"{from_sq} → {to_sq} is not legal in this position")
+            print(f"[ANALYSIS] Ignored illegal hypothetical move: {from_sq} → {to_sq}.", flush=True)
             return
+
+    set_board_status(driver, f"Analyzing {from_sq} → {to_sq} · Stockfish is calculating…")
     try:
         starting_eval, start_score = eval_white(engine, board, search_time)
         line_board = board.copy()
@@ -434,36 +459,39 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
         else:
             first_info = engine.analyse(line_board, chess.engine.Limit(time=search_time))
             pv = list(first_info.get("pv") or [])
-        line = [move] + pv[:max(0, max_plies-1)]
+        line = [move] + pv[:max(0, max_plies - 1)]
     except Exception as exc:
-        status_var.set(f"Engine analysis failed ({type(exc).__name__}).")
+        set_board_status(driver, f"Stockfish analysis failed · {type(exc).__name__}")
+        print(f"[ANALYSIS ERROR] Stockfish analysis failed ({type(exc).__name__}).", flush=True)
         return
 
     report = [
-        f"\nHypothetical move: {from_sq} → {to_sq}",
+        f"Hypothetical move: {from_sq} → {to_sq}",
         f"Position before move: {starting_eval}",
         f"Continuation: up to {len(line)} plies (one ply = one player's move).",
-        "The first arrow is yours; numbered native arrows below show the engine continuation.",
-        ""
+        "Eval convention: positive favors White; negative favors Black."
     ]
     eval_board = board.copy()
     previous_score = start_score
     cdp = tracker._direct_cdp_page_for_driver(driver)
     drawn_count = 0
     board_labels: list[dict] = []
+    details: list[str] = []
+
     for index, current_move in enumerate(line, start=1):
         if current_move not in eval_board.legal_moves:
             break
-        before = eval_board.copy()
+
         label, note = move_label(eval_board, current_move)
         current_eval, current_score = eval_white(engine, eval_board, search_time)
-        step_delta = delta_text(previous_score, current_score)
-        line_item = f"{index}. {label} | {current_eval} | {step_delta}"
+        step_delta = current_score - previous_score
+        step_delta_full = delta_text(previous_score, current_score)
+        line_item = f"{index}. {label} | {current_eval} | {step_delta_full}"
         if note:
             line_item += f" | {note}"
         report.append(line_item)
-        compact = current_eval
-        compact = compact.replace("White +", "W+").replace("Black +", "B+")
+
+        compact = current_eval.replace("White +", "W+").replace("Black +", "B+")
         if compact.startswith("Equal"):
             compact = "="
         elif compact.startswith("Mate for White"):
@@ -472,6 +500,8 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
             compact = "MATE B"
         elif compact == "Draw":
             compact = "DRAW"
+
+        capture_tag = ""
         if "captures" in note:
             captured_piece = next(
                 (piece for piece in ("queen", "rook", "bishop", "knight", "pawn") if piece in note),
@@ -480,16 +510,41 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
             captured_side = "W" if "captures White " in note else ("B" if "captures Black " in note else "")
             piece_letter = {"queen": "Q", "rook": "R", "bishop": "B", "knight": "N", "pawn": "P"}.get(captured_piece, "")
             if piece_letter:
-                compact += f" x{captured_side}{piece_letter}"
+                capture_tag = f"x{captured_side}{piece_letter}"
+                compact += f" {capture_tag}"
+
         if "CHECKMATE" in note:
             compact = "MATE"
         elif "check" in note.lower():
             compact += "+"
-        board_labels.append({"number": index, "uci": current_move.uci(), "eval": compact})
+
+        if abs(step_delta) < 0.04:
+            delta_compact = "Δ≈0.00"
+        elif step_delta > 0:
+            delta_compact = f"ΔW+{abs(step_delta):.2f}"
+        else:
+            delta_compact = f"ΔB+{abs(step_delta):.2f}"
+
+        # Numbered midpoint tags identify which sequential ply each arrow represents.
+        board_labels.append({
+            "number": index,
+            "uci": current_move.uci(),
+            "eval": compact,
+        })
+        detail = f"{index}. {label.replace(' ', '', 1)} {compact} {delta_compact}"
+        if capture_tag:
+            detail += f" {capture_tag}"
+        if "CHECKMATE" in note:
+            detail += " MATE"
+        elif "check" in note.lower():
+            detail += " CHECK"
+        elif "castles" in note:
+            detail += " CASTLE"
+        details.append(detail[:58])
         previous_score = current_score
 
-        # The user already drew the first move. Add only the continuation as
-        # native right-click arrows, without submitting or premoving any move.
+        # Keep the board's native right-click annotation gesture for continuation arrows.
+        # No move is submitted to the board or queued as a premove.
         if index > 1 and cdp is not None and isinstance(geom, dict):
             set_listener_suppressed(driver, True)
             try:
@@ -502,7 +557,7 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
                 if result.get("ok"):
                     generated.append((current_move.uci(), dict(geom)))
                     drawn_count += 1
-                    time.sleep(0.035)
+                    time.sleep(0.025)
             except Exception:
                 pass
             finally:
@@ -510,24 +565,25 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
 
         if eval_board.is_checkmate():
             break
-    try:
-        driver.execute_script(
-            "return window.__variationLineAnalyzer?.drawLabels?.(arguments[0]) || {ok:false};",
-            board_labels,
-        )
-    except Exception:
-        pass
-    report.extend([
-        "",
-        "Eval convention: positive favors White; negative favors Black.",
-        "Number/eval labels are attached inside the board element; arrows use the board's native right-click annotations.",
-        f"Native continuation arrows drawn: {drawn_count}",
-        ""
-    ])
-    text_widget.insert("end", "\n".join(report) + "\n")
-    text_widget.see("end")
-    status_var.set(f"Analyzed {from_sq} → {to_sq}; {drawn_count} continuation arrows drawn.")
 
+    end_eval = details[-1].split(" ", 2)[2] if details else starting_eval
+    title = f"{from_sq}→{to_sq} · {starting_eval} · continuation arrows: {drawn_count}"
+    try:
+        result = driver.execute_script(
+            "return window.__variationLineAnalyzer?.drawLabels?.(arguments[0], arguments[1], arguments[2]) || {ok:false};",
+            board_labels, details, title,
+        )
+    except Exception as exc:
+        result = {"ok": False, "reason": type(exc).__name__}
+
+    report.append(f"Native continuation arrows drawn: {drawn_count}")
+    for line_text in report:
+        print("[LINE] " + line_text, flush=True)
+    if isinstance(result, dict) and result.get("ok"):
+        set_board_status(driver, title)
+    else:
+        print(f"[BOARD DISPLAY] Board labels result: {result}", flush=True)
+        set_board_status(driver, f"{from_sq}→{to_sq} analyzed · check terminal output for line details")
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze a manually drawn hypothetical line on the configured authorized chess board.")
