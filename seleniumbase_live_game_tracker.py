@@ -972,8 +972,14 @@ def prepare_bot_components(args, allowed_host, installed):
         print("[BOOK] Opening book loaded.", flush=True)
     else:
         print("[BOOK] Opening book unavailable; using Stockfish strategy.", flush=True)
-    print("[AUTO] ChessKida move-selection behavior enabled for the configured, non-blocked test site.", flush=True)
-    if args.move_input == "cursor":
+    if args.show_move_mode and not args.auto_play:
+        print("[HINT] ChessKida move-selection behavior enabled in show-only mode.", flush=True)
+        print("[INPUT] Native right-click board-arrow mode enabled; selected moves and premoves are not submitted.", flush=True)
+    else:
+        print("[AUTO] ChessKida move-selection behavior enabled for the configured, non-blocked test site.", flush=True)
+    if args.show_move_mode and not args.auto_play:
+        pass
+    elif args.move_input == "cursor":
         print("[INPUT] Cursor drag mode enabled for the configured test board; public competitive hosts remain blocked.", flush=True)
     else:
         print("[INPUT] Direct game API mode enabled.", flush=True)
@@ -5413,7 +5419,7 @@ def main() -> int:
                                 else None
                             )
                             bot_to_move = (
-                                args.auto_play
+                                (args.auto_play or args.show_move_mode)
                                 and bot_color_value is not None
                                 and dashboard_board.turn == bot_color_value
                             )
