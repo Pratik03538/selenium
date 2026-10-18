@@ -580,10 +580,12 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
     for line_text in report:
         print("[LINE] " + line_text, flush=True)
     if isinstance(result, dict) and result.get("ok"):
-        set_board_status(driver, title)
+        # drawLabels already painted both the numbered arrows' labels and the
+        # complete compact line panel; don't overwrite it with a status-only layer.
+        print("[BOARD DISPLAY] Numbered continuation and evaluation panel rendered on the board.", flush=True)
     else:
         print(f"[BOARD DISPLAY] Board labels result: {result}", flush=True)
-        set_board_status(driver, f"{from_sq}→{to_sq} analyzed · check terminal output for line details")
+        set_board_status(driver, f"{from_sq}→{to_sq} analyzed · see terminal if board labels are unavailable")
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Analyze a manually drawn hypothetical line on the configured authorized chess board.")
