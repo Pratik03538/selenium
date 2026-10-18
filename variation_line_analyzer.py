@@ -798,6 +798,78 @@ def set_listener_suppressed(driver, value: bool) -> None:
         pass
 
 
+def dispatch_native_annotation_arrow(
+    cdp,
+    uci: str,
+    *,
+    left: float,
+    top: float,
+    width: float,
+    height: float,
+    bottom_side: str,
+) -> dict:
+    """Toggle a native annotation arrow without submitting or moving a chess piece."""
+    text = str(uci or "").lower()
+    if not __import__("re").fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", text):
+        return {"ok": False, "reason": "invalid-uci"}
+    if (
+        width <= 0 or height <= 0
+        or abs(width - height) > max(8.0, width * 0.08)
+        or bottom_side not in {"white", "black"}
+    ):
+        return {"ok": False, "reason": "invalid-board-geometry"}
+
+    def square_point(square: str) -> tuple[float, float]:
+        file_index = ord(square[0]) - ord("a")
+        rank_number = int(square[1])
+        board_file = file_index if bottom_side == "white" else 7 - file_index
+        board_row = 8 - rank_number if bottom_side == "white" else rank_number - 1
+        return (
+            left + (board_file + 0.5) * width / 8.0,
+            top + (board_row + 0.5) * height / 8.0,
+        )
+
+    sx, sy = square_point(text[:2])
+    dx, dy = square_point(text[2:4])
+    mx, my = (sx + dx) / 2.0, (sy + dy) / 2.0
+    command_ids: set[int] = set()
+    try:
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": sx, "y": sy,
+            "button": "none", "buttons": 0, "pointerType": "mouse",
+        }))
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": sx, "y": sy,
+            "button": "right", "buttons": 2, "clickCount": 1,
+            "pointerType": "mouse",
+        }))
+        time.sleep(0.004)
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": mx, "y": my,
+            "button": "right", "buttons": 2, "pointerType": "mouse",
+        }))
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": dx, "y": dy,
+            "button": "right", "buttons": 2, "pointerType": "mouse",
+        }))
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": dx, "y": dy,
+            "button": "right", "buttons": 0, "clickCount": 1,
+            "pointerType": "mouse",
+        }))
+        cdp.wait_for(command_ids, timeout=1.0)
+    except Exception as exc:
+        try:
+            cdp.send("Input.dispatchMouseEvent", {
+                "type": "mouseReleased", "button": "right",
+                "buttons": 0, "pointerType": "mouse",
+            })
+        except Exception:
+            pass
+        return {"ok": False, "reason": "native-arrow-gesture-failed", "error_type": type(exc).__name__}
+    return {"ok": True, "uci": text}
+
+
 def clear_generated(driver, generated: list[tuple[str, dict]]) -> None:
     if not generated:
         return
@@ -811,7 +883,7 @@ def clear_generated(driver, generated: list[tuple[str, dict]]) -> None:
     try:
         for uci, geom in reversed(generated):
             try:
-                tracker._dispatch_native_board_arrow(
+                dispatch_native_annotation_arrow(
                     cdp, uci,
                     left=geom["left"], top=geom["top"],
                     width=geom["width"], height=geom["height"],
@@ -1153,7 +1225,7 @@ def remove_unconfirmed_native_arrow(driver, event: dict) -> None:
         if cdp is None or len(uci) < 4:
             return
         set_listener_suppressed(driver, True)
-        tracker._dispatch_native_board_arrow(
+        dispatch_native_annotation_arrow(
             cdp, uci,
             left=float(geom["left"]), top=float(geom["top"]),
             width=float(geom["width"]), height=float(geom["height"]),
