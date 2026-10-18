@@ -482,6 +482,7 @@ window.__variationLineAnalyzer = {
   drawLabels,
   drawSuggestions,
   clearLabels,
+  resetTrackedArrows:() => { userArrows.clear(); return true; },
   diagnostics:() => {
     const found = findBoard();
     const rect = found?.getBoundingClientRect?.();
@@ -1004,6 +1005,7 @@ def main() -> int:
                             set_board_status(driver, "Board changed · could not reset analysis position")
                             time.sleep(0.12)
                             continue
+                        driver.execute_script("window.__variationLineAnalyzer?.resetTrackedArrows?.();")
                         last_fen = current_fen
                         accepted_steps = 0
                         pending_hints = []
@@ -1106,7 +1108,8 @@ def main() -> int:
 
                         try:
                             accepted_san = analysis_board.san(chosen_move)
-                            if not branch_active or not followed_hint:
+                            was_branch_active = branch_active
+                            if not was_branch_active or not followed_hint:
                                 # A first arrow starts the sequence. A different legal
                                 # arrow during a sequence starts a new branch here.
                                 accepted_steps = 0
@@ -1122,7 +1125,7 @@ def main() -> int:
                                     f"{accepted_steps}/{args.plies} · continuing hinted line",
                                     flush=True,
                                 )
-                            elif accepted_steps == 1:
+                            elif not was_branch_active:
                                 print(
                                     f"[START] Your arrow selected {accepted_san} · "
                                     f"starting the variation ({accepted_steps}/{args.plies})",
