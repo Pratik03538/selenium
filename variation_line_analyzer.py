@@ -57,6 +57,7 @@ if (window.__variationLineAnalyzer) {
 }
 const queue = [];
 let down = null;
+let suppress = false;
 function matchingBoard(event) {
   const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
   for (const node of path) {
@@ -75,6 +76,7 @@ function squareAt(board, x, y, side) {
   return String.fromCharCode(97+file) + String(rank);
 }
 function onDown(event) {
+  if (suppress) { down = null; return; }
   if (event.button !== 2) return;
   const board = matchingBoard(event);
   if (!board) { down = null; return; }
@@ -90,6 +92,7 @@ function onDown(event) {
   };
 }
 function onUp(event) {
+  if (suppress) { down = null; return; }
   if (!down || event.button !== 2) return;
   const saved = down;
   down = null;
@@ -110,6 +113,8 @@ window.addEventListener('pointerdown', onDown, true);
 window.addEventListener('pointerup', onUp, true);
 window.__variationLineAnalyzer = {
   queue,
+  get suppress() { return suppress; },
+  set suppress(value) { suppress = !!value; },
   stop:() => {
     window.removeEventListener('pointerdown', onDown, true);
     window.removeEventListener('pointerup', onUp, true);
@@ -193,6 +198,16 @@ def move_label(board: chess.Board, move: chess.Move) -> str:
     return prefix + san, note
 
 
+def set_listener_suppressed(driver, value: bool) -> None:
+    try:
+        driver.execute_script(
+            "if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = arguments[0];",
+            bool(value),
+        )
+    except Exception:
+        pass
+
+
 def clear_generated(driver, generated: list[tuple[str, dict]]) -> None:
     if not generated:
         return
@@ -200,18 +215,23 @@ def clear_generated(driver, generated: list[tuple[str, dict]]) -> None:
     if cdp is None:
         generated.clear()
         return
-    # Native arrows toggle off when the same right-drag is repeated.
-    for uci, geom in reversed(generated):
-        try:
-            tracker._dispatch_native_board_arrow(
-                cdp, uci,
-                left=geom["left"], top=geom["top"],
-                width=geom["width"], height=geom["height"],
-                bottom_side=geom["bottom_side"],
-            )
-            time.sleep(0.025)
-        except Exception:
-            pass
+    # Suppress our own synthetic native-arrow gestures so they are not re-read
+    # as if the user had drawn a new hypothetical line.
+    set_listener_suppressed(driver, True)
+    try:
+        for uci, geom in reversed(generated):
+            try:
+                tracker._dispatch_native_board_arrow(
+                    cdp, uci,
+                    left=geom["left"], top=geom["top"],
+                    width=geom["width"], height=geom["height"],
+                    bottom_side=geom["bottom_side"],
+                )
+                time.sleep(0.025)
+            except Exception:
+                pass
+    finally:
+        set_listener_suppressed(driver, False)
     generated.clear()
 
 
@@ -278,6 +298,7 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
         # The user already drew the first move. Add only the continuation as
         # native right-click arrows, without submitting or premoving any move.
         if index > 1 and cdp is not None and isinstance(geom, dict):
+            set_listener_suppressed(driver, True)
             try:
                 result = tracker._dispatch_native_board_arrow(
                     cdp, current_move.uci(),
@@ -291,6 +312,8 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
                     time.sleep(0.035)
             except Exception:
                 pass
+            finally:
+                set_listener_suppressed(driver, False)
 
         if eval_board.is_checkmate():
             break
@@ -369,7 +392,18 @@ def main() -> int:
         driver.switch_to.window(chosen_handle)
         tracker.check_target(driver.current_url, allowed_host)
         cfg = make_observer_config(args.board_selector)
-        installed = driver.execute_script(tracker.JS_INSTALL_OBSERVER, cfg)
+        # Reuse the main tracker's reader if it is already installed. Do not
+        # replace/disconnect the running tracker observer from this add-on.
+        existing_state = driver.execute_script(
+            "return window.__liveGameApiReader?.current?.() || null;"
+        )
+        if isinstance(existing_state, dict) and (
+            existing_state.get("fen") or existing_state.get("boardFound")
+            or existing_state.get("gameApiFound")
+        ):
+            installed = {"boardFound": True, "gameApiFound": True}
+        else:
+            installed = driver.execute_script(tracker.JS_INSTALL_OBSERVER, cfg)
         if not isinstance(installed, dict) or not installed.get("boardFound") or not installed.get("gameApiFound"):
             print("[BOARD ERROR] Board/game API was not detected. Configure the board selector and exposed board game API first.", file=sys.stderr)
             return 2
