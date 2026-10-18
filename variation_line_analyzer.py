@@ -681,82 +681,92 @@ def main() -> int:
         engine = chess.engine.SimpleEngine.popen_uci(str(engine_path))
         engine.configure({"Threads": 2, "Hash": 128})
 
-        import tkinter as tk
-        from tkinter import ttk
-        root = tk.Tk()
-        root.title("Variation Line Analyzer — Authorized Study/Test Board")
-        root.geometry("650x560")
-        root.minsize(520, 380)
-        status = tk.StringVar(value="Ready. Right-click drag an arrow on the board to analyze that hypothetical move.")
-        ttk.Label(root, textvariable=status, wraplength=610).pack(fill="x", padx=10, pady=(10, 5))
-        controls = ttk.Frame(root)
-        controls.pack(fill="x", padx=10, pady=(0, 6))
-        output = tk.Text(root, wrap="word", font=("Consolas", 10), height=22)
-        scroll = ttk.Scrollbar(root, orient="vertical", command=output.yview)
-        output.configure(yscrollcommand=scroll.set)
-        output.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=(0, 10))
-        scroll.pack(side="right", fill="y", padx=(0, 10), pady=(0, 10))
-
         generated: list[tuple[str, dict]] = []
-        last_fen = str((driver.execute_script("return window.__liveGameApiReader.current()") or {}).get("fen") or "")
-        busy = False
+        initial = driver.execute_script(
+            "return window.__liveGameApiReader?.current?.() || {};"
+        ) or {}
+        last_fen = str(initial.get("fen") or "")
+        set_board_status(
+            driver,
+            f"Analyzer ready · right-click drag a line · max {args.plies} plies"
+        )
+        print("[READY] No separate window will open.", flush=True)
+        print("[READY] Draw a right-click arrow directly on the authorized board.", flush=True)
+        print("[READY] Numbered arrows, evaluation, captures/check/mate, and the move list will appear on that board.", flush=True)
+        print("[READY] Press Ctrl+C in this terminal to stop.", flush=True)
 
-        def clear_lines() -> None:
-            clear_generated(driver, generated)
-            status.set("Continuation arrows drawn by this analyzer were cleared.")
+        try:
+            while True:
+                try:
+                    state = driver.execute_script(
+                        "return window.__liveGameApiReader?.current?.() || {};"
+                    ) or {}
+                    current_fen = str(state.get("fen") or "")
 
-        ttk.Button(controls, text="Clear continuation arrows", command=clear_lines).pack(side="left")
-        ttk.Label(controls, text=f"Max plies: {args.plies}  |  Search: {args.search_time:.2f}s/position").pack(side="left", padx=12)
+                    if current_fen and last_fen and current_fen != last_fen:
+                        clear_generated(driver, generated)
+                        try:
+                            driver.execute_script(
+                                "window.__variationLineAnalyzer?.clearLabels?.();"
+                            )
+                        except Exception:
+                            pass
+                        set_board_status(
+                            driver,
+                            "Board position changed · old analysis cleared · draw a new arrow"
+                        )
+                    if current_fen:
+                        last_fen = current_fen
 
-        def poll() -> None:
-            nonlocal last_fen, busy
-            if busy:
-                root.after(100, poll)
-                return
-            try:
-                state = driver.execute_script("return window.__liveGameApiReader ? window.__liveGameApiReader.current() : {};") or {}
-                current_fen = str(state.get("fen") or "")
-                if current_fen and last_fen and current_fen != last_fen:
-                    clear_generated(driver, generated)
-                    try:
-                        driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
-                    except Exception:
-                        pass
-                    status.set("Board position changed; old continuation arrows and labels cleared.")
-                if current_fen:
-                    last_fen = current_fen
-                queued = driver.execute_script("return window.__variationLineAnalyzer ? window.__variationLineAnalyzer.queue.splice(0) : [];") or []
-                for event in queued:
-                    busy = True
-                    try:
-                        analyze_arrow(driver, engine, event, args.plies, args.search_time, generated, output, status)
-                    finally:
-                        busy = False
-            except Exception as exc:
-                status.set(f"Listener paused: {type(exc).__name__}")
-            root.after(120, poll)
+                    queued = driver.execute_script(
+                        "return window.__variationLineAnalyzer ? "
+                        "window.__variationLineAnalyzer.queue.splice(0) : [];"
+                    ) or []
+                    if not isinstance(queued, list):
+                        queued = []
 
-        def close_app() -> None:
+                    for event in queued:
+                        if not isinstance(event, dict):
+                            continue
+                        try:
+                            # Ignore gestures captured before a position change.
+                            if current_fen and str(event.get("fen") or "") != current_fen:
+                                set_board_status(driver, "Position changed during drag · draw the arrow again")
+                                continue
+                            analyze_arrow(
+                                driver, engine, event, args.plies,
+                                args.search_time, generated
+                            )
+                        except Exception as exc:
+                            set_board_status(
+                                driver,
+                                f"Analysis error · {type(exc).__name__} · see terminal"
+                            )
+                            print(
+                                f"[ANALYSIS ERROR] {type(exc).__name__}: {exc}",
+                                file=sys.stderr, flush=True
+                            )
+                except tracker.WebDriverException as exc:
+                    set_board_status(driver, f"Browser read failed · {type(exc).__name__}")
+                    print(f"[BROWSER ERROR] {type(exc).__name__}", file=sys.stderr, flush=True)
+                time.sleep(0.12)
+        finally:
             try:
                 clear_generated(driver, generated)
-                driver.execute_script("window.__variationLineAnalyzer?.stop?.()")
+            except Exception:
+                pass
+            try:
+                driver.execute_script("window.__variationLineAnalyzer?.stop?.();")
+            except Exception:
+                pass
+            try:
+                driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
             except Exception:
                 pass
             try:
                 engine.quit()
             except Exception:
                 pass
-            try:
-                root.destroy()
-            except Exception:
-                pass
-
-        root.protocol("WM_DELETE_WINDOW", close_app)
-        output.insert("end", "Ready. Draw a legal right-click arrow on the authorized board.\n")
-        output.insert("end", "The arrow is treated as a hypothetical first move; no move is submitted.\n")
-        output.insert("end", "Evaluation is from White's perspective. Captures, checks, and mate are called out per ply.\n\n")
-        root.after(120, poll)
-        root.mainloop()
         return 0
     except KeyboardInterrupt:
         print("\n[STOP] Analyzer stopped.")
