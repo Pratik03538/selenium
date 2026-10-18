@@ -46,8 +46,29 @@ def make_observer_config(board_selector: str) -> dict:
     }
 
 
+def publish_autoplay_mode(path: Path | None, enabled: bool) -> bool:
+    """Atomically tell the parent tracker whether its existing BOT switch is enabled."""
+    if path is None:
+        return False
+    temp_path = path.with_name(path.name + ".tmp")
+    try:
+        temp_path.write_text(
+            json.dumps({"autoplay_enabled": bool(enabled)}),
+            encoding="utf-8",
+        )
+        temp_path.replace(path)
+        return True
+    except OSError:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+        return False
+
+
 INSTALL_LINE_WATCHER = r"""
 const selector = String(arguments[0] || 'chess-board');
+const autoplayControlEnabled = Boolean(arguments[1]);
 const api = window.__liveGameApiReader;
 if (!api || typeof api.current !== 'function') {
   return {ok:false, reason:'tracker-board-observer-not-installed'};
@@ -62,7 +83,7 @@ const userArrows = new Set();
 let down = null;
 let suppress = false;
 let turnHintEnabled = false;
-let turnHintStatus = 'OFF · no move is played';
+let turnHintStatus = autoplayControlEnabled ? 'OFF · autoplay mode' : 'OFF · no move is played';
 let turnControl = null;
 let turnControlButton = null;
 let turnControlStatus = null;
@@ -457,8 +478,8 @@ function ensureTurnControl() {
     turnControlButton.addEventListener('click', () => {
       turnHintEnabled = !turnHintEnabled;
       turnHintStatus = turnHintEnabled
-        ? 'ON · checking whose turn it is'
-        : 'OFF · no move is played';
+        ? (autoplayControlEnabled ? 'ON · move hints only · autoplay paused' : 'ON · checking whose turn it is')
+        : (autoplayControlEnabled ? 'OFF · autoplay mode' : 'OFF · no move is played');
       if (!turnHintEnabled) clearTurnSuggestion();
       else clearTurnSuggestion();
       refreshTurnControlText();
@@ -1242,10 +1263,14 @@ def main() -> int:
     parser.add_argument("--debugger-address", default="127.0.0.1:9223")
     parser.add_argument("--allowed-domain", default="")
     parser.add_argument("--board-selector", default="chess-board")
+    parser.add_argument("--window-handle", default="", help="Optional tracker-selected Chrome tab handle for automatic launch.")
+    parser.add_argument("--autoplay-control-file", default="", help="Optional private IPC file used only when the tracker launches this companion.")
     parser.add_argument("--stockfish-path", default="")
     parser.add_argument("--plies", type=int, default=0, help="Optional maximum sequential plies; 0 means unlimited (default).")
     parser.add_argument("--search-time", type=float, default=0.05, help="Fast Stockfish search time per position in seconds (0.05-2.0).")
     args = parser.parse_args()
+    mode_control_raw = str(args.autoplay_control_file or "").strip()
+    mode_control_file = Path(mode_control_raw).expanduser().resolve() if mode_control_raw else None
     args.plies = max(0, int(args.plies))
     progress_limit = str(args.plies) if args.plies > 0 else "∞"
     args.search_time = max(0.05, min(2.0, float(args.search_time)))
@@ -1301,8 +1326,22 @@ def main() -> int:
         if not candidates:
             print("[TAB ERROR] Open the configured authorized test board in the existing debugging Chrome session.", file=sys.stderr)
             return 2
-        if len(candidates) == 1:
+        requested_handle = str(args.window_handle or "").strip()
+        requested_match = next(
+            (handle for handle, _url in candidates if requested_handle and handle == requested_handle),
+            None,
+        )
+        if requested_match is not None:
+            chosen_handle = requested_match
+        elif len(candidates) == 1:
             chosen_handle = candidates[0][0]
+        elif requested_handle:
+            print(
+                "[TAB ERROR] Could not match the tracker-selected tab handle; "
+                "automatic launch will not prompt for a different tab.",
+                file=sys.stderr,
+            )
+            return 2
         else:
             print("Matching authorized tabs:")
             for idx, (_, url) in enumerate(candidates):
@@ -1330,7 +1369,9 @@ def main() -> int:
         if not isinstance(installed, dict) or not installed.get("boardFound") or not installed.get("gameApiFound"):
             print("[BOARD ERROR] Board/game API was not detected. Configure the board selector and exposed board game API first.", file=sys.stderr)
             return 2
-        watch_result = driver.execute_script(INSTALL_LINE_WATCHER, args.board_selector)
+        watch_result = driver.execute_script(
+            INSTALL_LINE_WATCHER, args.board_selector, mode_control_file is not None
+        )
         if not isinstance(watch_result, dict) or not watch_result.get("ok"):
             print("[BOARD ERROR] Could not install the right-click line listener.", file=sys.stderr)
             return 2
@@ -1397,6 +1438,11 @@ def main() -> int:
         turn_hint_was_enabled = False
         turn_hint_last_fen = ""
         turn_hint_last_status = "OFF"
+        last_published_autoplay_state: bool | None = None
+        off_hint_status = (
+            "OFF · autoplay mode" if mode_control_file is not None
+            else "OFF · no move is played"
+        )
 
         def show_next_step() -> None:
             nonlocal pending_hints, awaiting_clear, queued_followup_hint
@@ -1501,11 +1547,24 @@ def main() -> int:
                         "return window.__variationLineAnalyzer?.getTurnHintState?.() || {enabled:false};"
                     ) or {}
                     turn_hint_enabled = bool(turn_hint_ui.get("enabled"))
+                    if mode_control_file is not None:
+                        requested_autoplay = not turn_hint_enabled
+                        if requested_autoplay != last_published_autoplay_state:
+                            if publish_autoplay_mode(mode_control_file, requested_autoplay):
+                                last_published_autoplay_state = requested_autoplay
+                                print(
+                                    "[MODE] SHOW MOVE: "
+                                    + ("OFF -> tracker BOT ON." if requested_autoplay else "ON -> tracker BOT OFF."),
+                                    flush=True,
+                                )
+                            else:
+                                print("[MODE] Could not send the toggle state to the tracker.", flush=True)
                     if not turn_hint_enabled:
                         if turn_hint_was_enabled or turn_hint_last_status != "OFF":
                             driver.execute_script(
                                 "window.__variationLineAnalyzer?.clearTurnSuggestion?.();"
-                                "window.__variationLineAnalyzer?.setTurnHintStatus?.('OFF · no move is played');"
+                                "window.__variationLineAnalyzer?.setTurnHintStatus?.(arguments[0]);",
+                                off_hint_status,
                             )
                         turn_hint_was_enabled = False
                         turn_hint_last_fen = ""
