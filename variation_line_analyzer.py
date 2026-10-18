@@ -63,14 +63,36 @@ let overlayHost = null;
 let originalHostPosition = '';
 let changedHostPosition = false;
 const svgNS = 'http://www.w3.org/2000/svg';
+const boardSelectors = Array.from(new Set([
+  selector, 'chess-board', 'wc-chess-board', '#board-single'
+].filter(Boolean)));
+function matchesBoard(node) {
+  if (!node || typeof node.matches !== 'function') return false;
+  return boardSelectors.some(sel => {
+    try { return node.matches(sel); } catch (_) { return false; }
+  });
+}
 function findBoard(root = document) {
-  try { const found = root.querySelector(selector); if (found) return found; } catch (_) {}
-  let elements = [];
-  try { elements = root.querySelectorAll('*'); } catch (_) {}
-  for (const el of elements) {
-    if (el.shadowRoot) {
-      const nested = findBoard(el.shadowRoot);
-      if (nested) return nested;
+  // Match the same board fallback order used by the existing tracker, and
+  // search open shadow roots because many chess boards are web components.
+  const roots = [root];
+  const visitedRoots = new Set();
+  while (roots.length) {
+    const current = roots.shift();
+    if (!current || visitedRoots.has(current)) continue;
+    visitedRoots.add(current);
+    for (const sel of boardSelectors) {
+      try {
+        for (const candidate of current.querySelectorAll(sel)) {
+          const r = candidate.getBoundingClientRect();
+          if (r.width > 8 && r.height > 8) return candidate;
+        }
+      } catch (_) {}
+    }
+    let elements = [];
+    try { elements = current.querySelectorAll('*'); } catch (_) {}
+    for (const el of elements) {
+      if (el.shadowRoot && !visitedRoots.has(el.shadowRoot)) roots.push(el.shadowRoot);
     }
   }
   return null;
@@ -78,43 +100,45 @@ function findBoard(root = document) {
 function clearLabels() {
   if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
   overlay = null;
-  if (changedHostPosition && overlayHost) overlayHost.style.position = originalHostPosition;
   overlayHost = null;
   changedHostPosition = false;
 }
 function ensureOverlay() {
   const board = findBoard();
-  if (!board) return null;
+  if (!board) return {ok:false, reason:'board-element-not-found'};
   const rect = board.getBoundingClientRect();
-  if (!rect.width || !rect.height) return null;
+  if (rect.width < 8 || rect.height < 8) return {ok:false, reason:'board-has-no-visible-size'};
   if (!overlay || !overlay.isConnected || overlayHost !== board) {
     clearLabels();
-    const root = board.shadowRoot || board;
-    originalHostPosition = board.style.position || '';
-    if (getComputedStyle(board).position === 'static') {
-      board.style.position = 'relative';
-      changedHostPosition = true;
-    }
     overlayHost = board;
     overlay = document.createElementNS(svgNS, 'svg');
     overlay.setAttribute('data-variation-line-labels', 'true');
-    overlay.style.position = 'absolute';
-    overlay.style.inset = '0';
-    overlay.style.width = '100%';
-    overlay.style.height = '100%';
+    // A viewport-fixed SVG above the page works for open/closed web-component
+    // shadow roots without changing any existing board DOM or CSS layout.
+    overlay.style.position = 'fixed';
+    overlay.style.left = rect.left + 'px';
+    overlay.style.top = rect.top + 'px';
+    overlay.style.margin = '0';
+    overlay.style.padding = '0';
+    overlay.style.width = rect.width + 'px';
+    overlay.style.height = rect.height + 'px';
     overlay.style.overflow = 'hidden';
     overlay.style.pointerEvents = 'none';
-    overlay.style.zIndex = '2147483000';
-    root.appendChild(overlay);
+    overlay.style.zIndex = '2147483647';
+    (document.body || document.documentElement).appendChild(overlay);
   }
+  overlay.style.left = rect.left + 'px';
+  overlay.style.top = rect.top + 'px';
+  overlay.style.width = rect.width + 'px';
+  overlay.style.height = rect.height + 'px';
   overlay.setAttribute('viewBox', '0 0 ' + rect.width + ' ' + rect.height);
   overlay.setAttribute('width', String(rect.width));
   overlay.setAttribute('height', String(rect.height));
-  return {board, rect, svg:overlay};
+  return {ok:true, board, rect, svg:overlay};
 }
 function drawLabels(items, details = [], statusText = '') {
   const setup = ensureOverlay();
-  if (!setup) return {ok:false, reason:'board-label-layer-unavailable'};
+  if (!setup || !setup.ok) return {ok:false, reason:setup?.reason || 'board-label-layer-unavailable'};
   const {board, rect, svg} = setup;
   while (svg.firstChild) svg.removeChild(svg.firstChild);
   const state = api.current() || {};
@@ -208,7 +232,15 @@ function drawLabels(items, details = [], statusText = '') {
 function matchingBoard(event) {
   const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
   for (const node of path) {
-    try { if (node && node.matches && node.matches(selector)) return node; } catch (_) {}
+    if (matchesBoard(node)) return node;
+  }
+  // Some wrappers omit the custom-element host from composedPath; fall back to
+  // hit-testing and climb through parent/shadow-host boundaries.
+  let node = null;
+  try { node = document.elementFromPoint(event.clientX, event.clientY); } catch (_) {}
+  for (let depth=0; node && depth<18; depth++) {
+    if (matchesBoard(node)) return node;
+    node = node.parentElement || node.getRootNode?.().host || null;
   }
   return null;
 }
@@ -406,10 +438,29 @@ def set_board_status(driver, message: str) -> None:
             "return window.__variationLineAnalyzer?.drawLabels?.([], [], arguments[0]) || {ok:false};",
             str(message),
         )
+        reason = ""
         if isinstance(result, dict) and not result.get("ok"):
-            print(f"[BOARD DISPLAY] Status could not be drawn on the board ({result.get('reason', 'unknown')}).", flush=True)
+            reason = str(result.get("reason") or "unknown")
+        previous = getattr(driver, "_variation_last_display_warning", None)
+        current = (reason, str(message))
+        if reason and current != previous:
+            # Avoid flooding the terminal from the 120 ms polling loop.
+            prior_reason = previous[0] if isinstance(previous, tuple) else None
+            if reason != prior_reason:
+                print(f"[BOARD DISPLAY] Status could not be drawn on the board ({reason}).", flush=True)
+        try:
+            setattr(driver, "_variation_last_display_warning", current if reason else None)
+        except Exception:
+            pass
     except Exception as exc:
-        print(f"[BOARD DISPLAY] Could not update board status ({type(exc).__name__}).", flush=True)
+        previous = getattr(driver, "_variation_last_display_warning", None)
+        current = ("exception", type(exc).__name__)
+        if current != previous:
+            print(f"[BOARD DISPLAY] Could not update board status ({type(exc).__name__}).", flush=True)
+        try:
+            setattr(driver, "_variation_last_display_warning", current)
+        except Exception:
+            pass
 
 
 def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: float,
