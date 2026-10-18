@@ -799,6 +799,7 @@ def calculate_next_hints(
     step_number: int,
     max_steps: int,
     previous_eval_white_cp: int | None = None,
+    forced_first_hint: dict | None = None,
 ) -> tuple[list[dict], str]:
     """Calculate up to two moves by repeatedly applying the existing move selector."""
     if board.is_game_over(claim_draw=True):
@@ -824,26 +825,48 @@ def calculate_next_hints(
         if line_board.is_game_over(claim_draw=True):
             break
 
-        (
-            move,
-            _selected_info,
-            selection_meta,
-            root_label,
-            root_value,
-            _root_cp,
-            reason,
-        ) = select_strategy_move(
-            engine,
-            book,
-            strategy_module,
-            line_board,
-            search_time,
-            selector_previous_cp,
-        )
-        if move is None:
-            if hints:
-                return hints, reason or "No further legal continuation"
-            return [], reason or "ChessKida selector returned no legal continuation"
+        if offset == 0 and forced_first_hint:
+            # The second arrow in the previously displayed pair is already part
+            # of the current queue. Reuse it instead of random-selecting again.
+            try:
+                queued_move = chess.Move.from_uci(str(forced_first_hint.get("uci") or ""))
+            except ValueError:
+                queued_move = None
+            if queued_move is not None and queued_move in line_board.legal_moves:
+                move = queued_move
+                selection_meta = {
+                    "source": forced_first_hint.get("selection_source", "CHESSKIDA"),
+                    "rank": forced_first_hint.get("selection_rank"),
+                    "reason": forced_first_hint.get("selection_reason", "Queued ChessKida selection"),
+                }
+                _selected_info = None
+                root_label, root_value, _root_cp = eval_white(
+                    engine, line_board, min(search_time, 0.01), strategy_module
+                )
+            else:
+                forced_first_hint = None
+
+        if not (offset == 0 and forced_first_hint and queued_move in line_board.legal_moves):
+            (
+                move,
+                _selected_info,
+                selection_meta,
+                root_label,
+                root_value,
+                _root_cp,
+                reason,
+            ) = select_strategy_move(
+                engine,
+                book,
+                strategy_module,
+                line_board,
+                search_time,
+                selector_previous_cp,
+            )
+            if move is None:
+                if hints:
+                    return hints, reason or "No further legal continuation"
+                return [], reason or "ChessKida selector returned no legal continuation"
 
         if previous_display_value is None:
             previous_display_value = root_value
@@ -1118,10 +1141,11 @@ def main() -> int:
         pending_hints: list[dict] = []
         branch_active = False
         awaiting_clear = False
+        queued_followup_hint: dict | None = None
         line_previous_eval_white_cp: int | None = None
 
         def show_next_step() -> None:
-            nonlocal pending_hints, awaiting_clear
+            nonlocal pending_hints, awaiting_clear, queued_followup_hint
             if not branch_active:
                 pending_hints = []
                 show_hints(driver, [], "Queue empty · draw a legal arrow to begin")
@@ -1129,6 +1153,7 @@ def main() -> int:
 
             if args.plies > 0 and accepted_steps >= args.plies:
                 pending_hints = []
+                queued_followup_hint = None
                 awaiting_clear = True
                 show_hints(
                     driver, [],
@@ -1141,9 +1166,12 @@ def main() -> int:
                 )
                 return
 
+            forced_hint = queued_followup_hint
+            queued_followup_hint = None
             hints, reason = calculate_next_hints(
                 engine, strategy_module, book, analysis_board, args.search_time,
                 accepted_steps + 1, args.plies, line_previous_eval_white_cp,
+                forced_hint,
             )
             if not hints:
                 pending_hints = []
@@ -1210,6 +1238,7 @@ def main() -> int:
                         pending_hints = []
                         branch_active = False
                         awaiting_clear = False
+                        queued_followup_hint = None
                         line_previous_eval_white_cp = None
                         show_hints(driver, [], "Board position changed · queue reset · draw a new arrow")
                         print("[RESET] Board position changed; waiting for your next arrow.", flush=True)
@@ -1261,6 +1290,7 @@ def main() -> int:
                             pending_hints = []
                             branch_active = False
                             awaiting_clear = False
+                            queued_followup_hint = None
                             line_previous_eval_white_cp = None
                             show_hints(driver, [], "Queue cleared · real board position restored · draw a new arrow")
                             print(
@@ -1344,6 +1374,10 @@ def main() -> int:
                                 pending_hints[0].get("eval_white_cp")
                                 if followed_hint and pending_hints else None
                             )
+                            hinted_followup = (
+                                dict(pending_hints[1])
+                                if followed_hint and len(pending_hints) > 1 else None
+                            )
                             was_branch_active = branch_active
                             if not was_branch_active or not followed_hint:
                                 # A first arrow starts the sequence. A different legal
@@ -1354,6 +1388,7 @@ def main() -> int:
                             accepted_steps += 1
                             branch_active = True
                             pending_hints = []
+                            queued_followup_hint = hinted_followup if followed_hint else None
                             if followed_hint and isinstance(hinted_after_cp, (int, float)):
                                 line_previous_eval_white_cp = int(hinted_after_cp)
                             else:
