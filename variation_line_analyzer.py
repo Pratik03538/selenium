@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -810,7 +811,7 @@ def dispatch_native_annotation_arrow(
 ) -> dict:
     """Toggle a native annotation arrow without submitting or moving a chess piece."""
     text = str(uci or "").lower()
-    if not __import__("re").fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", text):
+    if not re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", text):
         return {"ok": False, "reason": "invalid-uci"}
     if (
         width <= 0 or height <= 0
@@ -1583,19 +1584,23 @@ def main() -> int:
                                                 "source": selection_meta.get("source", "CHESSKIDA"),
                                             },
                                         )
-                                        message = "ON · your turn · " + selected_san
-                                        driver.execute_script(
-                                            "window.__variationLineAnalyzer?.setTurnHintStatus?.(arguments[0]);",
-                                            message,
-                                        )
-                                        turn_hint_last_status = message
                                         if isinstance(shown, dict) and shown.get("ok"):
+                                            message = "ON · your turn · " + selected_san
                                             print(
                                                 f"[TURN HINT] {selected_san} | "
                                                 f"source={selection_meta.get('source', 'CHESSKIDA')} | "
                                                 f"rank={selection_meta.get('rank', '—')} | no move submitted.",
                                                 flush=True,
                                             )
+                                        else:
+                                            reason = shown.get("reason", "arrow-display-failed") if isinstance(shown, dict) else "invalid-display-response"
+                                            message = "ON · arrow display failed · " + str(reason)
+                                            print(f"[TURN HINT] {message}.", flush=True)
+                                        driver.execute_script(
+                                            "window.__variationLineAnalyzer?.setTurnHintStatus?.(arguments[0]);",
+                                            message,
+                                        )
+                                        turn_hint_last_status = message
                             except Exception as exc:
                                 driver.execute_script(
                                     "window.__variationLineAnalyzer?.clearTurnSuggestion?.();"
