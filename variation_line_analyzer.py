@@ -58,6 +58,104 @@ if (window.__variationLineAnalyzer) {
 const queue = [];
 let down = null;
 let suppress = false;
+let overlay = null;
+let overlayHost = null;
+let originalHostPosition = '';
+let changedHostPosition = false;
+const svgNS = 'http://www.w3.org/2000/svg';
+function findBoard(root = document) {
+  try { const found = root.querySelector(selector); if (found) return found; } catch (_) {}
+  let elements = [];
+  try { elements = root.querySelectorAll('*'); } catch (_) {}
+  for (const el of elements) {
+    if (el.shadowRoot) {
+      const nested = findBoard(el.shadowRoot);
+      if (nested) return nested;
+    }
+  }
+  return null;
+}
+function clearLabels() {
+  if (overlay && overlay.parentNode) overlay.parentNode.removeChild(overlay);
+  overlay = null;
+  if (changedHostPosition && overlayHost) overlayHost.style.position = originalHostPosition;
+  overlayHost = null;
+  changedHostPosition = false;
+}
+function ensureOverlay() {
+  const board = findBoard();
+  if (!board) return null;
+  const rect = board.getBoundingClientRect();
+  if (!rect.width || !rect.height) return null;
+  if (!overlay || !overlay.isConnected || overlayHost !== board) {
+    clearLabels();
+    const root = board.shadowRoot || board;
+    originalHostPosition = board.style.position || '';
+    if (getComputedStyle(board).position === 'static') {
+      board.style.position = 'relative';
+      changedHostPosition = true;
+    }
+    overlayHost = board;
+    overlay = document.createElementNS(svgNS, 'svg');
+    overlay.setAttribute('data-variation-line-labels', 'true');
+    overlay.style.position = 'absolute';
+    overlay.style.inset = '0';
+    overlay.style.width = '100%';
+    overlay.style.height = '100%';
+    overlay.style.overflow = 'hidden';
+    overlay.style.pointerEvents = 'none';
+    overlay.style.zIndex = '2147483000';
+    root.appendChild(overlay);
+  }
+  overlay.setAttribute('viewBox', '0 0 ' + rect.width + ' ' + rect.height);
+  overlay.setAttribute('width', String(rect.width));
+  overlay.setAttribute('height', String(rect.height));
+  return {board, rect, svg:overlay};
+}
+function drawLabels(items) {
+  const setup = ensureOverlay();
+  if (!setup) return {ok:false, reason:'board-label-layer-unavailable'};
+  const {board, rect, svg} = setup;
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+  const state = api.current() || {};
+  const side = String(state.bottomSide || '').toLowerCase();
+  if (!['white','black'].includes(side)) return {ok:false, reason:'board-orientation-unknown'};
+  const make = (tag, attrs, textValue) => {
+    const node = document.createElementNS(svgNS, tag);
+    for (const [key, value] of Object.entries(attrs || {})) node.setAttribute(key, String(value));
+    if (textValue !== undefined) node.textContent = String(textValue);
+    return node;
+  };
+  const squarePoint = (square) => {
+    const file = square.charCodeAt(0)-97;
+    const rank = Number(square[1]);
+    const boardFile = side === 'white' ? file : 7-file;
+    const boardRow = side === 'white' ? 8-rank : rank-1;
+    return {x:(boardFile+0.5)*rect.width/8, y:(boardRow+0.5)*rect.height/8};
+  };
+  const palette = ['#1f2937','#374151','#4b5563','#111827'];
+  for (const item of (Array.isArray(items) ? items : [])) {
+    const uci = String(item.uci || '');
+    if (!/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(uci)) continue;
+    const a = squarePoint(uci.slice(0,2)), b = squarePoint(uci.slice(2,4));
+    const x = (a.x+b.x)/2, y = (a.y+b.y)/2;
+    const radius = Math.max(11, Math.min(rect.width,rect.height)/34);
+    const group = make('g', {'data-ply':item.number || ''});
+    group.appendChild(make('circle',{cx:x,cy:y,r:radius,fill:palette[(Number(item.number||1)-1)%palette.length],stroke:'#ffffff','stroke-width':1.5,opacity:0.96}));
+    group.appendChild(make('text',{x:x,y:y+4,'text-anchor':'middle','font-family':'Segoe UI, Arial, sans-serif','font-size':Math.max(10,radius*1.05),'font-weight':'700',fill:'#ffffff'},item.number || ''));
+    const shortEval = String(item.eval || '');
+    if (shortEval) {
+      const labelX = Math.min(rect.width-5, Math.max(5, x+radius+3));
+      const labelY = Math.min(rect.height-5, Math.max(15, y-radius-2));
+      const textWidth = Math.min(92, Math.max(34, shortEval.length*6.5+10));
+      const left = labelX + textWidth > rect.width ? Math.max(2,labelX-textWidth-radius*2) : labelX;
+      group.appendChild(make('rect',{x:left,y:labelY-12,width:textWidth,height:20,rx:5,fill:'#111827',stroke:'#ffffff','stroke-width':0.8,opacity:0.94}));
+      group.appendChild(make('text',{x:left+textWidth/2,y:labelY+2,'text-anchor':'middle','font-family':'Segoe UI, Arial, sans-serif','font-size':10,'font-weight':'600',fill:'#ffffff'},shortEval));
+    }
+    svg.appendChild(group);
+  }
+  return {ok:true, count:svg.childNodes.length};
+}
 function matchingBoard(event) {
   const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
   for (const node of path) {
@@ -113,11 +211,14 @@ window.addEventListener('pointerdown', onDown, true);
 window.addEventListener('pointerup', onUp, true);
 window.__variationLineAnalyzer = {
   queue,
+  drawLabels,
+  clearLabels,
   get suppress() { return suppress; },
   set suppress(value) { suppress = !!value; },
   stop:() => {
     window.removeEventListener('pointerdown', onDown, true);
     window.removeEventListener('pointerup', onUp, true);
+    clearLabels();
     queue.length = 0;
     delete window.__variationLineAnalyzer;
   }
@@ -282,6 +383,7 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
     previous_score = start_score
     cdp = tracker._direct_cdp_page_for_driver(driver)
     drawn_count = 0
+    board_labels: list[dict] = []
     for index, current_move in enumerate(line, start=1):
         if current_move not in eval_board.legal_moves:
             break
@@ -293,6 +395,17 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
         if note:
             line_item += f" | {note}"
         report.append(line_item)
+        compact = current_eval
+        compact = compact.replace("White +", "W+").replace("Black +", "B+")
+        if compact.startswith("Equal"):
+            compact = "="
+        elif compact.startswith("Mate for White"):
+            compact = "MATE W"
+        elif compact.startswith("Mate for Black"):
+            compact = "MATE B"
+        elif compact == "Draw":
+            compact = "DRAW"
+        board_labels.append({"number": index, "uci": current_move.uci(), "eval": compact})
         previous_score = current_score
 
         # The user already drew the first move. Add only the continuation as
@@ -317,10 +430,17 @@ def analyze_arrow(driver, engine, event: dict, max_plies: int, search_time: floa
 
         if eval_board.is_checkmate():
             break
+    try:
+        driver.execute_script(
+            "return window.__variationLineAnalyzer?.drawLabels?.(arguments[0]) || {ok:false};",
+            board_labels,
+        )
+    except Exception:
+        pass
     report.extend([
         "",
         "Eval convention: positive favors White; negative favors Black.",
-        "Arrows are the board's native right-click annotations. The numbered move/eval list is in this window.",
+        "Number/eval labels are attached inside the board element; arrows use the board's native right-click annotations.",
         f"Native continuation arrows drawn: {drawn_count}",
         ""
     ])
@@ -460,7 +580,11 @@ def main() -> int:
                 current_fen = str(state.get("fen") or "")
                 if current_fen and last_fen and current_fen != last_fen:
                     clear_generated(driver, generated)
-                    status.set("Board position changed; old continuation arrows cleared.")
+                    try:
+                        driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
+                    except Exception:
+                        pass
+                    status.set("Board position changed; old continuation arrows and labels cleared.")
                 if current_fen:
                     last_fen = current_fen
                 queued = driver.execute_script("return window.__variationLineAnalyzer ? window.__variationLineAnalyzer.queue.splice(0) : [];") or []
