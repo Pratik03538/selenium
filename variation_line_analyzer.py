@@ -551,17 +551,30 @@ def format_white_score(score) -> tuple[str, float]:
     return label, value
 
 
-def eval_white(engine, board: chess.Board, seconds: float) -> tuple[str, float]:
-    # Stockfish cannot analyse an already-terminal position on some builds.
+def eval_white(
+    engine,
+    board: chess.Board,
+    seconds: float,
+    strategy_module=None,
+) -> tuple[str, float, int]:
+    """Return a White-perspective label, display score and selector-compatible CP."""
     if board.is_checkmate():
         winner = not board.turn
         side = "White" if winner == chess.WHITE else "Black"
         value = 100000.0 if winner == chess.WHITE else -100000.0
-        return f"Mate for {side}", value
+        cp = 100000 if winner == chess.WHITE else -100000
+        return f"Mate for {side}", value, cp
     if board.is_game_over(claim_draw=True):
-        return "Draw", 0.0
-    info = engine.analyse(board, chess.engine.Limit(time=seconds))
-    return format_white_score(info["score"].pov(chess.WHITE))
+        return "Draw", 0.0, 0
+
+    info = engine.analyse(board, chess.engine.Limit(time=max(0.005, seconds)))
+    score_white = info["score"].pov(chess.WHITE)
+    label, value = format_white_score(score_white)
+    if strategy_module is not None:
+        cp = int(strategy_module.score_to_cp(score_white))
+    else:
+        cp = int(round(value * 100))
+    return label, value, cp
 
 
 def delta_text(previous: float, current: float) -> str:
@@ -678,14 +691,116 @@ def short_eval(value: str) -> str:
     )
 
 
+def select_strategy_move(
+    engine,
+    book,
+    strategy_module,
+    board: chess.Board,
+    search_time: float,
+    previous_eval_white_cp: int | None,
+) -> tuple[chess.Move | None, dict | None, dict, str, float, int, str]:
+    """Select one move using the project's ChessKida selector, not the raw top PV."""
+    root_label = ""
+    root_value = 0.0
+    root_cp = 0
+
+    # The main tracker uses this same weighted GM book before the ChessKida selector.
+    if book is not None:
+        try:
+            book_choice = book.choose(board)
+        except Exception:
+            book_choice = None
+        if isinstance(book_choice, dict) and book_choice.get("move") in board.legal_moves:
+            try:
+                root_label, root_value, root_cp = eval_white(
+                    engine, board, min(search_time, 0.01), strategy_module
+                )
+            except Exception:
+                root_label, root_value, root_cp = "", 0.0, 0
+            metadata = {
+                "rank": int(book_choice.get("rank", 1)) - 1,
+                "source": "GM_BOOK",
+                "reason": "GM BOOK | weighted opening-book choice",
+                "selected_cp": root_cp,
+            }
+            return book_choice["move"], None, metadata, root_label, root_value, root_cp, ""
+
+    try:
+        result = engine.analyse(
+            board,
+            chess.engine.Limit(depth=8, time=max(0.005, search_time)),
+            multipv=max(1, int(getattr(strategy_module, "TRAINING_MULTI_PV", 15))),
+        )
+        infos = result if isinstance(result, list) else [result]
+        infos = [
+            item for item in infos
+            if isinstance(item, dict) and item.get("pv") and item.get("score") is not None
+        ]
+    except Exception as exc:
+        return None, None, {}, root_label, root_value, root_cp, (
+            f"Move selection analysis failed · {type(exc).__name__}"
+        )
+
+    if not infos:
+        return None, None, {}, root_label, root_value, root_cp, (
+            "No legal MultiPV candidates returned by strategy analysis"
+        )
+
+    try:
+        root_score_white = infos[0]["score"].pov(chess.WHITE)
+        root_label, root_value = format_white_score(root_score_white)
+        root_cp = int(strategy_module.score_to_cp(root_score_white))
+    except Exception:
+        try:
+            root_label, root_value, root_cp = eval_white(
+                engine, board, min(search_time, 0.01), strategy_module
+            )
+        except Exception:
+            return None, None, {}, "", 0.0, 0, "Current-position evaluation unavailable"
+
+    try:
+        selected_move, selected_info, metadata = strategy_module.choose_stockfish_move(
+            board,
+            infos,
+            previous_eval_white_cp=previous_eval_white_cp,
+            opponent_accuracy=None,
+            opponent_sample_count=0,
+            opponent_pressure=False,
+            engine=engine,
+            bot_color=board.turn,
+            low_clock_mode=False,
+        )
+    except Exception as exc:
+        return None, None, {}, root_label, root_value, root_cp, (
+            f"ChessKida selector failed · {type(exc).__name__}"
+        )
+
+    if selected_move not in board.legal_moves:
+        reason = metadata.get("reason", "selector returned no legal move") if isinstance(metadata, dict) else "selector returned no legal move"
+        return None, None, metadata if isinstance(metadata, dict) else {}, root_label, root_value, root_cp, str(reason)
+
+    return (
+        selected_move,
+        selected_info if isinstance(selected_info, dict) else None,
+        metadata if isinstance(metadata, dict) else {},
+        root_label,
+        root_value,
+        root_cp,
+        "",
+    )
+
+
 def calculate_next_hints(
     engine,
+    strategy_module,
+    book,
     board: chess.Board,
     search_time: float,
     step_number: int,
     max_steps: int,
+    previous_eval_white_cp: int | None = None,
 ) -> tuple[list[dict], str]:
-    """Return at most two consecutive PV moves without executing either one."""
+    """Calculate up to two moves by repeatedly applying the existing move selector."""
     if board.is_game_over(claim_draw=True):
         outcome = board.outcome(claim_draw=True)
         if outcome and outcome.winner is not None:
@@ -693,90 +808,119 @@ def calculate_next_hints(
                         else "Checkmate · Black wins")
         return [], "Draw · no further moves"
 
-    try:
-        info = engine.analyse(board, chess.engine.Limit(time=search_time))
-        pv = list(info.get("pv") or [])
-        if not pv:
-            return [], "Stockfish returned no legal continuation"
+    remaining_steps = 2 if max_steps <= 0 else max(0, max_steps - step_number + 1)
+    moves_to_show = min(2, remaining_steps)
+    if moves_to_show < 1:
+        return [], "Preview complete"
 
-        _, root_value = format_white_score(info["score"].pov(chess.WHITE))
-        remaining_steps = max(0, max_steps - step_number + 1)
-        moves_to_show = min(2, remaining_steps, len(pv))
-        if moves_to_show < 1:
-            return [], "Preview complete"
+    # Keep virtual history so strategy selection sees the same line that has
+    # been traced so far, instead of treating every position as a fresh FEN.
+    line_board = board.copy(stack=True)
+    previous_display_value = None
+    selector_previous_cp = previous_eval_white_cp
+    hints: list[dict] = []
 
-        line_board = board.copy(stack=False)
-        previous_value = root_value
-        hints: list[dict] = []
+    for offset in range(moves_to_show):
+        if line_board.is_game_over(claim_draw=True):
+            break
 
-        for offset, move in enumerate(pv[:moves_to_show]):
-            if move not in line_board.legal_moves:
-                break
+        (
+            move,
+            _selected_info,
+            selection_meta,
+            root_label,
+            root_value,
+            _root_cp,
+            reason,
+        ) = select_strategy_move(
+            engine,
+            book,
+            strategy_module,
+            line_board,
+            search_time,
+            selector_previous_cp,
+        )
+        if move is None:
+            if hints:
+                return hints, reason or "No further legal continuation"
+            return [], reason or "ChessKida selector returned no legal continuation"
 
-            san = line_board.san(move)
-            side = "White" if line_board.turn == chess.WHITE else "Black"
-            move_prefix = (
-                f"{line_board.fullmove_number}."
-                if line_board.turn == chess.WHITE
-                else f"{line_board.fullmove_number}..."
+        if previous_display_value is None:
+            previous_display_value = root_value
+
+        san = line_board.san(move)
+        side = "White" if line_board.turn == chess.WHITE else "Black"
+        move_prefix = (
+            f"{line_board.fullmove_number}."
+            if line_board.turn == chess.WHITE
+            else f"{line_board.fullmove_number}..."
+        )
+        note = capture_description(line_board, move)
+        source = str(selection_meta.get("source", "CHESSKIDA"))
+        selected_rank = selection_meta.get("rank")
+        selection_reason = str(selection_meta.get("reason", "ChessKida move-selection policy"))
+
+        line_board.push(move)
+        after_eval, after_value, after_cp = eval_white(
+            engine, line_board, min(search_time, 0.01), strategy_module
+        )
+
+        if line_board.is_checkmate():
+            note = (note + " · " if note else "") + "CHECKMATE"
+        elif line_board.is_check():
+            note = (note + " · " if note else "") + "CHECK"
+        elif line_board.is_stalemate():
+            note = (note + " · " if note else "") + "STALEMATE"
+
+        capture_short = ""
+        if "captures" in note:
+            piece_name = next(
+                (p for p in ("queen", "rook", "bishop", "knight", "pawn") if p in note),
+                "",
             )
-            note = capture_description(line_board, move)
-            line_board.push(move)
+            captured_side = (
+                "W" if "captures White " in note
+                else ("B" if "captures Black " in note else "")
+            )
+            letter = {
+                "queen": "Q", "rook": "R", "bishop": "B",
+                "knight": "N", "pawn": "P",
+            }.get(piece_name, "")
+            if letter:
+                capture_short = f"captures {captured_side}{letter}"
 
-            if line_board.is_checkmate():
-                note = (note + " · " if note else "") + "CHECKMATE"
-            elif line_board.is_check():
-                note = (note + " · " if note else "") + "CHECK"
-            elif line_board.is_stalemate():
-                note = (note + " · " if note else "") + "STALEMATE"
+        if "CHECKMATE" in note:
+            display_eval = "MATE"
+        elif "STALEMATE" in note:
+            display_eval = "DRAW"
+        else:
+            display_eval = short_eval(after_eval)
 
-            after_eval, after_value = eval_white(engine, line_board, min(search_time, 0.01))
-            capture_short = ""
-            if "captures" in note:
-                piece_name = next(
-                    (p for p in ("queen", "rook", "bishop", "knight", "pawn") if p in note),
-                    "",
-                )
-                captured_side = (
-                    "W" if "captures White " in note
-                    else ("B" if "captures Black " in note else "")
-                )
-                letter = {
-                    "queen": "Q", "rook": "R", "bishop": "B",
-                    "knight": "N", "pawn": "P",
-                }.get(piece_name, "")
-                if letter:
-                    capture_short = f"captures {captured_side}{letter}"
+        hints.append({
+            "uci": move.uci(),
+            "san": f"{move_prefix}{san}",
+            "side": side,
+            "eval": display_eval,
+            "root_eval": short_eval(root_label),
+            "eval_white_cp": after_cp,
+            "delta": delta_text(previous_display_value, after_value),
+            "note": note,
+            "capture": capture_short,
+            "title": f"MOVE {step_number + offset} · {side}",
+            "step": step_number + offset,
+            "selection_source": source,
+            "selection_rank": selected_rank,
+            "selection_reason": selection_reason,
+        })
+        previous_display_value = after_value
+        selector_previous_cp = after_cp
 
-            if "CHECKMATE" in note:
-                display_eval = "MATE"
-            elif "STALEMATE" in note:
-                display_eval = "DRAW"
-            else:
-                display_eval = short_eval(after_eval)
+        if line_board.is_game_over(claim_draw=True):
+            break
 
-            hints.append({
-                "uci": move.uci(),
-                "san": f"{move_prefix}{san}",
-                "side": side,
-                "eval": display_eval,
-                "root_eval": short_eval(after_eval),
-                "delta": delta_text(previous_value, after_value),
-                "note": note,
-                "capture": capture_short,
-                "title": f"MOVE {step_number + offset} · {side}",
-                "step": step_number + offset,
-            })
-            previous_value = after_value
-
-            if line_board.is_game_over(claim_draw=True):
-                break
-
-        if not hints:
-            return [], "No legal continuation found"
-        return hints, ""
-    except Exception as exc:
-        return [], f"Stockfish error · {type(exc).__name__}"
+    if not hints:
+        return [], "No legal continuation found"
+    return hints, ""
 
 
 def show_hints(driver, hints: list[dict], message: str = "") -> bool:
@@ -828,15 +972,28 @@ def main() -> int:
     parser.add_argument("--allowed-domain", default="")
     parser.add_argument("--board-selector", default="chess-board")
     parser.add_argument("--stockfish-path", default="")
-    parser.add_argument("--plies", type=int, default=4, help="Maximum sequential suggestions before stopping (default 4, maximum 4).")
+    parser.add_argument("--plies", type=int, default=0, help="Optional maximum sequential plies; 0 means unlimited (default).")
     parser.add_argument("--search-time", type=float, default=0.05, help="Fast Stockfish search time per position in seconds (0.05-2.0).")
     args = parser.parse_args()
-    args.plies = max(1, min(4, int(args.plies)))
+    args.plies = max(0, int(args.plies))
+    progress_limit = str(args.plies) if args.plies > 0 else "∞"
     args.search_time = max(0.05, min(2.0, float(args.search_time)))
     driver = None
     engine = None
+    book = None
+    strategy_module = None
 
     try:
+        try:
+            import chesskida_strategy as strategy_module
+            from gm_book import GMBook
+        except ImportError as exc:
+            print(
+                "[STRATEGY ERROR] ChessKida selector files are missing beside the tracker.",
+                file=sys.stderr,
+            )
+            return 2
+
         blocked = tracker.load_blocked_platforms()
         allowed_host = tracker.normalize_host(args.allowed_domain) if args.allowed_domain else tracker.load_allowed_host_from_txt()[0]
         if not allowed_host:
@@ -950,10 +1107,18 @@ def main() -> int:
             engine.quit()
             return 2
 
+        book = GMBook(tracker.BASE_DIR / "Ultimate_GM_Bullet.bin")
+        if book.load():
+            print("[BOOK] Weighted GM opening book loaded for the same opening-selection behavior.", flush=True)
+        else:
+            print("[BOOK] GM opening book unavailable; continuing with the ChessKida selector.", flush=True)
+            book = None
+
         accepted_steps = 0
         pending_hints: list[dict] = []
         branch_active = False
         awaiting_clear = False
+        line_previous_eval_white_cp: int | None = None
 
         def show_next_step() -> None:
             nonlocal pending_hints, awaiting_clear
@@ -962,12 +1127,12 @@ def main() -> int:
                 show_hints(driver, [], "Queue empty · draw a legal arrow to begin")
                 return
 
-            if accepted_steps >= args.plies:
+            if args.plies > 0 and accepted_steps >= args.plies:
                 pending_hints = []
                 awaiting_clear = True
                 show_hints(
                     driver, [],
-                    f"Preview complete · {accepted_steps}/{args.plies} moves · manually clear ALL your arrows to restart"
+                    f"Preview complete · {accepted_steps}/{args.plies} plies · manually clear ALL your arrows to restart"
                 )
                 print(
                     f"[DONE] Preview finished after {accepted_steps} moves. "
@@ -977,8 +1142,8 @@ def main() -> int:
                 return
 
             hints, reason = calculate_next_hints(
-                engine, analysis_board, args.search_time,
-                accepted_steps + 1, args.plies,
+                engine, strategy_module, book, analysis_board, args.search_time,
+                accepted_steps + 1, args.plies, line_previous_eval_white_cp,
             )
             if not hints:
                 pending_hints = []
@@ -996,12 +1161,15 @@ def main() -> int:
                 return
 
             pending_hints = hints[:2]
-            if show_hints(driver, pending_hints):
+            if show_hints(driver, pending_hints, reason):
                 for hint in pending_hints:
                     note = f" · {hint['note']}" if hint.get("note") else ""
                     print(
                         f"[HINT {hint['step']}] {hint['title']} · {hint['san']} · "
-                        f"after={hint['eval']} · {hint['delta']}{note}",
+                        f"after={hint['eval']} · {hint['delta']} · "
+                        f"selector={hint.get('selection_source', 'CHESSKIDA')} "
+                        f"rank={hint.get('selection_rank', '—')} · "
+                        f"{hint.get('selection_reason', 'ChessKida selection')}{note}",
                         flush=True,
                     )
                 print(
@@ -1014,7 +1182,7 @@ def main() -> int:
         print("[READY] No suggestions are shown until you draw a native right-click arrow.", flush=True)
         print("[READY] Your drawn arrow selects the starting move; the next two suggestions then appear.", flush=True)
         print("[READY] Drawing the first hinted move continues that line; clear ALL your arrows to return to the real board position.", flush=True)
-        print("[READY] Nothing is played or premoved. Preview is limited to four plies.", flush=True)
+        print("[READY] No move cap by default. Clear all your arrows to return to the real position and start a fresh queue.", flush=True)
         print("[READY] Press Ctrl+C in this terminal to stop.", flush=True)
 
         try:
@@ -1042,6 +1210,7 @@ def main() -> int:
                         pending_hints = []
                         branch_active = False
                         awaiting_clear = False
+                        line_previous_eval_white_cp = None
                         show_hints(driver, [], "Board position changed · queue reset · draw a new arrow")
                         print("[RESET] Board position changed; waiting for your next arrow.", flush=True)
 
@@ -1092,6 +1261,7 @@ def main() -> int:
                             pending_hints = []
                             branch_active = False
                             awaiting_clear = False
+                            line_previous_eval_white_cp = None
                             show_hints(driver, [], "Queue cleared · real board position restored · draw a new arrow")
                             print(
                                 "[RESET] All tracked user arrows are cleared. "
@@ -1170,6 +1340,10 @@ def main() -> int:
 
                         try:
                             accepted_san = analysis_board.san(chosen_move)
+                            hinted_after_cp = (
+                                pending_hints[0].get("eval_white_cp")
+                                if followed_hint and pending_hints else None
+                            )
                             was_branch_active = branch_active
                             if not was_branch_active or not followed_hint:
                                 # A first arrow starts the sequence. A different legal
@@ -1180,23 +1354,33 @@ def main() -> int:
                             accepted_steps += 1
                             branch_active = True
                             pending_hints = []
+                            if followed_hint and isinstance(hinted_after_cp, (int, float)):
+                                line_previous_eval_white_cp = int(hinted_after_cp)
+                            else:
+                                try:
+                                    _label, _value, line_previous_eval_white_cp = eval_white(
+                                        engine, analysis_board, min(args.search_time, 0.01),
+                                        strategy_module,
+                                    )
+                                except Exception:
+                                    line_previous_eval_white_cp = None
 
                             if followed_hint:
                                 print(
                                     f"[CONFIRMED] {accepted_san} · "
-                                    f"{accepted_steps}/{args.plies} · continuing hinted line",
+                                    f"{accepted_steps}/{progress_limit} · continuing hinted line",
                                     flush=True,
                                 )
                             elif not was_branch_active:
                                 print(
                                     f"[START] Your arrow selected {accepted_san} · "
-                                    f"starting the variation ({accepted_steps}/{args.plies})",
+                                    f"starting the variation ({accepted_steps}/{progress_limit})",
                                     flush=True,
                                 )
                             else:
                                 print(
                                     f"[BRANCH] Your arrow selected {accepted_san} · "
-                                    f"new variation from this position ({accepted_steps}/{args.plies})",
+                                    f"new variation from this position ({accepted_steps}/{progress_limit})",
                                     flush=True,
                                 )
                             show_next_step()
@@ -1225,6 +1409,11 @@ def main() -> int:
             except Exception:
                 pass
             try:
+                if book is not None:
+                    book.close()
+            except Exception:
+                pass
+            try:
                 engine.quit()
             except Exception:
                 pass
@@ -1236,6 +1425,11 @@ def main() -> int:
         if driver is not None:
             try:
                 driver.execute_script("window.__variationLineAnalyzer?.stop?.()")
+            except Exception:
+                pass
+        if book is not None:
+            try:
+                book.close()
             except Exception:
                 pass
         if engine is not None:
