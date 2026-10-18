@@ -45,16 +45,28 @@ def make_observer_config(board_selector: str) -> dict:
     }
 
 
-def publish_autoplay_mode(path: Path | None, enabled: bool) -> bool:
-    """Atomically tell the parent tracker whether its existing BOT switch is enabled."""
+def publish_autoplay_mode(
+    path: Path | None,
+    enabled: bool,
+    move_reference: dict | None = None,
+) -> bool:
+    """Atomically publish the BOT switch and latest SHOW MOVE reference to the tracker."""
     if path is None:
         return False
+    payload = {"autoplay_enabled": bool(enabled)}
+    if move_reference is not None:
+        payload["move_reference"] = move_reference
+    else:
+        # Mode changes should not erase the last reference already published.
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(previous, dict) and isinstance(previous.get("move_reference"), dict):
+                payload["move_reference"] = previous["move_reference"]
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            pass
     temp_path = path.with_name(path.name + ".tmp")
     try:
-        temp_path.write_text(
-            json.dumps({"autoplay_enabled": bool(enabled)}),
-            encoding="utf-8",
-        )
+        temp_path.write_text(json.dumps(payload), encoding="utf-8")
         temp_path.replace(path)
         return True
     except OSError:
@@ -1672,21 +1684,45 @@ def main() -> int:
                                         )
                                     else:
                                         selected_san = turn_board.san(selected_move)
+                                        selected_rank = selection_meta.get("rank")
+                                        selected_source = str(selection_meta.get("source", "CHESSKIDA"))
                                         shown = driver.execute_script(
                                             "return window.__variationLineAnalyzer?.drawTurnSuggestion?.(arguments[0]) || {ok:false};",
                                             {
                                                 "uci": selected_move.uci(),
                                                 "san": selected_san,
-                                                "rank": selection_meta.get("rank"),
-                                                "source": selection_meta.get("source", "CHESSKIDA"),
+                                                "rank": selected_rank,
+                                                "source": selected_source,
                                             },
                                         )
+                                        if mode_control_file is not None:
+                                            try:
+                                                selected_rank_value = (
+                                                    int(selected_rank) if selected_rank is not None else None
+                                                )
+                                            except (TypeError, ValueError):
+                                                selected_rank_value = None
+                                            move_reference = {
+                                                "event_id": str(time.time_ns()),
+                                                "fen": current_fen,
+                                                "uci": selected_move.uci(),
+                                                "san": selected_san,
+                                                "ply": turn_board.ply() + 1,
+                                                "side": (
+                                                    "White" if turn_board.turn == chess.WHITE else "Black"
+                                                ),
+                                                "rank": selected_rank_value,
+                                                "source": selected_source,
+                                            }
+                                            publish_autoplay_mode(
+                                                mode_control_file, False, move_reference
+                                            )
                                         if isinstance(shown, dict) and shown.get("ok"):
                                             message = "ON · your turn · " + selected_san
                                             print(
                                                 f"[TURN HINT] {selected_san} | "
-                                                f"source={selection_meta.get('source', 'CHESSKIDA')} | "
-                                                f"rank={selection_meta.get('rank', '—')} | no move submitted.",
+                                                f"source={selected_source} | "
+                                                f"rank={selected_rank if selected_rank is not None else '—'} | no move submitted.",
                                                 flush=True,
                                             )
                                         else:
