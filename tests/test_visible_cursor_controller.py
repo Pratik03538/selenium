@@ -60,6 +60,26 @@ def make_controller():
     return VisibleCursorController(backend=backend, motion=motion), backend
 
 
+class CursorMotionBudgetTests(unittest.TestCase):
+    def test_millisecond_profiles_are_valid_for_low_clock_mode(self):
+        motion = CursorMotionConfig(
+            approach_duration_s=0.002,
+            move_drag_duration_s=0.006,
+            arrow_drag_duration_s=0.018,
+            settle_after_press_s=0.0,
+            settle_after_release_s=0.0,
+            min_steps=4,
+            max_steps=4,
+            curve_pixels=0.25,
+        )
+        self.assertEqual(motion.approach_duration_s, 0.002)
+        self.assertEqual(motion.move_drag_duration_s, 0.006)
+
+    def test_submillisecond_profile_is_rejected(self):
+        with self.assertRaises(ValueError):
+            CursorMotionConfig(approach_duration_s=0.0001)
+
+
 class BoardGeometryTests(unittest.TestCase):
     def test_white_bottom_orientation(self):
         board = BoardGeometry(100, 200, 800, 800, "white")
