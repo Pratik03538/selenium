@@ -3549,11 +3549,16 @@ def _replace_native_coaching_annotations(
     next_highlight: str | None,
     expected_fen: str,
 ) -> tuple[list[str], str | None]:
-    """Replace generated native annotations while suppressing analyzer queue events."""
+    """Draw only new annotations for the current position.
+
+    The board automatically clears native arrows/highlights when a move is made.
+    Never toggle previous annotations here: that gesture would create the old
+    arrow again rather than clear it.
+    """
     cdp = _direct_cdp_page_for_driver(driver)
     geometry = _read_board_annotation_geometry(driver, board_selector)
     if cdp is None or geometry is None:
-        return list(previous_arrows), previous_highlight
+        return [], None
 
     try:
         driver.execute_script(
@@ -3562,18 +3567,9 @@ def _replace_native_coaching_annotations(
     except Exception:
         pass
 
-    remaining_previous: list[str] = []
     drawn: list[str] = []
     kept_highlight: str | None = None
     try:
-        for arrow in reversed(previous_arrows):
-            if not _toggle_native_annotation_arrow(cdp, arrow, geometry):
-                remaining_previous.append(arrow)
-
-        highlight_needs_change = previous_highlight != next_highlight
-        if previous_highlight and highlight_needs_change:
-            _toggle_native_annotation_square(cdp, previous_highlight, geometry)
-
         current_fen = ""
         try:
             current_fen = str(driver.execute_script(
@@ -3581,6 +3577,7 @@ def _replace_native_coaching_annotations(
             ) or "").strip()
         except Exception:
             current_fen = ""
+
         position_matches = False
         if expected_fen and current_fen and chess is not None:
             try:
@@ -3594,11 +3591,10 @@ def _replace_native_coaching_annotations(
             for arrow in next_arrows[:5]:
                 if _toggle_native_annotation_arrow(cdp, arrow, geometry):
                     drawn.append(arrow)
-            if next_highlight:
-                if previous_highlight == next_highlight and not highlight_needs_change:
-                    kept_highlight = previous_highlight
-                elif _toggle_native_annotation_square(cdp, next_highlight, geometry):
-                    kept_highlight = next_highlight
+            if next_highlight and _toggle_native_annotation_square(
+                cdp, next_highlight, geometry
+            ):
+                kept_highlight = next_highlight
     finally:
         try:
             driver.execute_script(
@@ -3606,8 +3602,7 @@ def _replace_native_coaching_annotations(
             )
         except Exception:
             pass
-    return remaining_previous + drawn, kept_highlight
-
+    return drawn, kept_highlight
 
 
 
@@ -5553,8 +5548,6 @@ def main() -> int:
         auto_analysis_highlight_square: str | None = None
         # Never display the same arrow twice in one game, even after it disappears.
         shown_coaching_arrows: set[str] = set()
-        # Retry stale-arrow clearing if the board/CDP is temporarily unavailable.
-        pending_stale_coaching_arrows: list[str] = []
         last_dashboard_eval_fen = ""
         reconstructed_history: list[dict[str, str]] = []
         last_dashboard_history_signature = None
@@ -6071,10 +6064,6 @@ def main() -> int:
                                 arrow for arrow in next_coaching_arrows
                                 if arrow in auto_analysis_arrows
                             )
-                        pending_stale_coaching_arrows = [
-                            arrow for arrow in auto_analysis_arrows
-                            if arrow not in next_coaching_arrows
-                        ]
                         plan_mode = str(coaching_plan.get("mode") or "none")
                         plan_reason = str(coaching_plan.get("reason") or "")
                         tactical_queue = [
@@ -6097,26 +6086,6 @@ def main() -> int:
                                 + (f" | {plan_reason}" if plan_mode != "tactical-queue" else ""),
                                 flush=True,
                             )
-
-                    elif pending_stale_coaching_arrows and fen:
-                        current_arrows = [
-                            arrow for arrow in auto_analysis_arrows
-                            if arrow not in pending_stale_coaching_arrows
-                        ]
-                        cleared_or_pending, _ = _replace_native_coaching_annotations(
-                            driver,
-                            args.board_selector,
-                            pending_stale_coaching_arrows,
-                            None,
-                            [],
-                            None,
-                            fen,
-                        )
-                        pending_stale_coaching_arrows = list(cleared_or_pending)
-                        auto_analysis_arrows = pending_stale_coaching_arrows + [
-                            arrow for arrow in current_arrows
-                            if arrow not in pending_stale_coaching_arrows
-                        ]
 
                     # Send the complete validated history through one idempotent
                     # dashboard path. This is independent of BOT state and catches
