@@ -26,6 +26,7 @@ from seleniumbase_live_game_tracker import (
     infer_move_between_fens,
     calculate_top_continuation_uci_moves,
     build_move_coaching_plan,
+    build_current_position_danger_plan,
     filter_new_coaching_arrows,
     premove_phase_allowed,
     reconstruct_history_from_dom_moves,
@@ -348,6 +349,45 @@ class CoachingArrowDeduplicationTests(unittest.TestCase):
         self.assertEqual(filter_new_coaching_arrows(["a4a8"], shown_arrows), ["a4a8"])
         self.assertEqual(filter_new_coaching_arrows(["d4d8"], shown_arrows), [])
         self.assertIn("d4d8", shown_arrows)
+
+
+class CurrentPositionDangerPlanTests(unittest.TestCase):
+    class FakeEngine:
+        def __init__(self):
+            self.calls = []
+
+        def analyse(self, board, limit, multipv=1):
+            self.calls.append(board.fen())
+            return {"pv": []}
+
+    def test_opponent_reply_gets_reanalysed_from_the_new_fen(self):
+        engine = self.FakeEngine()
+        attacked_queen = chess.Board("3qk3/8/8/8/3R4/8/8/4K3 w - - 0 1")
+        moved_queen = chess.Board("4k3/2q5/8/8/3R4/8/8/4K3 w - - 0 1")
+
+        first_plan = build_current_position_danger_plan(
+            attacked_queen.fen(), "white", engine=engine
+        )
+        second_plan = build_current_position_danger_plan(
+            moved_queen.fen(), "white", engine=engine
+        )
+
+        self.assertIn("d4d8", first_plan["danger_arrows"])
+        self.assertNotIn("d4d8", second_plan["danger_arrows"])
+        self.assertEqual(len(engine.calls), 2)
+        self.assertEqual(engine.calls[0], attacked_queen.fen())
+        self.assertEqual(engine.calls[1], moved_queen.fen())
+
+    def test_current_position_plan_prioritizes_multiple_opponent_pieces(self):
+        board = chess.Board("3qk3/8/8/8/3R2r1/8/8/4K3 w - - 0 1")
+        plan = build_current_position_danger_plan(
+            board.fen(), "white", engine=self.FakeEngine()
+        )
+        self.assertEqual(plan["mode"], "threat-arrows")
+        self.assertIn("d4d8", plan["danger_arrows"])
+        self.assertLessEqual(len(plan["danger_arrows"]), 4)
+        self.assertEqual(plan["tactical_queue"], [])
+
 
 
 class MoveRetryGateTests(unittest.TestCase):
