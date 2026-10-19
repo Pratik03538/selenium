@@ -3974,6 +3974,21 @@ def _perform_cursor_drag_once(
                 return ""
 
         focus_guard = lambda: controller.backend.foreground_title_contains(window_title)
+
+        def preview_cursor_for_upcoming_moves(preview_fen: str) -> float:
+            """Pointer-only look-ahead; no engine search, button press, or FEN re-read."""
+            try:
+                preview_result = controller.preview_legal_moves(
+                    preview_fen,
+                    geometry=screen_geometry,
+                    focus_guard=focus_guard,
+                    max_moves=1 if low_clock_mode else 2,
+                    position_prevalidated=True,
+                )
+                return max(0.0, float(preview_result.duration_s) * 1000.0)
+            except Exception:
+                return 0.0
+
         try:
             cursor_result = controller.move_uci(
                 text,
@@ -4036,6 +4051,7 @@ def _perform_cursor_drag_once(
     page_detected_ms = observed.get("detected_ms")
     pending_premove = bool(observed.get("pending"))
     if current_fen and uci_move_reaches_fen(expected_fen, current_fen, text):
+        cursor_preview_ms = preview_cursor_for_upcoming_moves(current_fen)
         return {
             "ok": True,
             "confirmed": True,
@@ -4047,8 +4063,10 @@ def _perform_cursor_drag_once(
             "confirm_elapsed_ms": round(confirm_elapsed_ms, 1),
             "confirm_detected_ms": round(float(page_detected_ms or 0.0), 1),
             "confirm_interval_ms": confirm_interval_ms,
+            "cursor_preview_ms": round(cursor_preview_ms, 1),
         }
     if allow_premove and pending_premove:
+        cursor_preview_ms = preview_cursor_for_upcoming_moves(current_fen or expected_fen)
         return {
             "ok": True, "uci": text, "premove_attempted": True,
             "premove_confirmed": True, "premove_source": "page-side observer",
@@ -4058,8 +4076,10 @@ def _perform_cursor_drag_once(
             "confirm_elapsed_ms": round(confirm_elapsed_ms, 1),
             "confirm_detected_ms": round(float(page_detected_ms or 0.0), 1),
             "confirm_interval_ms": confirm_interval_ms,
+            "cursor_preview_ms": round(cursor_preview_ms, 1),
         }
     if allow_premove:
+        cursor_preview_ms = preview_cursor_for_upcoming_moves(current_fen or expected_fen)
         return {
             "ok": True, "uci": text, "premove_attempted": True,
             "premove_confirmed": False, "premove_source": "not-exposed",
@@ -4069,6 +4089,7 @@ def _perform_cursor_drag_once(
             "confirm_elapsed_ms": round(confirm_elapsed_ms, 1),
             "confirm_detected_ms": round(float(page_detected_ms or 0.0), 1),
             "confirm_interval_ms": confirm_interval_ms,
+            "cursor_preview_ms": round(cursor_preview_ms, 1),
         }
     return {
         "ok": False,
