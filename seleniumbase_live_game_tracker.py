@@ -7035,7 +7035,9 @@ def main() -> int:
                                         low_clock_mode=low_clock_mode,
                                         elapsed_seconds_before_delay=time.monotonic() - move_cycle_started_at,
                                         submission_reserve_seconds=(
-                                            0.075 if args.move_input == "cursor" else 0.035
+                                            (0.075 if low_clock_mode else 0.32)
+                                            if args.move_input == "cursor"
+                                            else 0.035
                                         ),
                                     )
                                     if natural_delay > 0:
