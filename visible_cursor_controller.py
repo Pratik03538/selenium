@@ -28,6 +28,7 @@ from __future__ import annotations
 import ctypes
 import math
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -494,6 +495,112 @@ class VisibleCursorController:
                 pass
             return CursorActionResult(
                 False, "move", f"input-failed: {exc}", (token,),
+                time.monotonic() - started,
+            )
+
+    def preview_legal_moves(
+        self,
+        fen: str,
+        *,
+        geometry: BoardGeometry,
+        focus_guard: FocusGuard | None,
+        max_moves: int = 2,
+        current_fen_reader: FenReader | None = None,
+        position_prevalidated: bool = False,
+    ) -> CursorActionResult:
+        """Move the pointer along one or two legal-looking next moves without clicking.
+
+        This is intentionally engine-free. It only uses the already-known board
+        position and legal move generation, and it never presses/releases a button.
+        The caller can pass position_prevalidated=True when the tracker just
+        received the same FEN from its existing confirmation watcher.
+        """
+        started = time.monotonic()
+        if not self.enabled:
+            return CursorActionResult(False, "preview", "controller-disabled")
+        if chess is None:
+            return CursorActionResult(False, "preview", "python-chess-required")
+        if not self._call_guard(focus_guard):
+            return CursorActionResult(False, "preview", "foreground-window-guard-failed")
+        if not position_prevalidated:
+            valid, reason = self._position_guard(fen, current_fen_reader)
+            if not valid:
+                return CursorActionResult(False, "preview", reason)
+
+        try:
+            board = chess.Board(str(fen or "").strip())
+            legal_moves = list(board.legal_moves)
+        except (ValueError, TypeError, IndexError):
+            return CursorActionResult(False, "preview", "invalid-fen")
+        if not legal_moves:
+            return CursorActionResult(False, "preview", "no-legal-next-moves")
+
+        try:
+            requested = max(1, min(2, int(max_moves)))
+        except (TypeError, ValueError):
+            requested = 2
+        target_count = random.SystemRandom().randint(1, min(requested, len(legal_moves)))
+
+        # Keep the preview plausible without Stockfish or any additional search:
+        # prefer captures/checks/castles when available, then sample different pieces.
+        forcing = []
+        quiet = []
+        for move in legal_moves:
+            try:
+                (forcing if (
+                    board.is_capture(move)
+                    or move.promotion is not None
+                    or board.is_castling(move)
+                    or board.gives_check(move)
+                ) else quiet).append(move)
+            except Exception:
+                quiet.append(move)
+        candidate_pool = forcing + quiet
+        random.SystemRandom().shuffle(candidate_pool)
+
+        selected = []
+        seen_sources = set()
+        for move in candidate_pool:
+            if move.from_square in seen_sources:
+                continue
+            selected.append(move)
+            seen_sources.add(move.from_square)
+            if len(selected) >= target_count:
+                break
+        if not selected:
+            return CursorActionResult(False, "preview", "no-distinct-legal-sources")
+
+        try:
+            current_point = self.backend.get_position()
+            total_steps = 0
+            # Preview legs are shorter than real move gestures; do not click or
+            # hold either button during this pointer-only movement.
+            leg_duration = max(0.001, min(0.006, self.motion.approach_duration_s))
+            route = []
+            for move in selected:
+                if not self._call_guard(focus_guard):
+                    return CursorActionResult(
+                        False, "preview", "foreground-window-guard-failed",
+                        tuple(route), time.monotonic() - started, total_steps,
+                    )
+                source = chess.square_name(move.from_square)
+                destination = chess.square_name(move.to_square)
+                for square in (source, destination):
+                    point = geometry.square_center(square)
+                    total_steps += self._follow_curve(current_point, point, leg_duration)
+                    current_point = point
+                route.append(move.uci())
+            return CursorActionResult(
+                True, "preview", "", tuple(route),
+                time.monotonic() - started, total_steps,
+            )
+        except Exception as exc:
+            try:
+                self.backend.release_all()
+            except Exception:
+                pass
+            return CursorActionResult(
+                False, "preview", f"input-failed: {exc}", tuple(),
                 time.monotonic() - started,
             )
 
