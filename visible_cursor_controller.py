@@ -454,7 +454,7 @@ class VisibleCursorController:
             piece = board.piece_at(move.from_square)
             if piece is None or piece.color != expected_turn:
                 return CursorActionResult(False, "move", "source-piece-not-owned-by-bot", (token,))
-            if move.promotion is not None and promotion_handler is None:
+            if move.promotion is not None and promotion_handler is None and not allow_premove:
                 return CursorActionResult(False, "move", "promotion-handler-required", (token,))
             source = geometry.square_center(chess.square_name(move.from_square))
             destination = geometry.square_center(chess.square_name(move.to_square))
