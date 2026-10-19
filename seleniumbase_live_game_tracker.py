@@ -2831,6 +2831,218 @@ def calculate_top_continuation_uci_moves(
     return continuation
 
 
+def build_move_coaching_plan(
+    engine,
+    previous_fen: str,
+    current_fen: str,
+    move_uci: str,
+    bot_color: str,
+    max_plies: int = 5,
+    search_seconds: float = 0.16,
+) -> dict[str, object]:
+    """Choose sparse coaching annotations; show a line only for forcing tactics.
+
+    Ordinary positions show at most two new threats/control arrows, or a native
+    square highlight for a just-captured target. A multi-ply principal-variation
+    queue is reserved for check, forced mate, likely recapture, or a forcing
+    capture/check sequence. Analysis does not submit moves.
+    """
+    empty = {"mode": "none", "arrows": [], "highlight_square": None, "reason": ""}
+    if chess is None or not previous_fen or not current_fen:
+        return empty
+    try:
+        before = chess.Board(previous_fen)
+        after = chess.Board(current_fen)
+        move = chess.Move.from_uci(str(move_uci or "").strip().lower())
+        side = normalize_chess_color(bot_color)
+        if side not in {"white", "black"}:
+            return empty
+        bot_turn = chess.WHITE if side == "white" else chess.BLACK
+        if before.turn != bot_turn or move not in before.legal_moves:
+            return empty
+        expected = before.copy(stack=True)
+        expected.push(move)
+        if not _same_chess_position(expected, after):
+            return empty
+        moved_piece = after.piece_at(move.to_square)
+        if moved_piece is None or moved_piece.color != bot_turn:
+            return empty
+        if after.is_game_over(claim_draw=True):
+            return empty
+    except (ValueError, TypeError, IndexError):
+        return empty
+
+    was_capture = before.is_capture(move)
+    opponent_color = not bot_turn
+    immediate_recapture = False
+    try:
+        immediate_recapture = any(
+            reply.to_square == move.to_square and after.is_capture(reply)
+            for reply in after.legal_moves
+        )
+    except Exception:
+        immediate_recapture = False
+
+    max_plies = max(1, min(5, int(max_plies)))
+    search_seconds = max(0.05, min(0.30, float(search_seconds)))
+    pv_uci: list[str] = []
+    has_forced_mate = False
+    forcing_event_count = 0
+    first_reply_recaptures = False
+    score_text = ""
+    if engine is not None:
+        try:
+            info_result = engine.analyse(
+                after.copy(stack=True),
+                chess.engine.Limit(time=search_seconds),
+                multipv=1,
+            )
+            info = info_result[0] if isinstance(info_result, list) and info_result else info_result
+            if isinstance(info, dict):
+                score = info.get("score")
+                has_forced_mate = bool(score is not None and score.is_mate())
+                if score is not None:
+                    try:
+                        score_text = str(score)
+                    except Exception:
+                        score_text = ""
+                pv = info.get("pv")
+                if isinstance(pv, (list, tuple)):
+                    probe = after.copy(stack=True)
+                    for candidate in pv:
+                        if len(pv_uci) >= max_plies or candidate not in probe.legal_moves:
+                            break
+                        is_capture = probe.is_capture(candidate)
+                        gives_check = probe.gives_check(candidate)
+                        if is_capture or gives_check:
+                            forcing_event_count += 1
+                        if not pv_uci:
+                            first_reply_recaptures = (
+                                was_capture
+                                and candidate.to_square == move.to_square
+                                and is_capture
+                            )
+                        pv_uci.append(candidate.uci())
+                        probe.push(candidate)
+                        if probe.is_game_over(claim_draw=True):
+                            break
+        except Exception:
+            # A missing/slow analysis must not suppress inexpensive board-based hints.
+            pv_uci = []
+            has_forced_mate = False
+            forcing_event_count = 0
+            first_reply_recaptures = False
+
+    forcing_check = after.is_check()
+    recapture_queue = immediate_recapture and first_reply_recaptures
+    tactical_queue = bool(
+        has_forced_mate
+        or forcing_check
+        or recapture_queue
+        or forcing_event_count >= 2
+    )
+    if tactical_queue and pv_uci:
+        reason = (
+            "forced mate" if has_forced_mate else
+            "check line" if forcing_check else
+            "recapture line" if recapture_queue else
+            "forcing tactical sequence"
+        )
+        return {
+            "mode": "tactical-queue",
+            "arrows": pv_uci[:5],
+            "highlight_square": None,
+            "reason": reason,
+            "score": score_text,
+        }
+
+    # Quiet/non-forcing moves must not display generic opponent best-move arrows.
+    # For a capture without a forcing recapture, mark the captured square once.
+    if was_capture:
+        return {
+            "mode": "capture-highlight",
+            "arrows": [],
+            "highlight_square": chess.square_name(move.to_square),
+            "reason": "captured piece square",
+            "score": score_text,
+        }
+
+    # Highlight only newly-created attacks on enemy pieces, not every legal move.
+    attacked_targets: list[tuple[int, int]] = []
+    try:
+        attacked_squares = after.attacks(move.to_square)
+        for target_square in attacked_squares:
+            target_piece = after.piece_at(target_square)
+            if target_piece is None or target_piece.color == bot_turn:
+                continue
+            if before.is_attacked_by(bot_turn, target_square):
+                continue
+            defended = after.is_attacked_by(opponent_color, target_square)
+            target_value = int(chess.piece_value(target_piece.piece_type))
+            # Prefer valuable and undefended targets. The arrow describes a new
+            # threat created by the moved piece; it is not an opponent move.
+            priority = target_value * 10 + (0 if defended else 7)
+            attacked_targets.append((priority, target_square))
+    except Exception:
+        attacked_targets = []
+    attacked_targets.sort(reverse=True)
+    if attacked_targets:
+        arrows = [
+            chess.square_name(move.to_square) + chess.square_name(square)
+            for _priority, square in attacked_targets[:2]
+        ]
+        return {
+            "mode": "new-threat",
+            "arrows": arrows,
+            "highlight_square": None,
+            "reason": "newly attacked enemy piece",
+            "score": score_text,
+        }
+
+    # No direct piece target: show at most one newly controlled meaningful square.
+    # This keeps a strategic move readable instead of spraying every attack square.
+    try:
+        enemy_king = after.king(opponent_color)
+        opponent_destinations = {candidate.to_square for candidate in after.legal_moves}
+        controlled: list[tuple[int, int]] = []
+        center_squares = {
+            chess.D4, chess.E4, chess.D5, chess.E5,
+            chess.C4, chess.F4, chess.C5, chess.F5,
+        }
+        for square in after.attacks(move.to_square):
+            if after.piece_at(square) is not None:
+                continue
+            if before.is_attacked_by(bot_turn, square):
+                continue
+            score = 0
+            if square in center_squares:
+                score += 4
+            if square in opponent_destinations:
+                score += 3
+            if enemy_king is not None:
+                distance = chess.square_distance(square, enemy_king)
+                if distance <= 2:
+                    score += 3 - distance
+            if score > 0:
+                controlled.append((score, square))
+        controlled.sort(reverse=True)
+        if controlled:
+            return {
+                "mode": "controlled-square",
+                "arrows": [
+                    chess.square_name(move.to_square)
+                    + chess.square_name(controlled[0][1])
+                ],
+                "highlight_square": None,
+                "reason": "newly controlled key square",
+                "score": score_text,
+            }
+    except Exception:
+        pass
+
+    return empty
+
+
 def _read_board_annotation_geometry(driver, board_selector: str) -> dict[str, object] | None:
     """Read visible board geometry and orientation for native right-click arrows."""
     script = r"""
@@ -3002,21 +3214,71 @@ def _toggle_native_annotation_arrow(cdp, uci: str, geometry: dict[str, object]) 
         return False
 
 
-def _replace_native_analysis_arrows(
+def _toggle_native_annotation_square(cdp, square: str, geometry: dict[str, object]) -> bool:
+    """Toggle a native single-square highlight with the board's right-click gesture."""
+    text = str(square or "").strip().lower()
+    if not re.fullmatch(r"[a-h][1-8]", text):
+        return False
+    try:
+        left = float(geometry["left"])
+        top = float(geometry["top"])
+        width = float(geometry["width"])
+        height = float(geometry["height"])
+        bottom_side = str(geometry["bottom_side"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if width <= 0 or height <= 0 or bottom_side not in {"white", "black"}:
+        return False
+    file_index = ord(text[0]) - ord("a")
+    rank_number = int(text[1])
+    board_file = file_index if bottom_side == "white" else 7 - file_index
+    board_row = 8 - rank_number if bottom_side == "white" else rank_number - 1
+    x = left + (board_file + 0.5) * width / 8.0
+    y = top + (board_row + 0.5) * height / 8.0
+    command_ids: set[int] = set()
+    try:
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": x, "y": y,
+            "button": "none", "buttons": 0, "pointerType": "mouse",
+        }))
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": x, "y": y,
+            "button": "right", "buttons": 2, "clickCount": 1,
+            "pointerType": "mouse",
+        }))
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": x, "y": y,
+            "button": "right", "buttons": 0, "clickCount": 1,
+            "pointerType": "mouse",
+        }))
+        cdp.wait_for(command_ids, timeout=1.0)
+        return True
+    except Exception:
+        try:
+            cdp.send("Input.dispatchMouseEvent", {
+                "type": "mouseReleased", "button": "right",
+                "buttons": 0, "pointerType": "mouse",
+            })
+        except Exception:
+            pass
+        return False
+
+
+def _replace_native_coaching_annotations(
     driver,
     board_selector: str,
     previous_arrows: list[str],
+    previous_highlight: str | None,
     next_arrows: list[str],
+    next_highlight: str | None,
     expected_fen: str,
-) -> list[str]:
-    """Replace generated two-ply analysis arrows without submitting chess moves."""
+) -> tuple[list[str], str | None]:
+    """Replace generated native annotations while suppressing analyzer queue events."""
     cdp = _direct_cdp_page_for_driver(driver)
     geometry = _read_board_annotation_geometry(driver, board_selector)
     if cdp is None or geometry is None:
-        return list(previous_arrows)
+        return list(previous_arrows), previous_highlight
 
-    # Generated right-click arrows must not be reinterpreted as a user's line
-    # selection by the optional companion analyzer.
     try:
         driver.execute_script(
             "if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = true;"
@@ -3026,10 +3288,15 @@ def _replace_native_analysis_arrows(
 
     remaining_previous: list[str] = []
     drawn: list[str] = []
+    kept_highlight: str | None = None
     try:
         for arrow in reversed(previous_arrows):
             if not _toggle_native_annotation_arrow(cdp, arrow, geometry):
                 remaining_previous.append(arrow)
+
+        highlight_needs_change = previous_highlight != next_highlight or bool(next_arrows)
+        if previous_highlight and highlight_needs_change:
+            _toggle_native_annotation_square(cdp, previous_highlight, geometry)
 
         current_fen = ""
         try:
@@ -3048,9 +3315,15 @@ def _replace_native_analysis_arrows(
                 position_matches = False
 
         if position_matches:
-            for arrow in next_arrows:
-                if _toggle_native_annotation_arrow(cdp, arrow, geometry):
-                    drawn.append(arrow)
+            if next_arrows:
+                for arrow in next_arrows[:5]:
+                    if _toggle_native_annotation_arrow(cdp, arrow, geometry):
+                        drawn.append(arrow)
+            elif next_highlight:
+                if previous_highlight == next_highlight and not highlight_needs_change:
+                    kept_highlight = previous_highlight
+                elif _toggle_native_annotation_square(cdp, next_highlight, geometry):
+                    kept_highlight = next_highlight
     finally:
         try:
             driver.execute_script(
@@ -3058,7 +3331,9 @@ def _replace_native_analysis_arrows(
             )
         except Exception:
             pass
-    return remaining_previous + drawn
+    return remaining_previous + drawn, kept_highlight
+
+
 
 
 def _perform_cursor_drag_once(
@@ -5000,6 +5275,7 @@ def main() -> int:
         new_file = not csv_path.exists() or csv_path.stat().st_size == 0
         previous_fen = ""
         auto_analysis_arrows: list[str] = []
+        auto_analysis_highlight_square: str | None = None
         last_dashboard_eval_fen = ""
         reconstructed_history: list[dict[str, str]] = []
         last_dashboard_history_signature = None
@@ -5392,6 +5668,7 @@ def main() -> int:
                         clock_source_reported = True
                     last_move: dict[str, str] | None = None
                     note = "DOM/API state change; identifiers omitted"
+                    position_before_fen = previous_fen
                     position_changed = bool(fen and fen != previous_fen)
 
                     if position_changed:
@@ -5425,49 +5702,83 @@ def main() -> int:
                                 f"[HISTORY SYNC] Reconciled {len(dom_history)} plies against current FEN.",
                                 flush=True,
                             )
-                    # Native two-ply analysis arrows are independent of SHOW MOVE hints.
-                    # After the bot moves, display the top predicted opponent reply and
-                    # the engine's follow-up. Do not draw every legal destination.
+                    # Sparse coaching annotations are independent of SHOW MOVE.
+                    # Quiet positions show only newly-created threats/control or a
+                    # captured-square highlight. Multi-ply arrows appear only for a
+                    # forcing tactical/recapture/mate line.
                     if position_changed and chess is not None and fen:
-                        next_analysis_arrows: list[str] = []
+                        coaching_plan: dict[str, object] = {
+                            "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
+                        }
                         if (
                             args.auto_play
                             and engine is not None
                             and active_bot_color in {"white", "black"}
                             and isinstance(last_move, dict)
                             and normalize_chess_color(last_move.get("side")) == active_bot_color
+                            and position_before_fen
                         ):
                             try:
-                                position_after_move = chess.Board(fen)
                                 analysis_seconds = max(
-                                    0.04,
-                                    min(0.12, float(getattr(args, "engine_time", 0.4)) * 0.15),
+                                    0.08,
+                                    min(0.25, float(getattr(args, "engine_time", 0.4)) * 0.25),
                                 )
-                                next_analysis_arrows = calculate_top_continuation_uci_moves(
+                                coaching_plan = build_move_coaching_plan(
                                     engine,
-                                    position_after_move,
-                                    max_plies=2,
+                                    position_before_fen,
+                                    fen,
+                                    str(last_move.get("uci") or ""),
+                                    active_bot_color,
+                                    max_plies=5,
                                     search_seconds=analysis_seconds,
                                 )
                             except (ValueError, IndexError, TypeError, RuntimeError):
-                                next_analysis_arrows = []
-                        previous_arrow_count = len(auto_analysis_arrows)
-                        auto_analysis_arrows = _replace_native_analysis_arrows(
-                            driver,
-                            args.board_selector,
-                            auto_analysis_arrows,
-                            next_analysis_arrows,
-                            fen,
+                                coaching_plan = {
+                                    "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
+                                }
+
+                        next_coaching_arrows = [
+                            str(value) for value in (coaching_plan.get("arrows") or [])
+                            if isinstance(value, str)
+                        ][:5]
+                        next_highlight_square = (
+                            str(coaching_plan.get("highlight_square") or "").strip().lower() or None
                         )
-                        if next_analysis_arrows and auto_analysis_arrows:
-                            readable_line = " → ".join(next_analysis_arrows)
+                        auto_analysis_arrows, auto_analysis_highlight_square = (
+                            _replace_native_coaching_annotations(
+                                driver,
+                                args.board_selector,
+                                auto_analysis_arrows,
+                                auto_analysis_highlight_square,
+                                next_coaching_arrows,
+                                next_highlight_square,
+                                fen,
+                            )
+                        )
+                        plan_mode = str(coaching_plan.get("mode") or "none")
+                        plan_reason = str(coaching_plan.get("reason") or "")
+                        if plan_mode == "tactical-queue" and auto_analysis_arrows:
                             print(
-                                f"[NEXT ANALYSIS] Native board arrows for top continuation "
-                                f"({len(next_analysis_arrows)} ply): {readable_line}.",
+                                f"[COACHING] Tactical queue ({len(auto_analysis_arrows)} ply): "
+                                f"{plan_reason} | {' -> '.join(auto_analysis_arrows)}.",
                                 flush=True,
                             )
-                        elif previous_arrow_count and not auto_analysis_arrows:
-                            print("[NEXT ANALYSIS] Previous generated arrows cleared.", flush=True)
+                        elif plan_mode == "new-threat" and auto_analysis_arrows:
+                            print(
+                                f"[COACHING] New threat arrows: {'; '.join(auto_analysis_arrows)}.",
+                                flush=True,
+                            )
+                        elif plan_mode == "controlled-square" and auto_analysis_arrows:
+                            print(
+                                f"[COACHING] One key controlled square: {auto_analysis_arrows[0]}.",
+                                flush=True,
+                            )
+                        elif plan_mode == "capture-highlight" and auto_analysis_highlight_square:
+                            print(
+                                f"[COACHING] Captured target square highlighted: "
+                                f"{auto_analysis_highlight_square}.",
+                                flush=True,
+                            )
 
                     # Send the complete validated history through one idempotent
                     # dashboard path. This is independent of BOT state and catches
