@@ -3150,6 +3150,170 @@ def build_move_coaching_plan(
         }
     return empty
 
+
+def build_current_position_danger_plan(
+    current_fen: str,
+    bot_color: str,
+    engine=None,
+    search_seconds: float = 0.08,
+) -> dict[str, object]:
+    """Re-analyse current board after the opponent replies and report current risks.
+
+    This deliberately creates no continuation queue. It recalculates attacks and
+    loose material from the latest FEN, so arrows describe the new position rather
+    than replaying a previous move's coaching plan.
+    """
+    empty = {
+        "mode": "none",
+        "arrows": [],
+        "danger_arrows": [],
+        "tactical_queue": [],
+        "highlight_square": None,
+        "reason": "",
+    }
+    if chess is None or not current_fen:
+        return empty
+    try:
+        board = chess.Board(current_fen)
+        side = normalize_chess_color(bot_color)
+        if side not in {"white", "black"}:
+            return empty
+        bot_turn = chess.WHITE if side == "white" else chess.BLACK
+        opponent_color = not bot_turn
+        if board.is_game_over(claim_draw=True) or board.turn != bot_turn:
+            return empty
+    except (ValueError, TypeError, IndexError):
+        return empty
+
+    values = {
+        chess.PAWN: 1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK: 5,
+        chess.QUEEN: 9,
+        chess.KING: 100,
+    }
+
+    # Run a fresh, bounded evaluation on this exact post-reply board state.
+    engine_pv: list[chess.Move] = []
+    score_text = ""
+    if engine is not None:
+        try:
+            result = engine.analyse(
+                board.copy(stack=True),
+                chess.engine.Limit(time=max(0.03, min(0.15, float(search_seconds)))),
+                multipv=1,
+            )
+            info = result[0] if isinstance(result, list) and result else result
+            if isinstance(info, dict):
+                score = info.get("score")
+                if score is not None:
+                    try:
+                        score_text = str(score.pov(bot_turn))
+                    except Exception:
+                        score_text = str(score)
+                pv = info.get("pv")
+                if isinstance(pv, (list, tuple)):
+                    probe = board.copy(stack=True)
+                    for candidate in pv[:2]:
+                        if candidate not in probe.legal_moves:
+                            break
+                        engine_pv.append(candidate)
+                        probe.push(candidate)
+        except Exception:
+            engine_pv = []
+
+    # Opponent targets are the priority: valuable pieces attacked by our pieces,
+    # especially those without an adequate defence, are shown first.
+    enemy_targets: list[tuple[int, str, str]] = []
+    for target_square, target_piece in board.piece_map().items():
+        if target_piece.color != opponent_color:
+            continue
+        if target_piece.piece_type not in {chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN}:
+            continue
+        attackers = list(board.attackers(bot_turn, target_square))
+        if not attackers:
+            continue
+        target_value = values.get(target_piece.piece_type, 0)
+        defenders = list(board.attackers(opponent_color, target_square))
+        attacker_squares = sorted(
+            attackers, key=lambda sq: values.get(board.piece_at(sq).piece_type, 0)
+        )
+        attacker_square = attacker_squares[0]
+        attacker_piece = board.piece_at(attacker_square)
+        if attacker_piece is None:
+            continue
+        attacker_value = values.get(attacker_piece.piece_type, 0)
+        if target_value < attacker_value and defenders:
+            continue
+        priority = target_value * 20 - attacker_value * 2 + (15 if not defenders else 0)
+        arrow = chess.square_name(attacker_square) + chess.square_name(target_square)
+        label = (
+            f"opponent {chess.piece_name(target_piece.piece_type)} "
+            f"on {chess.square_name(target_square)} is threatened"
+        )
+        enemy_targets.append((priority, arrow, label))
+    enemy_targets.sort(reverse=True)
+
+    # Show a single high-confidence warning if our own valuable piece is loose
+    # or attacked by a cheaper opponent piece; don't annotate every defended pawn.
+    own_risks: list[tuple[int, str, str]] = []
+    for target_square, target_piece in board.piece_map().items():
+        if target_piece.color != bot_turn:
+            continue
+        if target_piece.piece_type not in {chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN}:
+            continue
+        attackers = list(board.attackers(opponent_color, target_square))
+        if not attackers:
+            continue
+        victim_value = values.get(target_piece.piece_type, 0)
+        defenders = list(board.attackers(bot_turn, target_square))
+        attacker_squares = sorted(
+            attackers, key=lambda sq: values.get(board.piece_at(sq).piece_type, 0)
+        )
+        attacker_square = attacker_squares[0]
+        attacker_piece = board.piece_at(attacker_square)
+        if attacker_piece is None:
+            continue
+        attacker_value = values.get(attacker_piece.piece_type, 0)
+        if victim_value <= attacker_value and defenders and len(defenders) >= len(attackers):
+            continue
+        priority = victim_value * 10 - attacker_value * 2 + (10 if not defenders else 0)
+        arrow = chess.square_name(attacker_square) + chess.square_name(target_square)
+        label = (
+            f"our {chess.piece_name(target_piece.piece_type)} "
+            f"on {chess.square_name(target_square)} is at risk"
+        )
+        own_risks.append((priority, arrow, label))
+    own_risks.sort(reverse=True)
+
+    danger_arrows: list[str] = []
+    reasons: list[str] = []
+    for _, arrow, label in enemy_targets:
+        if arrow not in danger_arrows:
+            danger_arrows.append(arrow)
+            reasons.append(label)
+        if len(danger_arrows) >= 3:
+            break
+    if own_risks:
+        _, own_arrow, own_label = own_risks[0]
+        if own_arrow not in danger_arrows:
+            danger_arrows.append(own_arrow)
+            reasons.append(own_label)
+
+    if not danger_arrows:
+        return {**empty, "score": score_text}
+    return {
+        "mode": "threat-arrows",
+        "arrows": danger_arrows[:4],
+        "danger_arrows": danger_arrows[:4],
+        "tactical_queue": [],
+        "highlight_square": None,
+        "reason": "; ".join(reasons),
+        "score": score_text,
+    }
+
+
 def _read_board_annotation_geometry(driver, board_selector: str) -> dict[str, object] | None:
     """Read visible board geometry and orientation for native right-click arrows."""
     script = r"""
@@ -5818,21 +5982,29 @@ def main() -> int:
                                 f"[HISTORY SYNC] Reconciled {len(dom_history)} plies against current FEN.",
                                 flush=True,
                             )
-                    # Sparse coaching annotations are independent of SHOW MOVE.
-                    # Quiet positions show only newly-created threats/control or a
-                    # captured-square highlight. Multi-ply arrows appear only for a
-                    # forcing tactical/recapture/mate line.
+                    # Coaching is independent of SHOW MOVE. Bot moves can produce a
+                    # bounded tactical queue; after an opponent reply, recalculate
+                    # danger arrows from the new current FEN rather than replaying old ones.
                     if position_changed and chess is not None and fen:
                         coaching_plan: dict[str, object] = {
                             "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
                         }
+                        last_move_side = (
+                            normalize_chess_color(last_move.get("side"))
+                            if isinstance(last_move, dict) else None
+                        )
                         coaching_from_bot_move = bool(
                             args.auto_play
                             and engine is not None
                             and active_bot_color in {"white", "black"}
-                            and isinstance(last_move, dict)
-                            and normalize_chess_color(last_move.get("side")) == active_bot_color
+                            and last_move_side == active_bot_color
                             and position_before_fen
+                        )
+                        coaching_after_opponent_move = bool(
+                            args.auto_play
+                            and engine is not None
+                            and active_bot_color in {"white", "black"}
+                            and last_move_side == ("black" if active_bot_color == "white" else "white")
                         )
                         if coaching_from_bot_move:
                             try:
@@ -5853,14 +6025,29 @@ def main() -> int:
                                 coaching_plan = {
                                     "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
                                 }
+                        elif coaching_after_opponent_move:
+                            try:
+                                coaching_plan = build_current_position_danger_plan(
+                                    fen,
+                                    active_bot_color,
+                                    engine=engine,
+                                    search_seconds=max(
+                                        0.03,
+                                        min(0.12, float(getattr(args, "engine_time", 0.4)) * 0.15),
+                                    ),
+                                )
+                            except (ValueError, IndexError, TypeError, RuntimeError):
+                                coaching_plan = {
+                                    "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
+                                }
 
                         next_coaching_arrows = [
                             str(value) for value in (coaching_plan.get("arrows") or [])
                             if isinstance(value, str)
                         ][:5]
-                        if coaching_from_bot_move:
-                            # Keep identical arrows hidden while that same threat is
-                            # continuously present, even across the opponent's reply.
+                        if coaching_from_bot_move or coaching_after_opponent_move:
+                            # Every new board state gets a fresh plan, but an exact
+                            # arrow route is displayed only once per game.
                             next_coaching_arrows = filter_new_coaching_arrows(
                                 next_coaching_arrows,
                                 shown_coaching_arrows,
@@ -5879,7 +6066,7 @@ def main() -> int:
                                 fen,
                             )
                         )
-                        if coaching_from_bot_move:
+                        if coaching_from_bot_move or coaching_after_opponent_move:
                             shown_coaching_arrows.update(
                                 arrow for arrow in next_coaching_arrows
                                 if arrow in auto_analysis_arrows
