@@ -192,23 +192,57 @@ class MoveCoachingPlanTests(unittest.TestCase):
         self.assertIsNone(plan["highlight_square"])
         self.assertEqual(plan["arrows"], [])
 
-    def test_checking_move_uses_a_forcing_queue_capped_at_five_plies(self):
+    def test_routine_check_does_not_automatically_start_tactical_queue(self):
         before = chess.Board("4k3/8/8/8/8/8/4R3/4K3 w - - 0 1")
         move = chess.Move.from_uci("e2e7")
         self.assertIn(move, before.legal_moves)
         after = before.copy(stack=True)
         after.push(move)
         self.assertTrue(after.is_check())
-        engine = self.FakeEngine(["e8f8", "e7e2", "f8g8", "e2e8", "g8h7"])
+        engine = self.FakeEngine(["e8f8", "e7e2", "f8g8"])
+
+        plan = build_move_coaching_plan(
+            engine, before.fen(), after.fen(), "e2e7", "white",
+            max_plies=5, search_seconds=0.08,
+        )
+        self.assertNotEqual(plan["mode"], "tactical-queue")
+        self.assertEqual(plan["tactical_queue"], [])
+
+    def test_forced_mate_queue_is_capped_at_three_plies(self):
+        before = chess.Board("4k3/8/8/8/8/8/4R3/4K3 w - - 0 1")
+        move = chess.Move.from_uci("e2e7")
+        self.assertIn(move, before.legal_moves)
+        after = before.copy(stack=True)
+        after.push(move)
+        self.assertTrue(after.is_check())
+        mate_score = chess.engine.PovScore(chess.engine.Mate(3), chess.WHITE)
+        engine = self.FakeEngine(
+            ["e8f8", "e7e2", "f8g8", "e2e8", "g8h7"],
+            score=mate_score,
+        )
 
         plan = build_move_coaching_plan(
             engine, before.fen(), after.fen(), "e2e7", "white",
             max_plies=5, search_seconds=0.08,
         )
         self.assertEqual(plan["mode"], "tactical-queue")
+        self.assertLessEqual(len(plan["tactical_queue"]), 3)
         self.assertLessEqual(len(plan["arrows"]), 5)
 
-    def test_normal_move_highlights_only_one_newly_threatened_enemy_piece(self):
+    def test_valuable_capture_alone_does_not_start_tactical_queue(self):
+        before = chess.Board("k7/8/8/3Rn3/8/8/8/4K3 w - - 0 1")
+        move = chess.Move.from_uci("d5e5")
+        self.assertIn(move, before.legal_moves)
+        after = before.copy(stack=True)
+        after.push(move)
+        self.assertFalse(after.is_check())
+        plan = build_move_coaching_plan(
+            self.FakeEngine([]), before.fen(), after.fen(), "d5e5", "white"
+        )
+        self.assertNotEqual(plan["mode"], "tactical-queue")
+        self.assertEqual(plan["tactical_queue"], [])
+
+    def test_normal_move_draws_arrow_to_newly_threatened_enemy_piece(self):
         before = chess.Board("3qk3/8/8/8/R7/8/8/4K3 w - - 0 1")
         move = chess.Move.from_uci("a4d4")
         self.assertIn(move, before.legal_moves)
@@ -219,9 +253,23 @@ class MoveCoachingPlanTests(unittest.TestCase):
         plan = build_move_coaching_plan(
             engine, before.fen(), after.fen(), "a4d4", "white"
         )
-        self.assertEqual(plan["mode"], "threat-highlight")
-        self.assertEqual(plan["highlight_square"], "d8")
-        self.assertEqual(plan["arrows"], [])
+        self.assertIn(plan["mode"], {"threat-arrows", "tactical-queue"})
+        self.assertIn("d4d8", plan["danger_arrows"])
+        self.assertLessEqual(len(plan["danger_arrows"]), 2)
+
+    def test_valuable_bot_piece_that_can_be_captured_gets_a_danger_arrow(self):
+        before = chess.Board("k3r3/8/8/8/8/8/P3Q3/7K w - - 0 1")
+        move = chess.Move.from_uci("a2a3")
+        self.assertIn(move, before.legal_moves)
+        after = before.copy(stack=True)
+        after.push(move)
+
+        plan = build_move_coaching_plan(
+            self.FakeEngine([]), before.fen(), after.fen(), "a2a3", "white"
+        )
+        self.assertEqual(plan["mode"], "threat-arrows")
+        self.assertIn("e8e2", plan["danger_arrows"])
+        self.assertIn("our queen", plan["reason"])
 
     def test_normal_move_that_threatens_nothing_shows_no_arrows(self):
         before = chess.Board()
