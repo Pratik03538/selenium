@@ -1824,10 +1824,22 @@ def main() -> int:
             # Autoplay mode uses only the board's native arrows; do not leave a
             # translucent analyzer SVG/status layer on the board.
             driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
-        print("[READY] No suggestions are shown until you draw a native right-click arrow.", flush=True)
-        print("[READY] Your drawn arrow selects the starting move; the next two suggestions then appear.", flush=True)
-        print("[READY] Drawing the first hinted move continues that line; clear ALL your arrows to return to the real board position.", flush=True)
-        print("[READY] No move cap by default. Clear all your arrows to return to the real position and start a fresh queue.", flush=True)
+        if mode_control_file is not None:
+            print(
+                "[READY] Autoplay mode: right-click a piece without dragging to draw arrows "
+                "to the squares it controls; repeat the same click to clear the map.",
+                flush=True,
+            )
+            print(
+                "[READY] SHOW MOVE mode keeps manual right-drag arrows. "
+                "Attack-map arrows clear on the next board position.",
+                flush=True,
+            )
+        else:
+            print("[READY] No suggestions are shown until you draw a native right-click arrow.", flush=True)
+            print("[READY] Your drawn arrow selects the starting move; the next two suggestions then appear.", flush=True)
+            print("[READY] Drawing the first hinted move continues that line; clear ALL your arrows to return to the real board position.", flush=True)
+            print("[READY] No move cap by default. Clear all your arrows to return to the real position and start a fresh queue.", flush=True)
         print("[READY] Press Ctrl+C in this terminal to stop.", flush=True)
 
         try:
