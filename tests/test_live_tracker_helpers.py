@@ -173,9 +173,9 @@ class MoveCoachingPlanTests(unittest.TestCase):
             engine, before.fen(), after.fen(), "e2e4", "white",
             max_plies=5, search_seconds=0.08,
         )
-        self.assertNotEqual(plan["mode"], "tactical-queue")
-        self.assertLessEqual(len(plan["arrows"]), 2)
-        self.assertTrue(all(uci.startswith("e4") for uci in plan["arrows"]))
+        self.assertEqual(plan["mode"], "none")
+        self.assertEqual(plan["arrows"], [])
+        self.assertIsNone(plan["highlight_square"])
 
     def test_capture_without_recapture_uses_single_target_square_highlight(self):
         before = chess.Board("r3k3/8/4p3/3B4/8/8/8/4K3 w - - 0 1")
@@ -188,8 +188,8 @@ class MoveCoachingPlanTests(unittest.TestCase):
         plan = build_move_coaching_plan(
             engine, before.fen(), after.fen(), "d5e6", "white"
         )
-        self.assertEqual(plan["mode"], "capture-highlight")
-        self.assertEqual(plan["highlight_square"], "e6")
+        self.assertEqual(plan["mode"], "none")
+        self.assertIsNone(plan["highlight_square"])
         self.assertEqual(plan["arrows"], [])
 
     def test_checking_move_uses_a_forcing_queue_capped_at_five_plies(self):
@@ -207,6 +207,35 @@ class MoveCoachingPlanTests(unittest.TestCase):
         )
         self.assertEqual(plan["mode"], "tactical-queue")
         self.assertLessEqual(len(plan["arrows"]), 5)
+
+    def test_normal_move_highlights_only_one_newly_threatened_enemy_piece(self):
+        before = chess.Board("3qk3/8/8/8/R7/8/8/4K3 w - - 0 1")
+        move = chess.Move.from_uci("a4d4")
+        self.assertIn(move, before.legal_moves)
+        after = before.copy(stack=True)
+        after.push(move)
+        engine = self.FakeEngine(["e8f8", "d8c7", "d4d8"])
+
+        plan = build_move_coaching_plan(
+            engine, before.fen(), after.fen(), "a4d4", "white"
+        )
+        self.assertEqual(plan["mode"], "threat-highlight")
+        self.assertEqual(plan["highlight_square"], "d8")
+        self.assertEqual(plan["arrows"], [])
+
+    def test_normal_move_that_threatens_nothing_shows_no_arrows(self):
+        before = chess.Board()
+        move = chess.Move.from_uci("e2e4")
+        after = before.copy(stack=True)
+        after.push(move)
+        engine = self.FakeEngine(["e7e5", "g1f3", "b8c6"])
+
+        plan = build_move_coaching_plan(
+            engine, before.fen(), after.fen(), "e2e4", "white"
+        )
+        self.assertEqual(plan["mode"], "none")
+        self.assertEqual(plan["arrows"], [])
+        self.assertIsNone(plan["highlight_square"])
 
     def test_invalid_position_transition_shows_nothing(self):
         before = chess.Board()
