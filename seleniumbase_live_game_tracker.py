@@ -3674,16 +3674,25 @@ def _replace_native_coaching_annotations(
     next_arrows: list[str],
     next_highlight: str | None,
     expected_fen: str,
+    *,
+    use_visible_cursor: bool = False,
+    game_id: int | str = 1,
+    auto_draw_enabled: bool = True,
+    bot_color: str | None = None,
+    white_clock_seconds: float | None = None,
+    black_clock_seconds: float | None = None,
+    low_clock_trigger_seconds: float = 10.0,
+    opening_fast_mode: bool = False,
+    fast_mode: bool = False,
 ) -> tuple[list[str], str | None]:
-    """Draw only new annotations for the current position.
+    """Draw only fresh annotations; optionally use actual desktop right-click gestures.
 
-    The board automatically clears native arrows/highlights when a move is made.
-    Never toggle previous annotations here: that gesture would create the old
-    arrow again rather than clear it.
+    The board clears native annotations on a move. Never toggle old routes here,
+    because a right-drag would recreate them instead of clearing them.
     """
-    cdp = _direct_cdp_page_for_driver(driver)
+    cdp = None if use_visible_cursor else _direct_cdp_page_for_driver(driver)
     geometry = _read_board_annotation_geometry(driver, board_selector)
-    if cdp is None or geometry is None:
+    if geometry is None or (not use_visible_cursor and cdp is None):
         return [], None
 
     try:
@@ -3713,7 +3722,69 @@ def _replace_native_coaching_annotations(
             except (ValueError, IndexError):
                 position_matches = False
 
-        if position_matches:
+        if position_matches and use_visible_cursor:
+            controller = _get_visible_cursor_controller(low_clock_mode=False)
+            current_side = normalize_chess_color(bot_color)
+            bot_clock = (
+                white_clock_seconds if current_side == "white"
+                else black_clock_seconds if current_side == "black"
+                else None
+            )
+            try:
+                screen_geometry = (
+                    read_selenium_board_geometry(
+                        driver, board_selector, str(geometry["bottom_side"])
+                    )
+                    if read_selenium_board_geometry is not None
+                    else None
+                )
+                window_title = str(driver.title or "").strip()
+            except Exception:
+                screen_geometry = None
+                window_title = ""
+            if controller is not None and screen_geometry is not None and window_title:
+                current_fen_reader = lambda: str(driver.execute_script(
+                    "return window.__liveGameApiReader?.current?.()?.fen || '';"
+                ) or "").strip()
+                focus_guard = lambda: controller.backend.foreground_title_contains(window_title)
+
+                for arrow in next_arrows[:5]:
+                    route = str(arrow or "").strip().lower()
+                    if not re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", route):
+                        continue
+                    result = controller.draw_arrow(
+                        route[:2],
+                        route[2:4],
+                        expected_fen=expected_fen,
+                        current_fen_reader=current_fen_reader,
+                        geometry=screen_geometry,
+                        game_id=game_id,
+                        focus_guard=focus_guard,
+                        auto_draw_enabled=bool(auto_draw_enabled),
+                        opening_fast_mode=bool(opening_fast_mode),
+                        fast_mode=bool(fast_mode),
+                        bot_clock_seconds=bot_clock,
+                        low_clock_trigger_seconds=low_clock_trigger_seconds,
+                    )
+                    if result.ok:
+                        drawn.append(route)
+
+                if next_highlight:
+                    highlight_result = controller.draw_highlight(
+                        next_highlight,
+                        expected_fen=expected_fen,
+                        current_fen_reader=current_fen_reader,
+                        geometry=screen_geometry,
+                        focus_guard=focus_guard,
+                        auto_draw_enabled=bool(auto_draw_enabled),
+                        opening_fast_mode=bool(opening_fast_mode),
+                        fast_mode=bool(fast_mode),
+                        bot_clock_seconds=bot_clock,
+                        low_clock_trigger_seconds=low_clock_trigger_seconds,
+                    )
+                    if highlight_result.ok:
+                        kept_highlight = next_highlight
+        elif position_matches:
             for arrow in next_arrows[:5]:
                 if _toggle_native_annotation_arrow(cdp, arrow, geometry):
                     drawn.append(arrow)
