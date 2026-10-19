@@ -2831,23 +2831,34 @@ def calculate_top_continuation_uci_moves(
     return continuation
 
 
+def chess_value_for_minor_piece() -> int:
+    """Return a minimal material threshold for a meaningful danger arrow."""
+    return 3
+
+
 def build_move_coaching_plan(
     engine,
     previous_fen: str,
     current_fen: str,
     move_uci: str,
     bot_color: str,
-    max_plies: int = 5,
+    max_plies: int = 3,
     search_seconds: float = 0.16,
 ) -> dict[str, object]:
-    """Keep ordinary-position coaching minimal and reserve arrows for tactics.
+    """Build sparse, GM-style danger arrows and only genuinely forcing lines.
 
-    Normal moves never display an opponent PV. If the moved piece newly attacks
-    an opponent piece, highlight only the single most important target square.
-    A short multi-move arrow queue is used only for a forcing check, forced mate,
-    promotion, meaningful piece capture, or a likely recapture sequence.
+    The PV queue is capped at three plies and is never triggered merely because
+    a move captured a piece or gave a routine check. Danger arrows are limited
+    to the best newly-created target and, when warranted, one hanging bot piece.
     """
-    empty = {"mode": "none", "arrows": [], "highlight_square": None, "reason": ""}
+    empty = {
+        "mode": "none",
+        "arrows": [],
+        "danger_arrows": [],
+        "tactical_queue": [],
+        "highlight_square": None,
+        "reason": "",
+    }
     if chess is None or not previous_fen or not current_fen:
         return empty
     try:
@@ -2872,8 +2883,8 @@ def build_move_coaching_plan(
     except (ValueError, TypeError, IndexError):
         return empty
 
-    was_capture = before.is_capture(move)
     opponent_color = not bot_turn
+    was_capture = before.is_capture(move)
     captured_piece = before.piece_at(move.to_square)
     if before.is_en_passant(move):
         captured_square = (
@@ -2882,21 +2893,24 @@ def build_move_coaching_plan(
         )
         captured_piece = before.piece_at(captured_square)
 
-    immediate_recapture = False
-    try:
-        immediate_recapture = any(
-            reply.to_square == move.to_square and after.is_capture(reply)
-            for reply in after.legal_moves
-        )
-    except Exception:
-        immediate_recapture = False
+    piece_values = {
+        chess.PAWN: 1,
+        chess.KNIGHT: 3,
+        chess.BISHOP: 3,
+        chess.ROOK: 5,
+        chess.QUEEN: 9,
+        chess.KING: 100,
+    }
 
-    max_plies = max(1, min(5, int(max_plies)))
+    # A PV is analysis only. It is capped at three plies and used for a queue
+    # only after a forcing-move gate below approves the position.
+    max_plies = max(1, min(3, int(max_plies)))
     search_seconds = max(0.05, min(0.30, float(search_seconds)))
     pv_uci: list[str] = []
     has_forced_mate = False
     first_reply_recaptures = False
     score_text = ""
+    bot_score_cp: int | None = None
     if engine is not None:
         try:
             info_result = engine.analyse(
@@ -2907,12 +2921,20 @@ def build_move_coaching_plan(
             info = info_result[0] if isinstance(info_result, list) and info_result else info_result
             if isinstance(info, dict):
                 score = info.get("score")
-                has_forced_mate = bool(score is not None and score.is_mate())
                 if score is not None:
                     try:
-                        score_text = str(score)
+                        bot_score = score.pov(bot_turn) if callable(getattr(score, "pov", None)) else score
+                        score_text = str(bot_score)
+                        if callable(getattr(bot_score, "is_mate", None)) and bot_score.is_mate():
+                            mate_distance = bot_score.mate()
+                            has_forced_mate = mate_distance is not None and mate_distance > 0
+                        if callable(getattr(bot_score, "score", None)):
+                            bot_score_cp = bot_score.score(mate_score=100000)
                     except Exception:
                         score_text = ""
+                        bot_score_cp = None
+                        has_forced_mate = False
+
                 pv = info.get("pv")
                 if isinstance(pv, (list, tuple)):
                     probe = after.copy(stack=True)
@@ -2933,82 +2955,178 @@ def build_move_coaching_plan(
             pv_uci = []
             has_forced_mate = False
             first_reply_recaptures = False
+            score_text = ""
+            bot_score_cp = None
 
-    forcing_check = after.is_check()
-    recapture_queue = was_capture and immediate_recapture and first_reply_recaptures
-    valuable_capture = bool(
+    # A routine check is not enough. Only queue checks with very few legal
+    # replies; forced mate, promotion and a meaningful, confirmed recapture are
+    # separate high-confidence tactical triggers.
+    forcing_check = False
+    if after.is_check():
+        try:
+            forcing_check = sum(1 for _ in after.legal_moves) <= 3
+        except Exception:
+            forcing_check = False
+
+    immediate_recapture = False
+    try:
+        immediate_recapture = any(
+            reply.to_square == move.to_square and after.is_capture(reply)
+            for reply in after.legal_moves
+        )
+    except Exception:
+        immediate_recapture = False
+    recapture_queue = bool(
         was_capture
+        and immediate_recapture
+        and first_reply_recaptures
         and captured_piece is not None
         and captured_piece.piece_type in {
             chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN
         }
     )
-    tactical_move = bool(
-        has_forced_mate
-        or forcing_check
-        or recapture_queue
-        or move.promotion is not None
-        or valuable_capture
+    promotion_queue = move.promotion is not None
+    queue_triggered = bool(
+        has_forced_mate or forcing_check or recapture_queue or promotion_queue
     )
-    if tactical_move and pv_uci:
-        reason = (
+    tactical_queue = pv_uci[:max_plies] if queue_triggered else []
+
+    # Find the strongest NEW attack on an opponent's non-pawn piece. Compare
+    # attacker sets (not just occupied squares) so discovered attacks count too.
+    enemy_threats: list[tuple[int, str, str]] = []
+    try:
+        for target_square, target_piece in after.piece_map().items():
+            if target_piece.color != opponent_color:
+                continue
+            if target_piece.piece_type in {chess.PAWN, chess.KING}:
+                continue
+            old_target = before.piece_at(target_square)
+            if old_target is None or old_target.color != opponent_color:
+                continue
+            old_attackers = set(before.attackers(bot_turn, target_square))
+            new_attackers = set(after.attackers(bot_turn, target_square)) - old_attackers
+            if not new_attackers:
+                continue
+
+            attacker_squares = [
+                square for square in new_attackers
+                if after.piece_at(square) is not None
+                and after.piece_at(square).color == bot_turn
+            ]
+            if not attacker_squares:
+                continue
+            attacker_square = min(
+                attacker_squares,
+                key=lambda square: piece_values.get(after.piece_at(square).piece_type, 0),
+            )
+            attacker_piece = after.piece_at(attacker_square)
+            if attacker_piece is None:
+                continue
+            attacker_value = piece_values.get(attacker_piece.piece_type, 0)
+            target_value = piece_values.get(target_piece.piece_type, 0)
+            defenders = after.attackers(opponent_color, target_square)
+
+            # Avoid noisy arrows for attacks that simply hang a more valuable
+            # attacker into an adequately defended lower-value target.
+            if target_value <= attacker_value and defenders:
+                continue
+            priority = target_value * 10 - attacker_value * 2 + (5 if not defenders else 0)
+            arrow = chess.square_name(attacker_square) + chess.square_name(target_square)
+            label = f"opponent {chess.piece_name(target_piece.piece_type)} at {chess.square_name(target_square)}"
+            enemy_threats.append((priority, arrow, label))
+    except Exception:
+        enemy_threats = []
+    enemy_threats.sort(reverse=True)
+
+    # Detect one meaningful capture threat against our own material. Prefer the
+    # engine's best reply if it captures; otherwise keep only clear material
+    # risks, rather than drawing arrows at every attacked pawn.
+    own_piece_risks: list[tuple[int, str, str]] = []
+    try:
+        best_reply_uci = pv_uci[0] if pv_uci else ""
+        for reply in after.legal_moves:
+            if not after.is_capture(reply):
+                continue
+            victim = after.piece_at(reply.to_square)
+            attacker = after.piece_at(reply.from_square)
+            if (
+                victim is None
+                or attacker is None
+                or victim.color != bot_turn
+                or victim.piece_type in {chess.PAWN, chess.KING}
+            ):
+                continue
+            victim_value = piece_values.get(victim.piece_type, 0)
+            attacker_value = piece_values.get(attacker.piece_type, 0)
+            defenders = after.attackers(bot_turn, reply.to_square)
+            is_engine_choice = reply.uci() == best_reply_uci
+            clear_material_risk = (
+                victim_value > attacker_value
+                or (not defenders and victim_value >= chess_value_for_minor_piece())
+            )
+            if not is_engine_choice and not clear_material_risk:
+                continue
+
+            priority = victim_value * 10 - attacker_value * 2
+            if not defenders:
+                priority += 8
+            if is_engine_choice:
+                priority += 30
+            arrow = reply.uci()
+            label = f"our {chess.piece_name(victim.piece_type)} at {chess.square_name(reply.to_square)} can be captured"
+            own_piece_risks.append((priority, arrow, label))
+    except Exception:
+        own_piece_risks = []
+    own_piece_risks.sort(reverse=True)
+
+    danger_arrows: list[str] = []
+    reasons: list[str] = []
+    if enemy_threats:
+        _, arrow, label = enemy_threats[0]
+        danger_arrows.append(arrow)
+        reasons.append(f"{label} is under threat")
+    if own_piece_risks:
+        _, arrow, label = own_piece_risks[0]
+        if arrow not in danger_arrows:
+            danger_arrows.append(arrow)
+            reasons.append(label)
+
+    # Even in a tactical position, keep the visual queue bounded: at most two
+    # danger arrows plus a three-ply line (five board arrows total).
+    combined_arrows: list[str] = []
+    for arrow in danger_arrows + tactical_queue:
+        if arrow not in combined_arrows and len(combined_arrows) < 5:
+            combined_arrows.append(arrow)
+
+    if tactical_queue:
+        queue_reason = (
             "forced mate" if has_forced_mate else
-            "checking move" if forcing_check else
+            "forcing check" if forcing_check else
             "recapture sequence" if recapture_queue else
-            "promotion" if move.promotion is not None else
-            "valuable capture"
+            "promotion"
         )
+        reason = "; ".join([queue_reason] + reasons)
         return {
             "mode": "tactical-queue",
-            "arrows": pv_uci[:5],
+            "arrows": combined_arrows,
+            "danger_arrows": danger_arrows,
+            "tactical_queue": tactical_queue,
             "highlight_square": None,
             "reason": reason,
             "score": score_text,
         }
 
-    # For ordinary moves, never draw opponent reply arrows or generic move queues.
-    # Highlight just one opponent piece freshly attacked by the piece that moved.
-    attacked_targets: list[tuple[int, int]] = []
-    try:
-        for target_square in after.attacks(move.to_square):
-            target_piece = after.piece_at(target_square)
-            if target_piece is None or target_piece.color == bot_turn:
-                continue
-            if before.is_attacked_by(bot_turn, target_square):
-                continue
-            target_value = {
-                chess.PAWN: 1,
-                chess.KNIGHT: 3,
-                chess.BISHOP: 3,
-                chess.ROOK: 5,
-                chess.QUEEN: 9,
-                chess.KING: 100,
-            }.get(target_piece.piece_type, 0)
-            opponent_defends = after.is_attacked_by(opponent_color, target_square)
-            priority = target_value * 10 + (0 if opponent_defends else 7)
-            attacked_targets.append((priority, target_square))
-    except Exception:
-        attacked_targets = []
-    attacked_targets.sort(reverse=True)
-
-    if attacked_targets:
-        target_square = attacked_targets[0][1]
-        target_piece = after.piece_at(target_square)
-        target_name = (
-            chess.piece_name(target_piece.piece_type)
-            if target_piece is not None else "piece"
-        )
+    if danger_arrows:
         return {
-            "mode": "threat-highlight",
-            "arrows": [],
-            "highlight_square": chess.square_name(target_square),
-            "reason": f"new threat to opponent {target_name}",
+            "mode": "threat-arrows",
+            "arrows": danger_arrows[:2],
+            "danger_arrows": danger_arrows[:2],
+            "tactical_queue": [],
+            "highlight_square": None,
+            "reason": "; ".join(reasons),
             "score": score_text,
         }
-
-    # No new threat: leave the board clean. No control-square arrows, no normal PV.
     return empty
-
 
 def _read_board_annotation_geometry(driver, board_selector: str) -> dict[str, object] | None:
     """Read visible board geometry and orientation for native right-click arrows."""
@@ -3261,7 +3379,7 @@ def _replace_native_coaching_annotations(
             if not _toggle_native_annotation_arrow(cdp, arrow, geometry):
                 remaining_previous.append(arrow)
 
-        highlight_needs_change = previous_highlight != next_highlight or bool(next_arrows)
+        highlight_needs_change = previous_highlight != next_highlight
         if previous_highlight and highlight_needs_change:
             _toggle_native_annotation_square(cdp, previous_highlight, geometry)
 
@@ -3282,11 +3400,10 @@ def _replace_native_coaching_annotations(
                 position_matches = False
 
         if position_matches:
-            if next_arrows:
-                for arrow in next_arrows[:5]:
-                    if _toggle_native_annotation_arrow(cdp, arrow, geometry):
-                        drawn.append(arrow)
-            elif next_highlight:
+            for arrow in next_arrows[:5]:
+                if _toggle_native_annotation_arrow(cdp, arrow, geometry):
+                    drawn.append(arrow)
+            if next_highlight:
                 if previous_highlight == next_highlight and not highlight_needs_change:
                     kept_highlight = previous_highlight
                 elif _toggle_native_annotation_square(cdp, next_highlight, geometry):
@@ -5696,7 +5813,7 @@ def main() -> int:
                                     fen,
                                     str(last_move.get("uci") or ""),
                                     active_bot_color,
-                                    max_plies=5,
+                                    max_plies=3,
                                     search_seconds=analysis_seconds,
                                 )
                             except (ValueError, IndexError, TypeError, RuntimeError):
@@ -5724,16 +5841,24 @@ def main() -> int:
                         )
                         plan_mode = str(coaching_plan.get("mode") or "none")
                         plan_reason = str(coaching_plan.get("reason") or "")
-                        if plan_mode == "tactical-queue" and auto_analysis_arrows:
+                        tactical_queue = [
+                            str(value) for value in (coaching_plan.get("tactical_queue") or [])
+                            if isinstance(value, str)
+                        ][:3]
+                        danger_arrows = [
+                            str(value) for value in (coaching_plan.get("danger_arrows") or [])
+                            if isinstance(value, str)
+                        ][:2]
+                        if plan_mode == "tactical-queue" and tactical_queue:
                             print(
-                                f"[COACHING] Tactical queue ({len(auto_analysis_arrows)} ply): "
-                                f"{plan_reason} | {' -> '.join(auto_analysis_arrows)}.",
+                                f"[COACHING] Tactical queue ({len(tactical_queue)} ply): "
+                                f"{plan_reason} | {' -> '.join(tactical_queue)}.",
                                 flush=True,
                             )
-                        elif plan_mode == "threat-highlight" and auto_analysis_highlight_square:
+                        if danger_arrows:
                             print(
-                                f"[COACHING] One threatened opponent piece highlighted: "
-                                f"{auto_analysis_highlight_square} ({plan_reason}).",
+                                f"[COACHING] Danger arrows: {'; '.join(danger_arrows)}"
+                                + (f" | {plan_reason}" if plan_mode != "tactical-queue" else ""),
                                 flush=True,
                             )
 
