@@ -3758,7 +3758,12 @@ def _perform_cursor_drag_once(
             "const t = api.dragTarget(a[0],a[1],a[2],a[3]); "
             "if (!t || !t.ok) return t || {ok:false,reason:'invalid-drag-target'}; "
             "const r = t.boardElement.getBoundingClientRect(); "
-            "return {ok:true,width:r.width,height:r.height,left:r.left,top:r.top,bottomSide:t.bottomSide}; })()"
+            "const dpr = Number(window.devicePixelRatio || 1); "
+            "const screenLeft = (Number(window.screenX || 0) + Number(r.left)) * dpr; "
+            "const screenTop = (Number(window.screenY || 0) + Number(window.outerHeight || window.innerHeight) "
+            "- Number(window.innerHeight) + Number(r.top)) * dpr; "
+            "return {ok:true,width:r.width,height:r.height,left:r.left,top:r.top,bottomSide:t.bottomSide, "
+            "screenLeft,screenTop,screenWidth:r.width*dpr,screenHeight:r.height*dpr}; })()"
         )
         target = cdp.evaluate(target_expression, timeout=0.8)
     except Exception:
@@ -3866,49 +3871,83 @@ def _perform_cursor_drag_once(
             time.sleep(pre_delay_ms / 1000.0)
 
         action_started_at = time.monotonic()
-        command_ids: set[int] = set()
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseMoved", "x": source_x, "y": source_y, "button": "none",
-            "buttons": 0, "pointerType": "mouse",
-        }))
-        time.sleep(hover_ms / 1000.0)
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mousePressed", "x": source_x, "y": source_y, "button": "left",
-            "buttons": 1, "clickCount": 1, "pointerType": "mouse",
-        }))
-        time.sleep(pickup_hold_ms / 1000.0)
-
-        for (px, py), segment_ms in zip(path_points, segment_durations):
-            command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-                "type": "mouseMoved", "x": px, "y": py, "button": "left",
-                "buttons": 1, "pointerType": "mouse",
-            }))
-            time.sleep(segment_ms / 1000.0)
-
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseReleased", "x": left + dx, "y": top + dy, "button": "left",
-            "buttons": 0, "clickCount": 1, "pointerType": "mouse",
-        }))
-        # Await all CDP acknowledgements together instead of paying one network
-        # round-trip per mouse event.
-        cdp.wait_for(command_ids, timeout=1.0)
-        action_elapsed_ms = (time.monotonic() - action_started_at) * 1000.0
-    except Exception as exc:
+        controller = _get_visible_cursor_controller(low_clock_mode=low_clock_mode)
+        if controller is None or BoardGeometry is None:
+            return {
+                "ok": False,
+                "reason": "visible-cursor-controller-unavailable",
+                "drag_ms": total_drag_ms,
+                "pre_delay_ms": pre_delay_ms,
+                "waypoints": waypoint_count,
+            }
         try:
-            cdp.send("Input.dispatchMouseEvent", {
-                "type": "mouseReleased", "button": "left", "buttons": 0,
-                "pointerType": "mouse",
-            })
-        except Exception:
-            pass
-        return {
-            "ok": False,
-            "reason": "direct-cdp-input-failed",
-            "error_type": type(exc).__name__,
-            "drag_ms": total_drag_ms,
-            "pre_delay_ms": pre_delay_ms,
-            "waypoints": waypoint_count,
-        }
+            screen_geometry = BoardGeometry(
+                left=float(target["screenLeft"]),
+                top=float(target["screenTop"]),
+                width=float(target["screenWidth"]),
+                height=float(target["screenHeight"]),
+                bottom_side=bottom_side,
+            )
+            window_title = str(driver.title or "").strip()
+        except (KeyError, TypeError, ValueError, WebDriverException):
+            return {
+                "ok": False,
+                "reason": "visible-cursor-geometry-or-window-title-unavailable",
+                "drag_ms": total_drag_ms,
+                "pre_delay_ms": pre_delay_ms,
+                "waypoints": waypoint_count,
+            }
+        if not window_title:
+            return {
+                "ok": False,
+                "reason": "visible-cursor-window-title-empty",
+                "drag_ms": total_drag_ms,
+                "pre_delay_ms": pre_delay_ms,
+                "waypoints": waypoint_count,
+            }
+
+        def current_fen_reader():
+            try:
+                return str(driver.execute_script(
+                    "return window.__liveGameApiReader?.current?.()?.fen || '';"
+                ) or "").strip()
+            except Exception:
+                return ""
+
+        focus_guard = lambda: controller.backend.foreground_title_contains(window_title)
+        try:
+            cursor_result = controller.move_uci(
+                text,
+                expected_fen=expected_fen,
+                current_fen_reader=current_fen_reader,
+                geometry=screen_geometry,
+                bot_color=str(expected_color or ""),
+                focus_guard=focus_guard,
+                allow_premove=bool(allow_premove),
+                premove_prevalidated=bool(allow_premove),
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": "visible-cursor-action-failed",
+                "error_type": type(exc).__name__,
+                "drag_ms": total_drag_ms,
+                "pre_delay_ms": pre_delay_ms,
+                "waypoints": waypoint_count,
+            }
+
+        action_elapsed_ms = (time.monotonic() - action_started_at) * 1000.0
+        total_drag_ms = int(round(action_elapsed_ms))
+        if not cursor_result.ok:
+            return {
+                "ok": False,
+                "reason": f"visible-cursor-{cursor_result.reason}",
+                "error_type": "VisibleCursorError",
+                "drag_ms": total_drag_ms,
+                "pre_delay_ms": pre_delay_ms,
+                "waypoints": waypoint_count,
+                "action_elapsed_ms": round(action_elapsed_ms, 1),
+            }
 
     confirmation_started_at = time.monotonic()
     try:
