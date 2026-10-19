@@ -1000,20 +1000,6 @@ def classify_autoplay_transition(
     return " · ".join(dict.fromkeys(reasons))
 
 
-def autoplay_preview_plies(reason: str) -> int:
-    """Use two native arrows for routine moves and up to four for tactical moments."""
-    if not str(reason or "").strip():
-        return 0
-    tactical_tokens = (
-        "CAPTURE",
-        "CHECK",
-        "MATE",
-        "PROMOTION",
-        "TACTICAL EVAL SWING",
-    )
-    return 4 if any(token in str(reason).upper() for token in tactical_tokens) else 2
-
-
 def draw_native_autoplay_preview(
     driver,
     engine,
@@ -1022,7 +1008,7 @@ def draw_native_autoplay_preview(
     max_plies: int,
     generated: list[tuple[str, dict]],
 ) -> list[str]:
-    """Draw 2–4 future PV arrows with the board's native right-click arrow mechanism."""
+    """Draw 2–3 future PV arrows with the board's native right-click arrow mechanism."""
     if board.is_game_over(claim_draw=True):
         return []
     try:
@@ -1069,7 +1055,7 @@ def draw_native_autoplay_preview(
         virtual_board = board.copy(stack=True)
         arrows: list[tuple[str, str]] = []
         seen_uci: set[str] = set()
-        limit = max(1, min(int(max_plies), 4))
+        limit = max(1, min(int(max_plies), 3))
         for move in pv:
             if move not in virtual_board.legal_moves:
                 break
@@ -1814,10 +1800,6 @@ def main() -> int:
                                     "static capture/check/mate detection remains active.",
                                     flush=True,
                                 )
-                            # In autoplay mode, every confirmed move gets a compact
-                            # native preview. Tactical reasons override this with 4 plies.
-                            if observed_move is not None and not autoplay_reason:
-                                autoplay_reason = "MOVE UPDATE"
 
                         analysis_board = next_board
                         driver.execute_script("window.__variationLineAnalyzer?.resetTrackedArrows?.();")
@@ -1843,7 +1825,12 @@ def main() -> int:
                                         flush=True,
                                     )
                                 else:
-                                    max_preview_plies = autoplay_preview_plies(autoplay_reason)
+                                    max_preview_plies = (
+                                        3 if any(
+                                            token in autoplay_reason
+                                            for token in ("FORCED MATE", "PROMOTION", "TACTICAL EVAL SWING")
+                                        ) else 2
+                                    )
                                     preview_labels = draw_native_autoplay_preview(
                                         driver, engine, next_board,
                                         min(args.search_time, 0.08),
