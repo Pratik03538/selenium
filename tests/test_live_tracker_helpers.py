@@ -28,6 +28,7 @@ from seleniumbase_live_game_tracker import (
     build_move_coaching_plan,
     build_current_position_danger_plan,
     filter_new_coaching_arrows,
+    _replace_native_coaching_annotations,
     premove_phase_allowed,
     reconstruct_history_from_dom_moves,
     sync_dashboard_history,
@@ -312,6 +313,47 @@ class MoveCoachingPlanTests(unittest.TestCase):
         self.assertEqual(plan["mode"], "none")
         self.assertEqual(plan["arrows"], [])
 
+
+
+
+class NativeAnnotationRedrawTests(unittest.TestCase):
+    def test_previous_arrow_is_not_toggled_after_board_move_clears_it(self):
+        fen = chess.Board().fen()
+
+        class FakeDriver:
+            def execute_script(self, script, *_args):
+                if "current?.()?.fen" in script:
+                    return fen
+                return None
+
+        with (
+            patch("seleniumbase_live_game_tracker._direct_cdp_page_for_driver", return_value=object()),
+            patch(
+                "seleniumbase_live_game_tracker._read_board_annotation_geometry",
+                return_value={
+                    "left": 0.0, "top": 0.0, "width": 800.0, "height": 800.0,
+                    "bottom_side": "white",
+                },
+            ),
+            patch("seleniumbase_live_game_tracker._same_chess_position", return_value=True),
+            patch("seleniumbase_live_game_tracker._toggle_native_annotation_arrow") as draw_arrow,
+            patch("seleniumbase_live_game_tracker._toggle_native_annotation_square") as draw_square,
+        ):
+            arrows, highlight = _replace_native_coaching_annotations(
+                FakeDriver(), "board",
+                previous_arrows=["d4d8"],
+                previous_highlight="e4",
+                next_arrows=[],
+                next_highlight=None,
+                expected_fen=fen,
+            )
+
+        # The board already cleared prior annotations on move; clicking the old
+        # route would recreate it. So old arrows/highlights must never be toggled.
+        draw_arrow.assert_not_called()
+        draw_square.assert_not_called()
+        self.assertEqual(arrows, [])
+        self.assertIsNone(highlight)
 
 
 
