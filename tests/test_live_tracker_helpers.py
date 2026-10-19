@@ -499,6 +499,197 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
         fallback_geometry.assert_not_called()
 
 
+class VisibleCursorMovementQueueIntegrationTests(unittest.TestCase):
+    def test_confirmed_move_previews_upcoming_legal_routes_after_board_changes(self):
+        from seleniumbase_live_game_tracker import _perform_cursor_drag_once
+
+        before = chess.STARTING_FEN
+        board_after = chess.Board(before)
+        board_after.push_uci("e2e4")
+        after = board_after.fen()
+
+        target = {
+            "ok": True, "width": 800.0, "height": 800.0,
+            "left": 10.0, "top": 20.0, "bottomSide": "white",
+            "screenLeft": 100.0, "screenTop": 200.0,
+            "screenWidth": 800.0, "screenHeight": 800.0,
+            "windowTitle": "Owned Chess Site - Browser",
+        }
+
+        class FakeDriver:
+            pass
+
+        class FakeCDP:
+            def evaluate(self, expression, timeout=None):
+                return target
+
+            def send(self, method, params):
+                self.method = method
+                self.params = params
+                return 73
+
+            def wait_for(self, command_ids, timeout=None):
+                self.last_timeout = timeout
+                return {
+                    73: {
+                        "result": {
+                            "result": {
+                                "value": {"fen": after, "detected_ms": 1.5}
+                            }
+                        }
+                    }
+                }
+
+        cdp = FakeCDP()
+        backend = SimpleNamespace(foreground_title_contains=Mock(return_value=True))
+        controller = SimpleNamespace(
+            backend=backend,
+            move_uci=Mock(return_value=SimpleNamespace(ok=True, reason="", waypoints=9)),
+            preview_legal_moves=Mock(return_value=SimpleNamespace(
+                ok=True, reason="", duration_s=0.006, waypoints=6
+            )),
+        )
+
+        with (
+            patch("seleniumbase_live_game_tracker._direct_cdp_page_for_driver", return_value=cdp),
+            patch("seleniumbase_live_game_tracker._get_visible_cursor_controller", return_value=controller),
+        ):
+            result = _perform_cursor_drag_once(
+                FakeDriver(), "e2e4", before, "white", allow_premove=False, low_clock_mode=False
+            )
+
+        self.assertTrue(result["ok"], result)
+        controller.preview_legal_moves.assert_called_once()
+        preview_fen = controller.preview_legal_moves.call_args.args[0]
+        self.assertEqual(preview_fen, after)
+        self.assertEqual(controller.preview_legal_moves.call_args.kwargs["max_moves"], 2)
+        self.assertTrue(controller.preview_legal_moves.call_args.kwargs["position_prevalidated"])
+        self.assertEqual(result["cursor_preview_ms"], 6.0)
+
+    def test_premove_queue_also_moves_cursor_to_possible_reply_routes(self):
+        from seleniumbase_live_game_tracker import _perform_cursor_drag_once
+
+        before = chess.STARTING_FEN
+        target = {
+            "ok": True, "width": 800.0, "height": 800.0,
+            "left": 10.0, "top": 20.0, "bottomSide": "white",
+            "screenLeft": 100.0, "screenTop": 200.0,
+            "screenWidth": 800.0, "screenHeight": 800.0,
+            "windowTitle": "Owned Chess Site - Browser",
+        }
+
+        class FakeDriver:
+            pass
+
+        class FakeCDP:
+            def evaluate(self, expression, timeout=None):
+                return target
+
+            def send(self, method, params):
+                return 73
+
+            def wait_for(self, command_ids, timeout=None):
+                return {
+                    73: {
+                        "result": {
+                            "result": {
+                                "value": {"fen": before, "pending": True, "detected_ms": 1.0}
+                            }
+                        }
+                    }
+                }
+
+        cdp = FakeCDP()
+        controller = SimpleNamespace(
+            backend=SimpleNamespace(foreground_title_contains=Mock(return_value=True)),
+            move_uci=Mock(return_value=SimpleNamespace(ok=True, reason="", waypoints=9)),
+            preview_legal_moves=Mock(return_value=SimpleNamespace(
+                ok=True, reason="", duration_s=0.004, waypoints=4
+            )),
+        )
+        with (
+            patch("seleniumbase_live_game_tracker._direct_cdp_page_for_driver", return_value=cdp),
+            patch("seleniumbase_live_game_tracker._get_visible_cursor_controller", return_value=controller),
+        ):
+            result = _perform_cursor_drag_once(
+                FakeDriver(), "g1f3", before, "white", allow_premove=True, low_clock_mode=False
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["premove_confirmed"])
+        controller.preview_legal_moves.assert_called_once()
+        self.assertEqual(controller.preview_legal_moves.call_args.args[0], before)
+        self.assertEqual(result["cursor_preview_ms"], 4.0)
+
+    def test_draw_queue_uses_10_to_30ms_gaps_and_previews_between_routes(self):
+        from seleniumbase_live_game_tracker import _replace_native_coaching_annotations
+
+        fen = chess.STARTING_FEN
+        events = []
+
+        class FakeDriver:
+            pass
+
+        class FakeBackend:
+            def foreground_title_contains(self, fragment):
+                return True
+
+        controller = SimpleNamespace(backend=FakeBackend())
+        controller.draw_arrow = Mock(
+            side_effect=lambda *args, **kwargs: (
+                events.append(("arrow", args[0], args[1])) or SimpleNamespace(ok=True)
+            )
+        )
+        controller.draw_highlight = Mock(return_value=SimpleNamespace(ok=True))
+        controller.preview_legal_moves = Mock(
+            side_effect=lambda *args, **kwargs: (
+                events.append(("preview", kwargs.get("max_moves")))
+                or SimpleNamespace(ok=True, duration_s=0.005)
+            )
+        )
+
+        with (
+            patch("seleniumbase_live_game_tracker._direct_cdp_page_for_driver") as cdp,
+            patch(
+                "seleniumbase_live_game_tracker._read_board_annotation_geometry",
+                return_value={
+                    "left": 0.0, "top": 0.0, "width": 800.0, "height": 800.0,
+                    "bottom_side": "white", "fen": fen,
+                    "screen_left": 100.0, "screen_top": 200.0,
+                    "screen_width": 800.0, "screen_height": 800.0,
+                    "window_title": "Owned Chess Site - Browser",
+                },
+            ),
+            patch("seleniumbase_live_game_tracker._get_visible_cursor_controller", return_value=controller),
+            patch("seleniumbase_live_game_tracker._same_chess_position", return_value=True),
+            patch("seleniumbase_live_game_tracker.time.sleep",
+                  side_effect=lambda duration: events.append(("sleep", duration))) as sleep_mock,
+            patch("seleniumbase_live_game_tracker.random.uniform", side_effect=[0.020, 0.020]) as jitter,
+        ):
+            arrows, highlight = _replace_native_coaching_annotations(
+                FakeDriver(), "board", [], None, ["d4d8", "a4a8"], None, fen,
+                use_visible_cursor=True,
+                game_id=1,
+                auto_draw_enabled=True,
+                bot_color="white",
+                white_clock_seconds=60.0,
+                black_clock_seconds=50.0,
+                low_clock_trigger_seconds=9.0,
+                opening_fast_mode=False,
+                fast_mode=False,
+            )
+
+        self.assertEqual(arrows, ["d4d8", "a4a8"])
+        self.assertIsNone(highlight)
+        self.assertEqual(jitter.call_args_list, [call(0.010, 0.030), call(0.010, 0.030)])
+        self.assertEqual(sleep_mock.call_args_list, [call(0.020), call(0.015)])
+        self.assertLess(events.index(("sleep", 0.020)), events.index(("arrow", "d4", "d8")))
+        self.assertLess(events.index(("preview", 1)), events.index(("arrow", "a4", "a8")))
+        self.assertEqual([value for value in events if value[0] == "arrow"], [
+            ("arrow", "d4", "d8"), ("arrow", "a4", "a8")
+        ])
+
+
 class PostMoveCoachingGateTests(unittest.TestCase):
     def test_coaching_is_allowed_after_the_bot_completes_its_move(self):
         self.assertTrue(
