@@ -120,6 +120,7 @@ class CursorActionResult:
     reason: str = ""
     route: tuple[str, ...] = ()
     duration_s: float = 0.0
+    waypoints: int = 0
 
 
 class MouseBackend(Protocol):
@@ -325,14 +326,14 @@ class VisibleCursorController:
         start: tuple[int, int],
         end: tuple[int, int],
         duration_s: float,
-    ) -> None:
+    ) -> int:
         x0, y0 = start
         x3, y3 = end
         dx, dy = x3 - x0, y3 - y0
         distance = math.hypot(dx, dy)
         if distance < 1:
             self._set_position(end)
-            return
+            return 1
 
         steps = max(
             self.motion.min_steps,
@@ -369,6 +370,7 @@ class VisibleCursorController:
                 time.sleep(interval)
 
         self._set_position(end)
+        return steps
 
     def _drag(
         self,
@@ -380,7 +382,7 @@ class VisibleCursorController:
         expected_fen: str,
         current_fen_reader: FenReader,
         focus_guard: FocusGuard,
-    ) -> None:
+    ) -> int:
         # The caller has already glided the visible cursor to the source square.
         # Snap only the final sub-pixel rounding, not the whole on-screen approach.
         self._set_position(start)
@@ -396,7 +398,7 @@ class VisibleCursorController:
             pressed = True
             if self.motion.settle_after_press_s:
                 time.sleep(self.motion.settle_after_press_s)
-            self._follow_curve(start, end, duration_s)
+            drag_steps = self._follow_curve(start, end, duration_s)
         finally:
             try:
                 if pressed:
@@ -405,6 +407,7 @@ class VisibleCursorController:
                 self.backend.release_all()
         if self.motion.settle_after_release_s:
             time.sleep(self.motion.settle_after_release_s)
+        return drag_steps
 
     def move_uci(
         self,
@@ -460,10 +463,10 @@ class VisibleCursorController:
 
         try:
             current_pointer = self.backend.get_position()
-            self._follow_curve(
+            approach_steps = self._follow_curve(
                 current_pointer, source, self.motion.approach_duration_s
             )
-            self._drag(
+            drag_steps = self._drag(
                 source,
                 destination,
                 "left",
@@ -480,7 +483,8 @@ class VisibleCursorController:
                         time.monotonic() - started,
                     )
             return CursorActionResult(
-                True, "move", "", (token,), time.monotonic() - started
+                True, "move", "", (token,), time.monotonic() - started,
+                approach_steps + drag_steps,
             )
         except Exception as exc:
             try:
@@ -536,7 +540,7 @@ class VisibleCursorController:
 
         point = geometry.square_center(token)
         try:
-            self._follow_curve(
+            approach_steps = self._follow_curve(
                 self.backend.get_position(), point, self.motion.approach_duration_s
             )
             if not self._call_guard(focus_guard):
@@ -560,7 +564,8 @@ class VisibleCursorController:
             if self.motion.settle_after_release_s:
                 time.sleep(self.motion.settle_after_release_s)
             return CursorActionResult(
-                True, "highlight", "", route, time.monotonic() - started
+                True, "highlight", "", route, time.monotonic() - started,
+                approach_steps + 1,
             )
         except Exception as exc:
             try:
@@ -630,10 +635,10 @@ class VisibleCursorController:
         end_point = geometry.square_center(end)
         try:
             current_pointer = self.backend.get_position()
-            self._follow_curve(
+            approach_steps = self._follow_curve(
                 current_pointer, start_point, self.motion.approach_duration_s
             )
-            self._drag(
+            drag_steps = self._drag(
                 start_point,
                 end_point,
                 "right",
@@ -644,7 +649,8 @@ class VisibleCursorController:
             )
             self._drawn_arrows.add(route)
             return CursorActionResult(
-                True, "draw", "", route, time.monotonic() - started
+                True, "draw", "", route, time.monotonic() - started,
+                approach_steps + drag_steps,
             )
         except Exception as exc:
             try:
