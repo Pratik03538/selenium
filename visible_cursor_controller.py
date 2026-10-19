@@ -575,7 +575,7 @@ class VisibleCursorController:
             total_steps = 0
             # Preview legs are shorter than real move gestures; do not click or
             # hold either button during this pointer-only movement.
-            leg_duration = max(0.001, min(0.006, self.motion.approach_duration_s))
+            leg_duration = max(0.001, min(0.002, self.motion.approach_duration_s))
             route = []
             for move in selected:
                 if not self._call_guard(focus_guard):
