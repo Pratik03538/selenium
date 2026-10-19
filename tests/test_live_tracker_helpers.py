@@ -27,6 +27,7 @@ from seleniumbase_live_game_tracker import (
     calculate_top_continuation_uci_moves,
     build_move_coaching_plan,
     build_current_position_danger_plan,
+    should_render_post_move_coaching,
     filter_new_coaching_arrows,
     _replace_native_coaching_annotations,
     premove_phase_allowed,
@@ -355,6 +356,33 @@ class NativeAnnotationRedrawTests(unittest.TestCase):
         self.assertEqual(arrows, [])
         self.assertIsNone(highlight)
 
+
+
+class PostMoveCoachingGateTests(unittest.TestCase):
+    def test_coaching_is_allowed_after_the_bot_completes_its_move(self):
+        self.assertTrue(
+            should_render_post_move_coaching(
+                True, True, "white", "white", "position-after", "position-before"
+            )
+        )
+
+    def test_opponent_move_never_triggers_coaching_or_draw_input(self):
+        self.assertFalse(
+            should_render_post_move_coaching(
+                True, True, "white", "black", "position-after", "position-before"
+            )
+        )
+
+    def test_coaching_is_skipped_if_autoplay_engine_or_prior_position_is_missing(self):
+        cases = [
+            (False, True, "white", "white", "after", "before"),
+            (True, False, "white", "white", "after", "before"),
+            (True, True, "white", "white", "after", ""),
+            (True, True, "white", "white", "", "before"),
+        ]
+        for args in cases:
+            with self.subTest(args=args):
+                self.assertFalse(should_render_post_move_coaching(*args))
 
 
 class CoachingArrowDeduplicationTests(unittest.TestCase):
