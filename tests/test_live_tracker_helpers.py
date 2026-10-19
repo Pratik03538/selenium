@@ -110,6 +110,16 @@ class LegalDestinationArrowTests(unittest.TestCase):
             [],
         )
 
+    def test_shows_no_destinations_after_checkmate(self):
+        board = chess.Board()
+        for uci in ("f2f3", "e7e5", "g2g4", "d8h4"):
+            board.push_uci(uci)
+        self.assertTrue(board.is_checkmate())
+        self.assertEqual(
+            legal_destination_arrow_uci_moves(board, "d8h4", "black"),
+            [],
+        )
+
     def test_returns_no_arrows_if_the_moved_piece_is_no_longer_on_its_destination(self):
         board = chess.Board()
         board.push_uci("e2e4")
