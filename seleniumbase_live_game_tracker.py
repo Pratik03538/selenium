@@ -3864,7 +3864,9 @@ def _perform_cursor_drag_once(
     waypoint_count = 4 if low_clock_mode else 12
     total_drag_ms = 0
     confirm_interval_ms = rng.randint(4, 10)
-    confirmation_timeout_ms = int(120 if low_clock_mode else (450 if allow_premove else 900))
+    # A native desktop-cursor gesture can take longer than synthetic CDP input.
+    # This timeout is post-action confirmation time, so it does not consume the move's clock.
+    confirmation_timeout_ms = int(350 if low_clock_mode else (650 if allow_premove else 1000))
 
     # Start a page-side watcher before sending mouse input. MutationObserver is
     # immediate; a 4-10ms in-page interval is the fallback for API-only updates.
