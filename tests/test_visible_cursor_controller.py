@@ -179,6 +179,39 @@ class VisibleMoveTests(unittest.TestCase):
         self.assertEqual(result.reason, "not-bot-turn")
         self.assertEqual(backend.events, [])
 
+    def test_premove_requires_site_validation_and_can_run_during_opponents_turn(self):
+        controller, backend = make_controller()
+        board = chess.Board()
+        board.push_uci("e2e4")
+        fen = board.fen()
+
+        blocked = controller.move_uci(
+            "g1f3",
+            expected_fen=fen,
+            current_fen_reader=lambda: fen,
+            geometry=BoardGeometry(0, 0, 800, 800),
+            bot_color="white",
+            focus_guard=lambda: True,
+            allow_premove=True,
+            premove_prevalidated=False,
+        )
+        self.assertFalse(blocked.ok)
+        self.assertEqual(blocked.reason, "premove-validation-required")
+        self.assertEqual(backend.events, [])
+
+        accepted = controller.move_uci(
+            "g1f3",
+            expected_fen=fen,
+            current_fen_reader=lambda: fen,
+            geometry=BoardGeometry(0, 0, 800, 800),
+            bot_color="white",
+            focus_guard=lambda: True,
+            allow_premove=True,
+            premove_prevalidated=True,
+        )
+        self.assertTrue(accepted.ok, accepted.reason)
+        self.assertIn(("press", "left"), backend.events)
+
     def test_foreground_guard_is_required(self):
         controller, backend = make_controller()
         fen = chess.STARTING_FEN
@@ -244,6 +277,41 @@ class VisibleArrowTests(unittest.TestCase):
                 self.assertFalse(result.ok)
                 self.assertEqual(result.reason, expected_reason)
         self.assertEqual(backend.events, [])
+
+    def test_native_highlight_uses_right_click_and_respects_fast_mode(self):
+        controller, backend = make_controller()
+        fen = chess.STARTING_FEN
+        blocked = controller.draw_highlight(
+            "e4",
+            expected_fen=fen,
+            current_fen_reader=lambda: fen,
+            geometry=BoardGeometry(0, 0, 800, 800),
+            focus_guard=lambda: True,
+            auto_draw_enabled=True,
+            opening_fast_mode=True,
+            fast_mode=False,
+            bot_clock_seconds=60.0,
+            low_clock_trigger_seconds=9.0,
+        )
+        self.assertFalse(blocked.ok)
+        self.assertEqual(blocked.reason, "opening-fast-mode")
+        self.assertEqual(backend.events, [])
+
+        result = controller.draw_highlight(
+            "e4",
+            expected_fen=fen,
+            current_fen_reader=lambda: fen,
+            geometry=BoardGeometry(0, 0, 800, 800),
+            focus_guard=lambda: True,
+            auto_draw_enabled=True,
+            opening_fast_mode=False,
+            fast_mode=False,
+            bot_clock_seconds=60.0,
+            low_clock_trigger_seconds=9.0,
+        )
+        self.assertTrue(result.ok, result.reason)
+        self.assertIn(("press", "right"), backend.events)
+        self.assertIn(("release", "right"), backend.events)
 
     def test_arrow_rejected_for_stale_fen_or_missing_focus(self):
         controller, backend = make_controller()
