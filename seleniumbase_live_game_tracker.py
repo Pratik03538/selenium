@@ -3712,8 +3712,8 @@ def _replace_native_coaching_annotations(
         return [], None
 
     try:
-        driver.execute_script(
-            "if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = true;"
+        cdp.evaluate(
+            "(() => { if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = true; return true; })()"
         )
     except Exception:
         pass
@@ -3826,8 +3826,8 @@ def _replace_native_coaching_annotations(
                 kept_highlight = next_highlight
     finally:
         try:
-            driver.execute_script(
-                "if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = false;"
+            cdp.evaluate(
+                "(() => { if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = false; return true; })()"
             )
         except Exception:
             pass
@@ -3967,8 +3967,8 @@ def _perform_cursor_drag_once(
 
         def current_fen_reader():
             try:
-                return str(driver.execute_script(
-                    "return window.__liveGameApiReader?.current?.()?.fen || '';"
+                return str(cdp.evaluate(
+                    "(() => String(window.__liveGameApiReader?.current?.()?.fen || ''))()"
                 ) or "").strip()
             except Exception:
                 return ""
