@@ -1746,6 +1746,10 @@ def main() -> int:
                         eval_delta_white = None
                         autoplay_reason = ""
                         if autoplay_preview_mode:
+                            # Static tactics still trigger if the quick engine scan fails.
+                            autoplay_reason = classify_autoplay_transition(
+                                before_board, next_board, observed_move,
+                            )
                             try:
                                 current_eval_value, current_mate_distance = autoplay_eval_snapshot(
                                     engine, next_board, min(args.search_time, 0.04)
@@ -1755,16 +1759,19 @@ def main() -> int:
                                     and last_autoplay_eval_value is not None
                                 ):
                                     eval_delta_white = current_eval_value - last_autoplay_eval_value
-                                autoplay_reason = classify_autoplay_transition(
+                                evaluated_reason = classify_autoplay_transition(
                                     before_board,
                                     next_board,
                                     observed_move,
                                     eval_delta_white,
                                     current_mate_distance,
                                 )
+                                if evaluated_reason:
+                                    autoplay_reason = evaluated_reason
                             except Exception as exc:
                                 print(
-                                    f"[AUTO ARROWS] Quick tactical scan failed ({type(exc).__name__}).",
+                                    f"[AUTO ARROWS] Quick tactical scan failed ({type(exc).__name__}); "
+                                    "static capture/check/mate detection remains active.",
                                     flush=True,
                                 )
 
