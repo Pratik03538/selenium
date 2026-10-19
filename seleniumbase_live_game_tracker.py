@@ -5799,7 +5799,7 @@ def main() -> int:
                             elif is_start_position(fen) and not is_start_position(previous_fen):
                                 game_number += 1
                                 reconstructed_history = []
-                                active_coaching_arrows.clear()
+                                shown_coaching_arrows.clear()
                                 note = "New game detected; move history reset"
                             elif chess is not None:
                                 note = "Position changed but transition could not be inferred as one legal move"
@@ -5863,7 +5863,7 @@ def main() -> int:
                             # continuously present, even across the opponent's reply.
                             next_coaching_arrows = filter_new_coaching_arrows(
                                 next_coaching_arrows,
-                                active_coaching_arrows,
+                                shown_coaching_arrows,
                             )
                         next_highlight_square = (
                             str(coaching_plan.get("highlight_square") or "").strip().lower() or None
@@ -5880,7 +5880,7 @@ def main() -> int:
                             )
                         )
                         if coaching_from_bot_move:
-                            active_coaching_arrows.update(
+                            shown_coaching_arrows.update(
                                 arrow for arrow in next_coaching_arrows
                                 if arrow in auto_analysis_arrows
                             )
