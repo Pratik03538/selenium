@@ -702,6 +702,7 @@ window.__variationLineAnalyzer = {
     const rect = found?.getBoundingClientRect?.();
     return {
       boardFound:!!found, boardTag:found?.tagName || '',
+      boardLeft:rect?.left || 0, boardTop:rect?.top || 0,
       boardWidth:rect?.width || 0, boardHeight:rect?.height || 0,
       bottomSide:resolveBottomSide(found, api.current() || {}) || 'unknown',
       trackedUserArrows:userArrows.size,
@@ -928,6 +929,154 @@ def clear_generated(driver, generated: list[tuple[str, dict]]) -> None:
     finally:
         set_listener_suppressed(driver, False)
     generated.clear()
+
+
+def autoplay_eval_snapshot(engine, board: chess.Board, seconds: float) -> tuple[float, int | None]:
+    """Return a quick White-perspective score and forced-mate distance."""
+    if board.is_checkmate():
+        winner = not board.turn
+        return (100000.0 if winner == chess.WHITE else -100000.0), 0
+    if board.is_game_over(claim_draw=True):
+        return 0.0, None
+    info = engine.analyse(board, chess.engine.Limit(time=max(0.01, float(seconds))))
+    score_white = info["score"].pov(chess.WHITE)
+    _label, value = format_white_score(score_white)
+    return float(value), score_white.mate()
+
+
+def classify_autoplay_transition(
+    before_board: chess.Board | None,
+    after_board: chess.Board,
+    move: chess.Move | None,
+    eval_delta_white: float | None = None,
+    current_mate_distance: int | None = None,
+) -> str:
+    """Describe only captures, forcing moves, mates, promotions, or large eval swings."""
+    reasons: list[str] = []
+    if before_board is not None and move is not None and move in before_board.legal_moves:
+        if before_board.is_capture(move):
+            reasons.append("CAPTURE")
+        if move.promotion is not None:
+            reasons.append("PROMOTION")
+        try:
+            resulting = before_board.copy(stack=True)
+            resulting.push(move)
+            if resulting.is_checkmate():
+                reasons.append("CHECKMATE")
+            elif resulting.is_check():
+                reasons.append("CHECK")
+        except (ValueError, AssertionError):
+            pass
+
+    if after_board.is_checkmate() and "CHECKMATE" not in reasons:
+        reasons.append("CHECKMATE")
+    if current_mate_distance is not None and not after_board.is_checkmate():
+        reasons.append(f"FORCED MATE IN {abs(int(current_mate_distance))}")
+    if (
+        eval_delta_white is not None
+        and current_mate_distance is None
+        and abs(float(eval_delta_white)) >= 1.25
+    ):
+        reasons.append(f"TACTICAL EVAL SWING {float(eval_delta_white):+.2f}")
+    # Keep the explanation compact if multiple signals describe the same event.
+    return " · ".join(dict.fromkeys(reasons))
+
+
+def draw_native_autoplay_preview(
+    driver,
+    engine,
+    board: chess.Board,
+    search_seconds: float,
+    max_plies: int,
+    generated: list[tuple[str, dict]],
+) -> list[str]:
+    """Draw 2–3 future PV arrows with the board's native right-click arrow mechanism."""
+    if board.is_game_over(claim_draw=True):
+        return []
+    try:
+        geometry = driver.execute_script(
+            "return window.__variationLineAnalyzer?.diagnostics?.() || {};"
+        ) or {}
+        if (
+            not geometry.get("boardFound")
+            or geometry.get("bottomSide") not in {"white", "black"}
+        ):
+            return []
+        geom = {
+            "left": float(geometry.get("boardLeft", 0)),
+            "top": float(geometry.get("boardTop", 0)),
+            "width": float(geometry.get("boardWidth", 0)),
+            "height": float(geometry.get("boardHeight", 0)),
+            "bottom_side": str(geometry.get("bottomSide")),
+        }
+        if (
+            geom["width"] <= 8
+            or geom["height"] <= 8
+            or abs(geom["width"] - geom["height"]) > max(8.0, geom["width"] * 0.08)
+        ):
+            return []
+        cdp = tracker._direct_cdp_page_for_driver(driver)
+        if cdp is None:
+            print("[AUTO ARROWS] Native board channel is unavailable; no overlay fallback used.", flush=True)
+            return []
+
+        info = engine.analyse(
+            board,
+            chess.engine.Limit(time=max(0.02, min(float(search_seconds), 0.12))),
+            multipv=1,
+        )
+        pv = info.get("pv") if isinstance(info, dict) else None
+        if not isinstance(pv, list):
+            return []
+        virtual_board = board.copy(stack=True)
+        arrows: list[tuple[str, str]] = []
+        seen_uci: set[str] = set()
+        limit = max(1, min(int(max_plies), 3))
+        for move in pv:
+            if move not in virtual_board.legal_moves:
+                break
+            san = virtual_board.san(move)
+            prefix = (
+                f"{virtual_board.fullmove_number}."
+                if virtual_board.turn == chess.WHITE
+                else f"{virtual_board.fullmove_number}..."
+            )
+            uci = move.uci()
+            if uci not in seen_uci:
+                seen_uci.add(uci)
+                arrows.append((uci, prefix + san))
+            virtual_board.push(move)
+            if len(arrows) >= limit:
+                break
+
+        if not arrows:
+            return []
+        shown: list[str] = []
+        set_listener_suppressed(driver, True)
+        try:
+            for uci, label in arrows:
+                result = dispatch_native_annotation_arrow(
+                    cdp, uci,
+                    left=geom["left"], top=geom["top"],
+                    width=geom["width"], height=geom["height"],
+                    bottom_side=geom["bottom_side"],
+                )
+                if result.get("ok"):
+                    generated.append((uci, dict(geom)))
+                    shown.append(label)
+                    time.sleep(0.012)
+                else:
+                    print(
+                        f"[AUTO ARROWS] Could not draw native arrow for {label} "
+                        f"({result.get('reason', 'unknown')}).",
+                        flush=True,
+                    )
+        finally:
+            set_listener_suppressed(driver, False)
+        return shown
+    except Exception as exc:
+        print(f"[AUTO ARROWS] Native preview failed ({type(exc).__name__}); no overlay fallback used.", flush=True)
+        return []
 
 
 def set_board_status(driver, message: str) -> None:
@@ -1456,6 +1605,9 @@ def main() -> int:
         turn_hint_last_key = ""
         turn_hint_last_status = "OFF"
         last_published_autoplay_state: bool | None = None
+        last_autoplay_eval_fen = ""
+        last_autoplay_eval_value: float | None = None
+        last_autoplay_mate_distance: int | None = None
         off_hint_status = (
             "OFF · autoplay mode" if mode_control_file is not None
             else "OFF · no move is played"
@@ -1523,7 +1675,15 @@ def main() -> int:
                     flush=True,
                 )
 
-        show_hints(driver, [], "Queue empty · draw a legal arrow to begin")
+        startup_turn_mode = driver.execute_script(
+            "return window.__variationLineAnalyzer?.getTurnHintState?.() || {enabled:false};"
+        ) or {}
+        if mode_control_file is None or bool(startup_turn_mode.get("enabled")):
+            show_hints(driver, [], "Queue empty · draw a legal arrow to begin")
+        else:
+            # Autoplay mode uses only the board's native arrows; do not leave a
+            # translucent analyzer SVG/status layer on the board.
+            driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
         print("[READY] No suggestions are shown until you draw a native right-click arrow.", flush=True)
         print("[READY] Your drawn arrow selects the starting move; the next two suggestions then appear.", flush=True)
         print("[READY] Drawing the first hinted move continues that line; clear ALL your arrows to return to the real board position.", flush=True)
@@ -1537,18 +1697,78 @@ def main() -> int:
                         "return window.__liveGameApiReader?.current?.() || {};"
                     ) or {}
                     current_fen = str(state.get("fen") or "").strip()
+                    turn_hint_ui = driver.execute_script(
+                        "return window.__variationLineAnalyzer?.getTurnHintState?.() || {enabled:false};"
+                    ) or {}
+                    turn_hint_enabled = bool(turn_hint_ui.get("enabled"))
+                    autoplay_preview_mode = mode_control_file is not None and not turn_hint_enabled
 
-                    # A real board move resets the hypothetical branch to the
-                    # actual position. Drawing annotations alone leaves FEN unchanged.
+                    # Native autoplay arrows are cleared immediately on entering SHOW MOVE,
+                    # which leaves that mode available for the user's manual native arrows.
+                    if not autoplay_preview_mode:
+                        if generated:
+                            clear_generated(driver, generated)
+                        last_autoplay_eval_fen = ""
+                        last_autoplay_eval_value = None
+                        last_autoplay_mate_distance = None
+
+                    # A real board move resets the hypothetical branch to the actual position.
+                    # Only tracker-launched autoplay mode gets automatic tactical previews.
                     if current_fen and current_fen != last_fen:
+                        previous_fen = last_fen
+                        before_board = None
+                        observed_move = None
+                        if previous_fen:
+                            try:
+                                before_board = chess.Board(previous_fen)
+                            except ValueError:
+                                before_board = None
+                            try:
+                                transition = tracker.infer_move_between_fens(previous_fen, current_fen)
+                                if transition and before_board is not None:
+                                    candidate = chess.Move.from_uci(str(transition.get("uci") or ""))
+                                    if candidate in before_board.legal_moves:
+                                        observed_move = candidate
+                            except (ValueError, TypeError):
+                                observed_move = None
+
                         clear_generated(driver, generated)
                         try:
                             driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
-                            analysis_board = chess.Board(current_fen)
+                            next_board = chess.Board(current_fen)
                         except Exception:
                             set_board_status(driver, "Board changed · could not reset analysis position")
                             time.sleep(0.12)
                             continue
+
+                        current_eval_value = None
+                        current_mate_distance = None
+                        eval_delta_white = None
+                        autoplay_reason = ""
+                        if autoplay_preview_mode:
+                            try:
+                                current_eval_value, current_mate_distance = autoplay_eval_snapshot(
+                                    engine, next_board, min(args.search_time, 0.04)
+                                )
+                                if (
+                                    last_autoplay_eval_fen == previous_fen
+                                    and last_autoplay_eval_value is not None
+                                ):
+                                    eval_delta_white = current_eval_value - last_autoplay_eval_value
+                                autoplay_reason = classify_autoplay_transition(
+                                    before_board,
+                                    next_board,
+                                    observed_move,
+                                    eval_delta_white,
+                                    current_mate_distance,
+                                )
+                            except Exception as exc:
+                                print(
+                                    f"[AUTO ARROWS] Quick tactical scan failed ({type(exc).__name__}).",
+                                    flush=True,
+                                )
+
+                        analysis_board = next_board
                         driver.execute_script("window.__variationLineAnalyzer?.resetTrackedArrows?.();")
                         last_fen = current_fen
                         accepted_steps = 0
@@ -1557,13 +1777,70 @@ def main() -> int:
                         awaiting_clear = False
                         queued_followup_hint = None
                         line_previous_eval_white_cp = None
-                        show_hints(driver, [], "Board position changed · queue reset · draw a new arrow")
-                        print("[RESET] Board position changed; waiting for your next arrow.", flush=True)
 
-                    turn_hint_ui = driver.execute_script(
-                        "return window.__variationLineAnalyzer?.getTurnHintState?.() || {enabled:false};"
-                    ) or {}
-                    turn_hint_enabled = bool(turn_hint_ui.get("enabled"))
+                        if autoplay_preview_mode:
+                            # Cache this position even if the quick evaluation failed, so
+                            # the same board is not re-evaluated twice in one polling cycle.
+                            last_autoplay_eval_fen = current_fen
+                            last_autoplay_eval_value = current_eval_value
+                            last_autoplay_mate_distance = current_mate_distance
+                            if autoplay_reason:
+                                if next_board.is_game_over(claim_draw=True):
+                                    print(
+                                        f"[AUTO ARROWS] {autoplay_reason} · position is terminal; "
+                                        "no future move arrows available.",
+                                        flush=True,
+                                    )
+                                else:
+                                    max_preview_plies = (
+                                        3 if any(
+                                            token in autoplay_reason
+                                            for token in ("FORCED MATE", "PROMOTION", "TACTICAL EVAL SWING")
+                                        ) else 2
+                                    )
+                                    preview_labels = draw_native_autoplay_preview(
+                                        driver, engine, next_board,
+                                        min(args.search_time, 0.08),
+                                        max_preview_plies, generated,
+                                    )
+                                    if preview_labels:
+                                        print(
+                                            f"[AUTO ARROWS] {autoplay_reason} | native board arrows: "
+                                            + " → ".join(preview_labels),
+                                            flush=True,
+                                        )
+                                    else:
+                                        print(
+                                            f"[AUTO ARROWS] {autoplay_reason} detected; "
+                                            "native preview unavailable, no translucent fallback used.",
+                                            flush=True,
+                                        )
+                        else:
+                            last_autoplay_eval_fen = ""
+                            last_autoplay_eval_value = None
+                            last_autoplay_mate_distance = None
+                            show_hints(
+                                driver, [],
+                                "Board position changed · queue reset · draw a new arrow",
+                            )
+                            print("[RESET] Board position changed; waiting for your next arrow.", flush=True)
+
+                    # Establish a baseline the first time autoplay is enabled for the
+                    # current position; switching modes itself must not draw arrows.
+                    if (
+                        autoplay_preview_mode
+                        and current_fen
+                        and current_fen != last_autoplay_eval_fen
+                    ):
+                        try:
+                            baseline_board = chess.Board(current_fen)
+                            last_autoplay_eval_value, last_autoplay_mate_distance = autoplay_eval_snapshot(
+                                engine, baseline_board, min(args.search_time, 0.04)
+                            )
+                        except Exception:
+                            last_autoplay_eval_value = None
+                            last_autoplay_mate_distance = None
+                        last_autoplay_eval_fen = current_fen
                     if mode_control_file is not None:
                         requested_autoplay = not turn_hint_enabled
                         if requested_autoplay != last_published_autoplay_state:
