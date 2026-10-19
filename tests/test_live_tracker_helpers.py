@@ -24,6 +24,7 @@ from seleniumbase_live_game_tracker import (
     _PremoveDeadlineExceeded,
     choose_mate_phase_premove,
     infer_move_between_fens,
+    legal_destination_arrow_uci_moves,
     premove_phase_allowed,
     reconstruct_history_from_dom_moves,
     sync_dashboard_history,
@@ -88,6 +89,35 @@ class BoardInputSourceGuardTests(unittest.TestCase):
             JS_INSTALL_OBSERVER,
         )
         self.assertIn("unreadable-fen-verified", JS_INSTALL_OBSERVER)
+
+
+class LegalDestinationArrowTests(unittest.TestCase):
+    def test_shows_only_legal_destinations_for_the_piece_that_just_moved(self):
+        board = chess.Board()
+        move = chess.Move.from_uci("e2e4")
+        board.push(move)
+
+        self.assertEqual(
+            legal_destination_arrow_uci_moves(board, "e2e4", "white"),
+            ["e4e5"],
+        )
+
+    def test_rejects_a_moved_side_mismatch(self):
+        board = chess.Board()
+        board.push_uci("e2e4")
+        self.assertEqual(
+            legal_destination_arrow_uci_moves(board, "e2e4", "black"),
+            [],
+        )
+
+    def test_returns_no_arrows_if_the_moved_piece_is_no_longer_on_its_destination(self):
+        board = chess.Board()
+        board.push_uci("e2e4")
+        board.push_uci("d7d5")
+        self.assertEqual(
+            legal_destination_arrow_uci_moves(board, "e2e4", "white"),
+            [],
+        )
 
 
 class MoveRetryGateTests(unittest.TestCase):
