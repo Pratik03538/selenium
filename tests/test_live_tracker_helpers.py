@@ -114,6 +114,7 @@ class LegalDestinationArrowTests(unittest.TestCase):
         board = chess.Board()
         board.push_uci("e2e4")
         board.push_uci("d7d5")
+        board.push_uci("e4e5")
         self.assertEqual(
             legal_destination_arrow_uci_moves(board, "e2e4", "white"),
             [],
