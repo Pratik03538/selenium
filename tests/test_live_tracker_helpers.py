@@ -26,6 +26,7 @@ from seleniumbase_live_game_tracker import (
     infer_move_between_fens,
     calculate_top_continuation_uci_moves,
     build_move_coaching_plan,
+    filter_new_coaching_arrows,
     premove_phase_allowed,
     reconstruct_history_from_dom_moves,
     sync_dashboard_history,
@@ -295,6 +296,47 @@ class MoveCoachingPlanTests(unittest.TestCase):
         self.assertEqual(plan["mode"], "none")
         self.assertEqual(plan["arrows"], [])
 
+
+
+
+class CoachingArrowDeduplicationTests(unittest.TestCase):
+    def test_same_arrow_is_not_repeated_after_opponent_reply_while_threat_persists(self):
+        active_arrows = set()
+
+        first_plan = filter_new_coaching_arrows(["d4d8"], active_arrows)
+        self.assertEqual(first_plan, ["d4d8"])
+        # Production records an arrow only after the board renderer drew it.
+        active_arrows.update(first_plan)
+
+        # Opponent's reply clears the board annotation but deliberately does not
+        # call the filter or clear its memory.
+        second_plan = filter_new_coaching_arrows(["d4d8"], active_arrows)
+        self.assertEqual(second_plan, [])
+        self.assertIn("d4d8", active_arrows)
+
+    def test_new_arrow_is_allowed_and_stale_arrow_expires_when_threat_disappears(self):
+        active_arrows = set()
+        first_plan = filter_new_coaching_arrows(["d4d8"], active_arrows)
+        active_arrows.update(first_plan)
+        self.assertEqual(first_plan, ["d4d8"])
+
+        new_plan = filter_new_coaching_arrows(["a4a8"], active_arrows)
+        self.assertEqual(new_plan, ["a4a8"])
+        active_arrows.update(new_plan)
+        self.assertNotIn("d4d8", active_arrows)
+        self.assertIn("a4a8", active_arrows)
+
+    def test_same_arrow_can_return_after_it_was_absent_from_a_bot_move_plan(self):
+        active_arrows = set()
+        first_plan = filter_new_coaching_arrows(["d4d8"], active_arrows)
+        active_arrows.update(first_plan)
+        self.assertEqual(first_plan, ["d4d8"])
+
+        self.assertEqual(filter_new_coaching_arrows([], active_arrows), [])
+        self.assertEqual(active_arrows, set())
+
+        later_plan = filter_new_coaching_arrows(["d4d8"], active_arrows)
+        self.assertEqual(later_plan, ["d4d8"])
 
 
 
