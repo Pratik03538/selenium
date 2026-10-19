@@ -5723,20 +5723,10 @@ def main() -> int:
                                 f"{plan_reason} | {' -> '.join(auto_analysis_arrows)}.",
                                 flush=True,
                             )
-                        elif plan_mode == "new-threat" and auto_analysis_arrows:
+                        elif plan_mode == "threat-highlight" and auto_analysis_highlight_square:
                             print(
-                                f"[COACHING] New threat arrows: {'; '.join(auto_analysis_arrows)}.",
-                                flush=True,
-                            )
-                        elif plan_mode == "controlled-square" and auto_analysis_arrows:
-                            print(
-                                f"[COACHING] One key controlled square: {auto_analysis_arrows[0]}.",
-                                flush=True,
-                            )
-                        elif plan_mode == "capture-highlight" and auto_analysis_highlight_square:
-                            print(
-                                f"[COACHING] Captured target square highlighted: "
-                                f"{auto_analysis_highlight_square}.",
+                                f"[COACHING] One threatened opponent piece highlighted: "
+                                f"{auto_analysis_highlight_square} ({plan_reason}).",
                                 flush=True,
                             )
 
