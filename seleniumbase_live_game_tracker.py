@@ -99,14 +99,14 @@ def _get_visible_cursor_controller(low_clock_mode: bool = False):
     # Stay comfortably inside the tracker's existing input reserve. The clock
     # manager still decides thinking delay; this profile adds no independent wait.
     motion = CursorMotionConfig(
-        approach_duration_s=0.004 if low_clock_mode else 0.018,
-        move_drag_duration_s=0.008 if low_clock_mode else 0.045,
+        approach_duration_s=0.002 if low_clock_mode else 0.012,
+        move_drag_duration_s=0.006 if low_clock_mode else 0.032,
         arrow_drag_duration_s=0.018,
         settle_after_press_s=0.0,
         settle_after_release_s=0.0,
-        min_steps=4 if low_clock_mode else 5,
-        max_steps=4 if low_clock_mode else 12,
-        curve_pixels=0.25 if low_clock_mode else 1.0,
+        min_steps=4,
+        max_steps=4 if low_clock_mode else 8,
+        curve_pixels=0.25 if low_clock_mode else 0.7,
     )
     try:
         if _VISIBLE_CURSOR_CONTROLLER is None:
@@ -3898,7 +3898,7 @@ def _perform_cursor_drag_once(
     confirm_interval_ms = rng.randint(4, 10)
     # A native desktop-cursor gesture can take longer than synthetic CDP input.
     # This timeout is post-action confirmation time, so it does not consume the move's clock.
-    confirmation_timeout_ms = int(120 if low_clock_mode else (450 if allow_premove else 450))
+    confirmation_timeout_ms = int(80 if low_clock_mode else 220)
 
     # Start a page-side watcher before sending mouse input. MutationObserver is
     # immediate; a 4-10ms in-page interval is the fallback for API-only updates.
@@ -7035,9 +7035,7 @@ def main() -> int:
                                         low_clock_mode=low_clock_mode,
                                         elapsed_seconds_before_delay=time.monotonic() - move_cycle_started_at,
                                         submission_reserve_seconds=(
-                                            (0.075 if low_clock_mode else 0.32)
-                                            if args.move_input == "cursor"
-                                            else 0.035
+                                            0.075 if args.move_input == "cursor" else 0.035
                                         ),
                                     )
                                     if natural_delay > 0:
