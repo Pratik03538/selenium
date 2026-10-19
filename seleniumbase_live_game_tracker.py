@@ -2831,6 +2831,26 @@ def calculate_top_continuation_uci_moves(
     return continuation
 
 
+
+def filter_new_coaching_arrows(
+    arrows: list[str],
+    active_arrows: set[str],
+) -> list[str]:
+    """Suppress duplicate arrows while the same danger persists across replies.
+
+    Call this only for a new bot move. An opponent reply should clear the native
+    board annotation but must not clear this memory; the repeated arrow becomes
+    eligible again only after it disappears from a later bot-move plan.
+    """
+    current: list[str] = []
+    for value in arrows:
+        arrow = str(value or "").strip().lower()
+        if re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", arrow) and arrow not in current:
+            current.append(arrow)
+    active_arrows.intersection_update(current)
+    return [arrow for arrow in current if arrow not in active_arrows]
+
+
 def build_move_coaching_plan(
     engine,
     previous_fen: str,
@@ -5350,6 +5370,9 @@ def main() -> int:
         previous_fen = ""
         auto_analysis_arrows: list[str] = []
         auto_analysis_highlight_square: str | None = None
+        # Remember coaching arrows across opponent replies so the same persistent
+        # danger is not repeatedly redrawn after each move.
+        active_coaching_arrows: set[str] = set()
         last_dashboard_eval_fen = ""
         reconstructed_history: list[dict[str, str]] = []
         last_dashboard_history_signature = None
@@ -5758,6 +5781,7 @@ def main() -> int:
                             elif is_start_position(fen) and not is_start_position(previous_fen):
                                 game_number += 1
                                 reconstructed_history = []
+                                active_coaching_arrows.clear()
                                 note = "New game detected; move history reset"
                             elif chess is not None:
                                 note = "Position changed but transition could not be inferred as one legal move"
@@ -5784,14 +5808,15 @@ def main() -> int:
                         coaching_plan: dict[str, object] = {
                             "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
                         }
-                        if (
+                        coaching_from_bot_move = bool(
                             args.auto_play
                             and engine is not None
                             and active_bot_color in {"white", "black"}
                             and isinstance(last_move, dict)
                             and normalize_chess_color(last_move.get("side")) == active_bot_color
                             and position_before_fen
-                        ):
+                        )
+                        if coaching_from_bot_move:
                             try:
                                 analysis_seconds = max(
                                     0.08,
@@ -5815,6 +5840,13 @@ def main() -> int:
                             str(value) for value in (coaching_plan.get("arrows") or [])
                             if isinstance(value, str)
                         ][:5]
+                        if coaching_from_bot_move:
+                            # Keep identical arrows hidden while that same threat is
+                            # continuously present, even across the opponent's reply.
+                            next_coaching_arrows = filter_new_coaching_arrows(
+                                next_coaching_arrows,
+                                active_coaching_arrows,
+                            )
                         next_highlight_square = (
                             str(coaching_plan.get("highlight_square") or "").strip().lower() or None
                         )
@@ -5829,6 +5861,11 @@ def main() -> int:
                                 fen,
                             )
                         )
+                        if coaching_from_bot_move:
+                            active_coaching_arrows.update(
+                                arrow for arrow in next_coaching_arrows
+                                if arrow in auto_analysis_arrows
+                            )
                         plan_mode = str(coaching_plan.get("mode") or "none")
                         plan_reason = str(coaching_plan.get("reason") or "")
                         tactical_queue = [
