@@ -20,7 +20,6 @@ import subprocess
 import zipfile
 import sys
 import threading
-import tempfile
 import time
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -55,21 +54,6 @@ try:
 except ImportError:
     chess = None  # FEN/DOM capture works; reconstruction/autoplay need python-chess.
 
-try:
-    from visible_cursor_controller import (
-        BoardGeometry,
-        CursorMotionConfig,
-        VisibleCursorController,
-        WindowsMouseBackend,
-        read_selenium_board_geometry,
-    )
-except ImportError:
-    BoardGeometry = None
-    CursorMotionConfig = None
-    VisibleCursorController = None
-    WindowsMouseBackend = None
-    read_selenium_board_geometry = None
-
 BASE_DIR = Path(__file__).resolve().parent
 BLOCKED_PLATFORMS_FILE = BASE_DIR / "blocked_platforms.txt"
 # Use a new private log so a prior CSV with raw URLs is not appended to.
@@ -82,49 +66,6 @@ CSV_FIELDS = [
     "legal_move_count", "legal_moves_json", "white_clock",
     "black_clock", "result", "note",
 ]
-
-# Bound the deliberate pauses between a completed bot move and its annotation
-# queue, and between queued right-drag arrows. Preview-cursor travel counts toward
-# the same interval so it does not add a second pause.
-CURSOR_DRAW_GAP_MIN_SECONDS = 0.010
-CURSOR_DRAW_GAP_MAX_SECONDS = 0.030
-
-
-_VISIBLE_CURSOR_CONTROLLER = None
-
-
-def _get_visible_cursor_controller(low_clock_mode: bool = False):
-    """Lazily create the OS-cursor backend and choose a clock-aware gesture profile."""
-    global _VISIBLE_CURSOR_CONTROLLER
-    if (
-        VisibleCursorController is None
-        or WindowsMouseBackend is None
-        or CursorMotionConfig is None
-    ):
-        return None
-    # Stay comfortably inside the tracker's existing input reserve. The clock
-    # manager still decides thinking delay; this profile adds no independent wait.
-    motion = CursorMotionConfig(
-        approach_duration_s=0.002 if low_clock_mode else 0.012,
-        move_drag_duration_s=0.006 if low_clock_mode else 0.032,
-        arrow_drag_duration_s=0.018,
-        settle_after_press_s=0.0,
-        settle_after_release_s=0.0,
-        min_steps=4,
-        max_steps=4 if low_clock_mode else 8,
-        curve_pixels=0.25 if low_clock_mode else 0.7,
-    )
-    try:
-        if _VISIBLE_CURSOR_CONTROLLER is None:
-            _VISIBLE_CURSOR_CONTROLLER = VisibleCursorController(
-                backend=WindowsMouseBackend(),
-                motion=motion,
-            )
-        else:
-            _VISIBLE_CURSOR_CONTROLLER.motion = motion
-        return _VISIBLE_CURSOR_CONTROLLER
-    except Exception:
-        return None
 
 
 def now_utc() -> str:
@@ -143,26 +84,6 @@ def normalize_chess_color(value: object) -> str | None:
     if token in {"black", "b", "dark", "black-side", "black_side"}:
         return "black"
     return None
-
-
-def should_render_post_move_coaching(
-    auto_play: bool,
-    engine_available: bool,
-    bot_color: object,
-    last_move_side: object,
-    current_fen: str,
-    previous_fen: str,
-) -> bool:
-    """Only run coaching after the bot's own completed move, never on its thinking turn."""
-    normalized_bot_color = normalize_chess_color(bot_color)
-    return bool(
-        auto_play
-        and engine_available
-        and normalized_bot_color in {"white", "black"}
-        and normalize_chess_color(last_move_side) == normalized_bot_color
-        and str(current_fen or "").strip()
-        and str(previous_fen or "").strip()
-    )
 
 
 def normalize_api_bot_color(playing_as_color: object, playing_as: object) -> tuple[str | None, bool]:
@@ -434,52 +355,6 @@ def load_optional_txt_setting(setting_key: str) -> str:
 
 
 
-def read_analyzer_autoplay_request(path: Path | None) -> bool | None:
-    """Read the analyzer's atomic mode request; invalid/partial files are ignored."""
-    if path is None:
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    value = payload.get("autoplay_enabled") if isinstance(payload, dict) else None
-    return value if isinstance(value, bool) else None
-
-
-def read_analyzer_move_reference(path: Path | None) -> dict[str, object] | None:
-    """Read one selected SHOW MOVE reference from the analyzer's private IPC file."""
-    if path is None:
-        return None
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-        return None
-    reference = payload.get("move_reference") if isinstance(payload, dict) else None
-    if not isinstance(reference, dict):
-        return None
-    event_id = str(reference.get("event_id") or "").strip()
-    fen = str(reference.get("fen") or "").strip()
-    uci = str(reference.get("uci") or "").strip().lower()
-    if not event_id or not fen or not re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", uci):
-        return None
-    return reference
-
-
-def format_move_reference_label(reference: dict[str, object]) -> str:
-    """Return a compact, human-readable source/rank label for the dashboard."""
-    source = str(reference.get("source") or "CHESSKIDA").strip().upper().replace("_", " ")
-    if not source:
-        source = "CHESSKIDA"
-    try:
-        rank = int(reference.get("rank"))
-        rank_label = f"#{rank + 1}"
-    except (TypeError, ValueError):
-        rank_label = "FREE"
-    if source == "GM BOOK":
-        source = "BOOK"
-    return f"{source} {rank_label}"
-
-
 class RuntimeSettingsWindow:
     """Compact live dashboard and runtime controls for the current run."""
 
@@ -489,7 +364,6 @@ class RuntimeSettingsWindow:
         "auto_rematch": "REMATCH",
         "premove_enabled": "NORMAL PREMOVES",
         "low_clock_extra_premoves": "LAST 7–10s EXTRA PREMOVES",
-        "auto_draw": "AUTO-DRAW",
         "clock_management": "CLOCK-BASED TIME MANAGEMENT",
     }
     BUTTON_LABELS = {
@@ -498,7 +372,6 @@ class RuntimeSettingsWindow:
         "auto_rematch": "REMATCH",
         "premove_enabled": "PREMOVES",
         "low_clock_extra_premoves": "EXTRA PREMOVES · 7–10s",
-        "auto_draw": "AUTO-DRAW",
         "clock_management": "CLOCK MANAGEMENT",
     }
 
@@ -911,20 +784,18 @@ class RuntimeSettingsWindow:
             pass
 
     def _put_move(self, game_number, ply, side, san, rank=None,
-                  eval_white_cp=None, status="Observed", row_suffix=None):
+                  eval_white_cp=None, status="Observed"):
         try:
             game_number = int(game_number)
             ply = int(ply)
         except (TypeError, ValueError):
             return
-        suffix = str(row_suffix or "").strip()
-        key = (game_number, ply, suffix) if suffix else (game_number, ply)
-        iid_suffix = f"_{suffix}" if suffix else ""
+        key = (game_number, ply)
         row = self.move_rows.get(key)
         is_new = row is None
         if is_new:
             row = {
-                "iid": f"game{game_number}_ply{ply}{iid_suffix}",
+                "iid": f"game{game_number}_ply{ply}",
                 "game": game_number,
                 "ply": ply,
                 "side": side or "?",
@@ -963,6 +834,11 @@ class RuntimeSettingsWindow:
         if is_new:
             self.moves_tree.move(iid, "", 0)
 
+        while len(self.move_order) > 200:
+            old_key = self.move_order.pop()
+            old = self.move_rows.pop(old_key, None)
+            if old and self.moves_tree.exists(old["iid"]):
+                self.moves_tree.delete(old["iid"])
 
     def record_selected_move(
         self, game_number, ply, side, san, rank, eval_white_cp=None, status="Selected"
@@ -970,14 +846,6 @@ class RuntimeSettingsWindow:
         self._put_move(
             game_number, ply, side, san, rank=rank,
             eval_white_cp=eval_white_cp, status=status,
-        )
-
-    def record_move_reference(self, game_number, ply, side, san, reference, eval_white_cp=None):
-        """Keep a SHOW MOVE reference beside—not in place of—the actual board move."""
-        self._put_move(
-            game_number, ply, side, san, rank=reference,
-            eval_white_cp=eval_white_cp, status="SHOW MOVE reference",
-            row_suffix="reference",
         )
 
     def record_observed_move(self, game_number, ply, move, eval_white_cp=None):
@@ -2399,30 +2267,6 @@ def reconstruct_history_from_dom_moves(
     return history
 
 
-def sync_dashboard_history(settings_window, game_number: int, history: list[dict[str, str]]) -> int:
-    """Publish every validated on-board ply to the dashboard, regardless of move source."""
-    if settings_window is None or not history:
-        return 0
-    synced = 0
-    for index, item in enumerate(history, start=1):
-        if not isinstance(item, dict):
-            continue
-        try:
-            ply = int(item.get("game_ply") or index)
-        except (TypeError, ValueError):
-            continue
-        try:
-            settings_window.record_observed_move(
-                game_number, ply, item, eval_white_cp=None
-            )
-            synced += 1
-        except Exception:
-            # A single malformed row must not prevent the rest of the game
-            # history from being rendered.
-            continue
-    return synced
-
-
 def format_move_history(history: list[dict[str, str]], limit: int = 16) -> str:
     """Format reconstructed SAN moves for a compact console preview."""
     chunks: list[str] = []
@@ -2654,60 +2498,6 @@ def is_low_clock_mode(
     return bool(force_fast_mode or remaining <= threshold)
 
 
-def auto_draw_suppression_reason(
-    auto_draw_enabled: bool,
-    bot_color: object,
-    current_fen: str,
-    previous_fen: str,
-    white_clock_seconds: float | None,
-    black_clock_seconds: float | None,
-    low_clock_trigger_seconds: float = 10.0,
-    force_fast_mode: bool = False,
-    opening_premove_fullmove_max: int | None = None,
-) -> str:
-    """Explain why native coaching annotations should be skipped for this position."""
-    if not auto_draw_enabled:
-        return "Auto-Draw switch is OFF"
-    normalized_bot_color = normalize_chess_color(bot_color)
-    if normalized_bot_color not in {"white", "black"}:
-        return "bot side is unconfirmed"
-    if force_fast_mode:
-        return "short-time-control fast mode is active"
-    if chess is None:
-        return "python-chess is unavailable"
-    try:
-        current_board = chess.Board(str(current_fen or "").strip())
-        previous_board = chess.Board(str(previous_fen or "").strip())
-    except (ValueError, TypeError, IndexError):
-        return "position FEN is unavailable"
-    try:
-        configured_limit = (
-            PREMOVE_OPENING_FULLMOVE_MAX
-            if opening_premove_fullmove_max is None
-            else int(opening_premove_fullmove_max)
-        )
-        opening_limit = max(
-            PREMOVE_OPENING_FULLMOVE_MIN,
-            min(PREMOVE_OPENING_FULLMOVE_MAX, configured_limit),
-        )
-        # Check both FENs: a Black move increments fullmove_number, but that move
-        # still belongs to the opening window that was in effect before it.
-        if min(current_board.fullmove_number, previous_board.fullmove_number) <= opening_limit:
-            return "opening fast/premove window is active"
-    except (AttributeError, TypeError, ValueError):
-        return "opening phase could not be determined"
-
-    bot_clock = (
-        white_clock_seconds if normalized_bot_color == "white"
-        else black_clock_seconds
-    )
-    if bot_clock is None:
-        return "bot clock is unavailable (fail-safe)"
-    if is_low_clock_mode(bot_clock, low_clock_trigger_seconds):
-        return f"bot low-clock fast mode is active ({float(bot_clock):.2f}s)"
-    return ""
-
-
 def calculate_engine_search_limit(
     base_seconds: float,
     remaining_seconds: float | None,
@@ -2920,970 +2710,15 @@ def _direct_cdp_page_for_driver(driver):
         return None
 
 
-def calculate_top_continuation_uci_moves(
-    engine,
-    board: "chess.Board",
-    max_plies: int = 2,
-    search_seconds: float = 0.08,
-) -> list[str]:
-    """Return at most two moves from Stockfish's best continuation (principal variation).
-
-    Move one is the strongest predicted reply from the current position; move two
-    is the engine follow-up after that hypothetical reply. This is analysis only:
-    no move is submitted and the real game board is never changed.
-    """
-    if chess is None or engine is None or board is None:
-        return []
-    try:
-        if board.is_game_over(claim_draw=True):
-            return []
-        max_plies = max(1, min(2, int(max_plies)))
-        search_seconds = max(0.025, min(0.15, float(search_seconds)))
-        result = engine.analyse(
-            board.copy(stack=True),
-            chess.engine.Limit(time=search_seconds),
-            multipv=1,
-        )
-        info = result[0] if isinstance(result, list) and result else result
-        pv = info.get("pv") if isinstance(info, dict) else None
-    except Exception:
-        return []
-    if not isinstance(pv, (list, tuple)):
-        return []
-
-    probe = board.copy(stack=True)
-    continuation: list[str] = []
-    for move in pv:
-        if len(continuation) >= max_plies:
-            break
-        if move not in probe.legal_moves:
-            break
-        continuation.append(move.uci())
-        probe.push(move)
-        if probe.is_game_over(claim_draw=True):
-            break
-    return continuation
-
-
-
-def filter_new_coaching_arrows(
-    arrows: list[str],
-    shown_arrows: set[str],
-) -> list[str]:
-    """Return valid arrows that have never been shown earlier in this game.
-
-    The shown-arrows set is intentionally sticky: absence from later positions
-    does not remove an arrow from the set. Only a new-game reset clears history.
-    """
-    current: list[str] = []
-    for value in arrows:
-        arrow = str(value or "").strip().lower()
-        if re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", arrow) and arrow not in current:
-            current.append(arrow)
-    return [arrow for arrow in current if arrow not in shown_arrows]
-
-
-def build_move_coaching_plan(
-    engine,
-    previous_fen: str,
-    current_fen: str,
-    move_uci: str,
-    bot_color: str,
-    max_plies: int = 3,
-    search_seconds: float = 0.16,
-) -> dict[str, object]:
-    """Build sparse, GM-style danger arrows and only genuinely forcing lines.
-
-    The PV queue is capped at three plies and is never triggered merely because
-    a move captured a piece or gave a routine check. Danger arrows are limited
-    to the best newly-created target and, when warranted, one hanging bot piece.
-    """
-    empty = {
-        "mode": "none",
-        "arrows": [],
-        "danger_arrows": [],
-        "tactical_queue": [],
-        "highlight_square": None,
-        "reason": "",
-    }
-    if chess is None or not previous_fen or not current_fen:
-        return empty
-    try:
-        before = chess.Board(previous_fen)
-        after = chess.Board(current_fen)
-        move = chess.Move.from_uci(str(move_uci or "").strip().lower())
-        side = normalize_chess_color(bot_color)
-        if side not in {"white", "black"}:
-            return empty
-        bot_turn = chess.WHITE if side == "white" else chess.BLACK
-        if before.turn != bot_turn or move not in before.legal_moves:
-            return empty
-        expected = before.copy(stack=True)
-        expected.push(move)
-        if not _same_chess_position(expected, after):
-            return empty
-        moved_piece = after.piece_at(move.to_square)
-        if moved_piece is None or moved_piece.color != bot_turn:
-            return empty
-        if after.is_game_over(claim_draw=True):
-            return empty
-    except (ValueError, TypeError, IndexError):
-        return empty
-
-    opponent_color = not bot_turn
-    was_capture = before.is_capture(move)
-    captured_piece = before.piece_at(move.to_square)
-    if before.is_en_passant(move):
-        captured_square = (
-            move.to_square - 8 if bot_turn == chess.WHITE
-            else move.to_square + 8
-        )
-        captured_piece = before.piece_at(captured_square)
-
-    piece_values = {
-        chess.PAWN: 1,
-        chess.KNIGHT: 3,
-        chess.BISHOP: 3,
-        chess.ROOK: 5,
-        chess.QUEEN: 9,
-        chess.KING: 100,
-    }
-
-    # A PV is analysis only. It is capped at three plies and used for a queue
-    # only after a forcing-move gate below approves the position.
-    max_plies = max(1, min(3, int(max_plies)))
-    search_seconds = max(0.05, min(0.30, float(search_seconds)))
-    pv_uci: list[str] = []
-    has_forced_mate = False
-    first_reply_recaptures = False
-    score_text = ""
-    if engine is not None:
-        try:
-            info_result = engine.analyse(
-                after.copy(stack=True),
-                chess.engine.Limit(time=search_seconds),
-                multipv=1,
-            )
-            info = info_result[0] if isinstance(info_result, list) and info_result else info_result
-            if isinstance(info, dict):
-                score = info.get("score")
-                if score is not None:
-                    try:
-                        bot_score = score.pov(bot_turn) if callable(getattr(score, "pov", None)) else score
-                        score_text = str(bot_score)
-                        if callable(getattr(bot_score, "is_mate", None)) and bot_score.is_mate():
-                            mate_distance = bot_score.mate()
-                            has_forced_mate = mate_distance is not None and mate_distance > 0
-                    except Exception:
-                        score_text = ""
-                        has_forced_mate = False
-
-                pv = info.get("pv")
-                if isinstance(pv, (list, tuple)):
-                    probe = after.copy(stack=True)
-                    for candidate in pv:
-                        if len(pv_uci) >= max_plies or candidate not in probe.legal_moves:
-                            break
-                        if not pv_uci:
-                            first_reply_recaptures = (
-                                was_capture
-                                and candidate.to_square == move.to_square
-                                and probe.is_capture(candidate)
-                            )
-                        pv_uci.append(candidate.uci())
-                        probe.push(candidate)
-                        if probe.is_game_over(claim_draw=True):
-                            break
-        except Exception:
-            pv_uci = []
-            has_forced_mate = False
-            first_reply_recaptures = False
-            score_text = ""
-
-    # A routine check is not enough. Only queue checks with very few legal
-    # replies; forced mate, promotion and a meaningful, confirmed recapture are
-    # separate high-confidence tactical triggers.
-    forcing_check = False
-    if after.is_check():
-        try:
-            forcing_check = sum(1 for _ in after.legal_moves) <= 2
-        except Exception:
-            forcing_check = False
-
-    immediate_recapture = False
-    try:
-        immediate_recapture = any(
-            reply.to_square == move.to_square and after.is_capture(reply)
-            for reply in after.legal_moves
-        )
-    except Exception:
-        immediate_recapture = False
-    recapture_queue = bool(
-        was_capture
-        and immediate_recapture
-        and first_reply_recaptures
-        and captured_piece is not None
-        and captured_piece.piece_type in {
-            chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN
-        }
-    )
-    promotion_queue = move.promotion is not None
-    queue_triggered = bool(
-        has_forced_mate or forcing_check or recapture_queue or promotion_queue
-    )
-    tactical_queue = pv_uci[:max_plies] if queue_triggered else []
-
-    # Collect meaningful attacks against opponent material. Prefer newly-created
-    # attacks and higher-value targets, but include an existing unresolved attack
-    # as well so the coaching can show more than one concrete danger.
-    enemy_threats: list[tuple[int, str, str]] = []
-    try:
-        for target_square, target_piece in after.piece_map().items():
-            if target_piece.color != opponent_color:
-                continue
-            if target_piece.piece_type in {chess.PAWN, chess.KING}:
-                continue
-            attackers = set(after.attackers(bot_turn, target_square))
-            if not attackers:
-                continue
-            old_attackers = set(before.attackers(bot_turn, target_square))
-            new_attackers = attackers - old_attackers
-            candidates = new_attackers or attackers
-            attacker_squares = [
-                square for square in candidates
-                if after.piece_at(square) is not None
-                and after.piece_at(square).color == bot_turn
-            ]
-            if not attacker_squares:
-                continue
-            attacker_square = min(
-                attacker_squares,
-                key=lambda square: piece_values.get(after.piece_at(square).piece_type, 0),
-            )
-            attacker_piece = after.piece_at(attacker_square)
-            if attacker_piece is None:
-                continue
-            attacker_value = piece_values.get(attacker_piece.piece_type, 0)
-            target_value = piece_values.get(target_piece.piece_type, 0)
-            defenders = after.attackers(opponent_color, target_square)
-            # Avoid noise when an adequately defended lower-value target is
-            # attacked by our more valuable piece, unless the attack is new.
-            if target_value < attacker_value and defenders and not new_attackers:
-                continue
-            priority = (
-                target_value * 20
-                - attacker_value * 2
-                + (12 if not defenders else 0)
-                + (10 if new_attackers else 0)
-            )
-            arrow = chess.square_name(attacker_square) + chess.square_name(target_square)
-            label = (
-                f"opponent {chess.piece_name(target_piece.piece_type)} "
-                f"at {chess.square_name(target_square)}"
-            )
-            enemy_threats.append((priority, arrow, label))
-    except Exception:
-        enemy_threats = []
-    enemy_threats.sort(reverse=True)
-
-    # Prefer one clear risk to our own valuable material as a secondary warning.
-    own_piece_risks: list[tuple[int, str, str]] = []
-    try:
-        best_reply_uci = pv_uci[0] if pv_uci else ""
-        for reply in after.legal_moves:
-            if not after.is_capture(reply):
-                continue
-            victim = after.piece_at(reply.to_square)
-            attacker = after.piece_at(reply.from_square)
-            if (
-                victim is None
-                or attacker is None
-                or victim.color != bot_turn
-                or victim.piece_type in {chess.PAWN, chess.KING}
-            ):
-                continue
-            victim_value = piece_values.get(victim.piece_type, 0)
-            attacker_value = piece_values.get(attacker.piece_type, 0)
-            defenders = after.attackers(bot_turn, reply.to_square)
-            is_engine_choice = reply.uci() == best_reply_uci
-            clear_material_risk = (
-                victim_value > attacker_value
-                or (not defenders and victim_value >= 3)
-            )
-            if not is_engine_choice and not clear_material_risk:
-                continue
-
-            priority = victim_value * 10 - attacker_value * 2
-            if not defenders:
-                priority += 8
-            if is_engine_choice:
-                priority += 30
-            arrow = reply.uci()
-            label = (
-                f"our {chess.piece_name(victim.piece_type)} "
-                f"at {chess.square_name(reply.to_square)} can be captured"
-            )
-            own_piece_risks.append((priority, arrow, label))
-    except Exception:
-        own_piece_risks = []
-    own_piece_risks.sort(reverse=True)
-
-    # More opponent dangers than own-piece warnings: up to three enemy arrows
-    # and one own-risk arrow in quiet positions.
-    enemy_danger_arrows: list[str] = []
-    reasons: list[str] = []
-    for _, arrow, label in enemy_threats:
-        if arrow not in enemy_danger_arrows:
-            enemy_danger_arrows.append(arrow)
-            reasons.append(f"{label} is under threat")
-        if len(enemy_danger_arrows) >= 3:
-            break
-    own_danger_arrows: list[str] = []
-    if own_piece_risks:
-        _, own_arrow, own_label = own_piece_risks[0]
-        if own_arrow not in enemy_danger_arrows:
-            own_danger_arrows.append(own_arrow)
-            reasons.append(own_label)
-
-    if tactical_queue:
-        # Keep the tactical sequence visible and reserve up to two slots for
-        # opponent danger arrows first; show own risk only if no enemy target exists.
-        selected_dangers = enemy_danger_arrows[:2]
-        if not selected_dangers and own_danger_arrows:
-            selected_dangers = own_danger_arrows[:1]
-        combined_arrows: list[str] = []
-        for arrow in selected_dangers + tactical_queue[:3]:
-            if arrow not in combined_arrows and len(combined_arrows) < 5:
-                combined_arrows.append(arrow)
-        queue_reason = (
-            "forced mate" if has_forced_mate else
-            "forcing check" if forcing_check else
-            "recapture sequence" if recapture_queue else
-            "promotion"
-        )
-        return {
-            "mode": "tactical-queue",
-            "arrows": combined_arrows,
-            "danger_arrows": selected_dangers,
-            "tactical_queue": tactical_queue[:3],
-            "highlight_square": None,
-            "reason": "; ".join([queue_reason] + reasons),
-            "score": score_text,
-        }
-
-    danger_arrows = enemy_danger_arrows[:3] + own_danger_arrows[:1]
-    if danger_arrows:
-        return {
-            "mode": "threat-arrows",
-            "arrows": danger_arrows[:4],
-            "danger_arrows": danger_arrows[:4],
-            "tactical_queue": [],
-            "highlight_square": None,
-            "reason": "; ".join(reasons),
-            "score": score_text,
-        }
-    return empty
-
-
-def build_current_position_danger_plan(
-    current_fen: str,
-    bot_color: str,
-    engine=None,
-    search_seconds: float = 0.08,
-) -> dict[str, object]:
-    """Re-analyse current board after the opponent replies and report current risks.
-
-    This deliberately creates no continuation queue. It recalculates attacks and
-    loose material from the latest FEN, so arrows describe the new position rather
-    than replaying a previous move's coaching plan.
-    """
-    empty = {
-        "mode": "none",
-        "arrows": [],
-        "danger_arrows": [],
-        "tactical_queue": [],
-        "highlight_square": None,
-        "reason": "",
-    }
-    if chess is None or not current_fen:
-        return empty
-    try:
-        board = chess.Board(current_fen)
-        side = normalize_chess_color(bot_color)
-        if side not in {"white", "black"}:
-            return empty
-        bot_turn = chess.WHITE if side == "white" else chess.BLACK
-        opponent_color = not bot_turn
-        if board.is_game_over(claim_draw=True) or board.turn != bot_turn:
-            return empty
-    except (ValueError, TypeError, IndexError):
-        return empty
-
-    values = {
-        chess.PAWN: 1,
-        chess.KNIGHT: 3,
-        chess.BISHOP: 3,
-        chess.ROOK: 5,
-        chess.QUEEN: 9,
-        chess.KING: 100,
-    }
-
-    # Run a fresh, bounded evaluation on this exact post-reply board state.
-    engine_pv: list[chess.Move] = []
-    score_text = ""
-    if engine is not None:
-        try:
-            result = engine.analyse(
-                board.copy(stack=True),
-                chess.engine.Limit(time=max(0.03, min(0.15, float(search_seconds)))),
-                multipv=1,
-            )
-            info = result[0] if isinstance(result, list) and result else result
-            if isinstance(info, dict):
-                score = info.get("score")
-                if score is not None:
-                    try:
-                        score_text = str(score.pov(bot_turn))
-                    except Exception:
-                        score_text = str(score)
-                pv = info.get("pv")
-                if isinstance(pv, (list, tuple)):
-                    probe = board.copy(stack=True)
-                    for candidate in pv[:2]:
-                        if candidate not in probe.legal_moves:
-                            break
-                        engine_pv.append(candidate)
-                        probe.push(candidate)
-        except Exception:
-            engine_pv = []
-
-    # Opponent targets are the priority: valuable pieces attacked by our pieces,
-    # especially those without an adequate defence, are shown first.
-    enemy_targets: list[tuple[int, str, str]] = []
-    for target_square, target_piece in board.piece_map().items():
-        if target_piece.color != opponent_color:
-            continue
-        if target_piece.piece_type not in {chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN}:
-            continue
-        attackers = list(board.attackers(bot_turn, target_square))
-        if not attackers:
-            continue
-        target_value = values.get(target_piece.piece_type, 0)
-        defenders = list(board.attackers(opponent_color, target_square))
-        attacker_squares = sorted(
-            attackers, key=lambda sq: values.get(board.piece_at(sq).piece_type, 0)
-        )
-        attacker_square = attacker_squares[0]
-        attacker_piece = board.piece_at(attacker_square)
-        if attacker_piece is None:
-            continue
-        attacker_value = values.get(attacker_piece.piece_type, 0)
-        if target_value < attacker_value and defenders:
-            continue
-        priority = target_value * 20 - attacker_value * 2 + (15 if not defenders else 0)
-        arrow = chess.square_name(attacker_square) + chess.square_name(target_square)
-        label = (
-            f"opponent {chess.piece_name(target_piece.piece_type)} "
-            f"on {chess.square_name(target_square)} is threatened"
-        )
-        enemy_targets.append((priority, arrow, label))
-    enemy_targets.sort(reverse=True)
-
-    # Show a single high-confidence warning if our own valuable piece is loose
-    # or attacked by a cheaper opponent piece; don't annotate every defended pawn.
-    own_risks: list[tuple[int, str, str]] = []
-    for target_square, target_piece in board.piece_map().items():
-        if target_piece.color != bot_turn:
-            continue
-        if target_piece.piece_type not in {chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN}:
-            continue
-        attackers = list(board.attackers(opponent_color, target_square))
-        if not attackers:
-            continue
-        victim_value = values.get(target_piece.piece_type, 0)
-        defenders = list(board.attackers(bot_turn, target_square))
-        attacker_squares = sorted(
-            attackers, key=lambda sq: values.get(board.piece_at(sq).piece_type, 0)
-        )
-        attacker_square = attacker_squares[0]
-        attacker_piece = board.piece_at(attacker_square)
-        if attacker_piece is None:
-            continue
-        attacker_value = values.get(attacker_piece.piece_type, 0)
-        if victim_value <= attacker_value and defenders and len(defenders) >= len(attackers):
-            continue
-        priority = victim_value * 10 - attacker_value * 2 + (10 if not defenders else 0)
-        arrow = chess.square_name(attacker_square) + chess.square_name(target_square)
-        label = (
-            f"our {chess.piece_name(target_piece.piece_type)} "
-            f"on {chess.square_name(target_square)} is at risk"
-        )
-        own_risks.append((priority, arrow, label))
-    own_risks.sort(reverse=True)
-
-    danger_arrows: list[str] = []
-    reasons: list[str] = []
-    for _, arrow, label in enemy_targets:
-        if arrow not in danger_arrows:
-            danger_arrows.append(arrow)
-            reasons.append(label)
-        if len(danger_arrows) >= 3:
-            break
-    if own_risks:
-        _, own_arrow, own_label = own_risks[0]
-        if own_arrow not in danger_arrows:
-            danger_arrows.append(own_arrow)
-            reasons.append(own_label)
-
-    if not danger_arrows:
-        return {**empty, "score": score_text}
-    return {
-        "mode": "threat-arrows",
-        "arrows": danger_arrows[:4],
-        "danger_arrows": danger_arrows[:4],
-        "tactical_queue": [],
-        "highlight_square": None,
-        "reason": "; ".join(reasons),
-        "score": score_text,
-    }
-
-
-def _read_board_annotation_geometry(driver, board_selector: str) -> dict[str, object] | None:
-    """Read visible board geometry and orientation for native right-click arrows."""
-    script = r"""
-const requested = String(arguments[0] || '').trim();
-const state = window.__liveGameApiReader?.current?.() || {};
-const selectors = Array.from(new Set([
-  requested, 'wc-chess-board', 'chess-board', '#board-single'
-].filter(Boolean)));
-const roots = [document];
-const visited = new Set();
-let found = null;
-while (roots.length) {
-  const root = roots.shift();
-  if (!root || visited.has(root)) continue;
-  visited.add(root);
-  for (const selector of selectors) {
-    try {
-      for (const candidate of root.querySelectorAll(selector)) {
-        const rect = candidate.getBoundingClientRect();
-        if (rect.width > 8 && rect.height > 8) {
-          found = candidate;
-          break;
-        }
-      }
-    } catch (_) {}
-    if (found) break;
-  }
-  if (found) break;
-  try {
-    for (const element of root.querySelectorAll('*')) {
-      if (element.shadowRoot && !visited.has(element.shadowRoot)) roots.push(element.shadowRoot);
-    }
-  } catch (_) {}
-}
-if (!found) return {ok:false, reason:'board-not-found'};
-const rect = found.getBoundingClientRect();
-let side = String(state.bottomSide || '').trim().toLowerCase();
-if (side !== 'white' && side !== 'black') {
-  let node = found;
-  for (let depth = 0; node && depth < 6; depth++) {
-    for (const attr of ['data-orientation','data-board-orientation','orientation']) {
-      const value = String(node.getAttribute?.(attr) || '').trim().toLowerCase();
-      if (value === 'white' || value === 'black') side = value;
-    }
-    if (side === 'white' || side === 'black') break;
-    const classes = String(node.className?.baseVal || node.className || '').toLowerCase().split(/\s+/);
-    if (classes.some(v => ['flipped','orientation-black','black-bottom'].includes(v))) side = 'black';
-    else if (classes.some(v => ['orientation-white','white-bottom'].includes(v))) side = 'white';
-    if (side === 'white' || side === 'black') break;
-    node = node.parentElement || node.getRootNode?.().host || null;
-  }
-}
-if (side !== 'white' && side !== 'black') {
-  const coordinateRoots = [found, found.shadowRoot].filter(Boolean);
-  for (const root of coordinateRoots) {
-    try {
-      for (const el of root.querySelectorAll('.coordinates')) {
-        let y1 = null, y8 = null;
-        for (const child of Array.from(el.children || [])) {
-          const label = String(child.innerText || child.textContent || '').trim();
-          if (label !== '1' && label !== '8') continue;
-          const itemRect = child.getBoundingClientRect?.();
-          if (!itemRect || !itemRect.width || !itemRect.height) continue;
-          const y = itemRect.top + itemRect.height / 2;
-          if (label === '1') y1 = y;
-          if (label === '8') y8 = y;
-        }
-        if (y1 !== null && y8 !== null && Math.abs(y1 - y8) > 20) {
-          side = y1 > y8 ? 'white' : 'black';
-          break;
-        }
-      }
-    } catch (_) {}
-    if (side === 'white' || side === 'black') break;
-  }
-}
-const dpr = Number(window.devicePixelRatio || 1);
-return {
-  ok: rect.width > 8 && rect.height > 8 && Math.abs(rect.width - rect.height) <= Math.max(8, rect.width * 0.08)
-      && (side === 'white' || side === 'black'),
-  reason: (side === 'white' || side === 'black') ? 'invalid-board-geometry' : 'board-orientation-unknown',
-  left: rect.left, top: rect.top, width: rect.width, height: rect.height, bottomSide: side,
-  fen: String(state.fen || ''),
-  screenLeft: (Number(window.screenX || 0) + Number(rect.left)) * dpr,
-  screenTop: (Number(window.screenY || 0) + Number(window.outerHeight || window.innerHeight)
-      - Number(window.innerHeight) + Number(rect.top)) * dpr,
-  screenWidth: Number(rect.width) * dpr,
-  screenHeight: Number(rect.height) * dpr,
-  windowTitle: String(document.title || '')
-};
-"""
-    try:
-        result = driver.execute_script(script, str(board_selector or ""))
-    except Exception:
-        return None
-    if not isinstance(result, dict) or not result.get("ok"):
-        return None
-    try:
-        geometry = {
-            "left": float(result["left"]),
-            "top": float(result["top"]),
-            "width": float(result["width"]),
-            "height": float(result["height"]),
-            "bottom_side": str(result["bottomSide"]),
-            "fen": str(result.get("fen") or ""),
-            "screen_left": float(result["screenLeft"]) if result.get("screenLeft") is not None else None,
-            "screen_top": float(result["screenTop"]) if result.get("screenTop") is not None else None,
-            "screen_width": float(result["screenWidth"]) if result.get("screenWidth") is not None else None,
-            "screen_height": float(result["screenHeight"]) if result.get("screenHeight") is not None else None,
-            "window_title": str(result.get("windowTitle") or ""),
-        }
-    except (KeyError, TypeError, ValueError):
-        return None
-    if geometry["bottom_side"] not in {"white", "black"}:
-        return None
-    return geometry
-
-
-def _toggle_native_annotation_arrow(cdp, uci: str, geometry: dict[str, object]) -> bool:
-    """Toggle one native board annotation arrow using right-button input."""
-    text = str(uci or "").strip().lower()
-    if chess is None or not re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", text):
-        return False
-    try:
-        left = float(geometry["left"])
-        top = float(geometry["top"])
-        width = float(geometry["width"])
-        height = float(geometry["height"])
-        bottom_side = str(geometry["bottom_side"])
-    except (KeyError, TypeError, ValueError):
-        return False
-    if width <= 0 or height <= 0 or bottom_side not in {"white", "black"}:
-        return False
-
-    def square_point(square: str) -> tuple[float, float]:
-        file_index = ord(square[0]) - ord("a")
-        rank_number = int(square[1])
-        board_file = file_index if bottom_side == "white" else 7 - file_index
-        board_row = 8 - rank_number if bottom_side == "white" else rank_number - 1
-        return (
-            left + (board_file + 0.5) * width / 8.0,
-            top + (board_row + 0.5) * height / 8.0,
-        )
-
-    sx, sy = square_point(text[:2])
-    dx, dy = square_point(text[2:4])
-    mx, my = (sx + dx) / 2.0, (sy + dy) / 2.0
-    command_ids: set[int] = set()
-    try:
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseMoved", "x": sx, "y": sy,
-            "button": "none", "buttons": 0, "pointerType": "mouse",
-        }))
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mousePressed", "x": sx, "y": sy,
-            "button": "right", "buttons": 2, "clickCount": 1,
-            "pointerType": "mouse",
-        }))
-        time.sleep(0.004)
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseMoved", "x": mx, "y": my,
-            "button": "right", "buttons": 2, "pointerType": "mouse",
-        }))
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseMoved", "x": dx, "y": dy,
-            "button": "right", "buttons": 2, "pointerType": "mouse",
-        }))
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseReleased", "x": dx, "y": dy,
-            "button": "right", "buttons": 0, "clickCount": 1,
-            "pointerType": "mouse",
-        }))
-        try:
-            cdp.wait_for(command_ids, timeout=1.0)
-        except Exception:
-            # The gesture events were already dispatched. A late acknowledgement
-            # must not leave this old arrow pending for a later move.
-            pass
-        return True
-    except Exception:
-        try:
-            cdp.send("Input.dispatchMouseEvent", {
-                "type": "mouseReleased", "button": "right",
-                "buttons": 0, "pointerType": "mouse",
-            })
-        except Exception:
-            pass
-        return False
-
-
-def _toggle_native_annotation_square(cdp, square: str, geometry: dict[str, object]) -> bool:
-    """Toggle a native single-square highlight with the board's right-click gesture."""
-    text = str(square or "").strip().lower()
-    if not re.fullmatch(r"[a-h][1-8]", text):
-        return False
-    try:
-        left = float(geometry["left"])
-        top = float(geometry["top"])
-        width = float(geometry["width"])
-        height = float(geometry["height"])
-        bottom_side = str(geometry["bottom_side"])
-    except (KeyError, TypeError, ValueError):
-        return False
-    if width <= 0 or height <= 0 or bottom_side not in {"white", "black"}:
-        return False
-    file_index = ord(text[0]) - ord("a")
-    rank_number = int(text[1])
-    board_file = file_index if bottom_side == "white" else 7 - file_index
-    board_row = 8 - rank_number if bottom_side == "white" else rank_number - 1
-    x = left + (board_file + 0.5) * width / 8.0
-    y = top + (board_row + 0.5) * height / 8.0
-    command_ids: set[int] = set()
-    try:
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseMoved", "x": x, "y": y,
-            "button": "none", "buttons": 0, "pointerType": "mouse",
-        }))
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mousePressed", "x": x, "y": y,
-            "button": "right", "buttons": 2, "clickCount": 1,
-            "pointerType": "mouse",
-        }))
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
-            "type": "mouseReleased", "x": x, "y": y,
-            "button": "right", "buttons": 0, "clickCount": 1,
-            "pointerType": "mouse",
-        }))
-        cdp.wait_for(command_ids, timeout=1.0)
-        return True
-    except Exception:
-        try:
-            cdp.send("Input.dispatchMouseEvent", {
-                "type": "mouseReleased", "button": "right",
-                "buttons": 0, "pointerType": "mouse",
-            })
-        except Exception:
-            pass
-        return False
-
-
-def _replace_native_coaching_annotations(
-    driver,
-    board_selector: str,
-    previous_arrows: list[str],
-    previous_highlight: str | None,
-    next_arrows: list[str],
-    next_highlight: str | None,
-    expected_fen: str,
-    *,
-    use_visible_cursor: bool = False,
-    game_id: int | str = 1,
-    auto_draw_enabled: bool = True,
-    bot_color: str | None = None,
-    white_clock_seconds: float | None = None,
-    black_clock_seconds: float | None = None,
-    low_clock_trigger_seconds: float = 10.0,
-    opening_fast_mode: bool = False,
-    fast_mode: bool = False,
-) -> tuple[list[str], str | None]:
-    """Draw only fresh annotations; optionally use actual desktop right-click gestures.
-
-    The board clears native annotations on a move. Never toggle old routes here,
-    because a right-drag would recreate them instead of clearing them.
-    """
-    cdp = _direct_cdp_page_for_driver(driver)
-    geometry = _read_board_annotation_geometry(driver, board_selector)
-    if geometry is None or cdp is None:
-        return [], None
-
-    try:
-        cdp.evaluate(
-            "(() => { if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = true; return true; })()"
-        )
-    except Exception:
-        pass
-
-    drawn: list[str] = []
-    kept_highlight: str | None = None
-    try:
-        current_fen = str(geometry.get("fen") or "").strip()
-        if not current_fen:
-            try:
-                current_fen = str(cdp.evaluate(
-                    "(() => String(window.__liveGameApiReader?.current?.()?.fen || ''))()"
-                ) or "").strip()
-            except Exception:
-                current_fen = ""
-
-        position_matches = False
-        if expected_fen and current_fen and chess is not None:
-            try:
-                position_matches = _same_chess_position(
-                    chess.Board(expected_fen), chess.Board(current_fen)
-                )
-            except (ValueError, IndexError):
-                position_matches = False
-
-        if position_matches and use_visible_cursor:
-            controller = _get_visible_cursor_controller(low_clock_mode=False)
-            current_side = normalize_chess_color(bot_color)
-            bot_clock = (
-                white_clock_seconds if current_side == "white"
-                else black_clock_seconds if current_side == "black"
-                else None
-            )
-            try:
-                if all(
-                    geometry.get(key) is not None
-                    for key in ("screen_left", "screen_top", "screen_width", "screen_height")
-                ):
-                    screen_geometry = BoardGeometry(
-                        left=float(geometry["screen_left"]),
-                        top=float(geometry["screen_top"]),
-                        width=float(geometry["screen_width"]),
-                        height=float(geometry["screen_height"]),
-                        bottom_side=str(geometry["bottom_side"]),
-                    ) if BoardGeometry is not None else None
-                else:
-                    # Compatibility fallback for older geometry readers/tests.
-                    screen_geometry = (
-                        read_selenium_board_geometry(
-                            driver, board_selector, str(geometry["bottom_side"])
-                        )
-                        if read_selenium_board_geometry is not None
-                        else None
-                    )
-                window_title = str(geometry.get("window_title") or "").strip()
-            except Exception:
-                screen_geometry = None
-                window_title = ""
-            if controller is not None and screen_geometry is not None and window_title:
-                current_fen_reader = lambda: str(cdp.evaluate(
-                    "(() => String(window.__liveGameApiReader?.current?.()?.fen || ''))()"
-                ) or "").strip()
-                focus_guard = lambda: controller.backend.foreground_title_contains(window_title)
-
-                routes = [
-                    str(value or "").strip().lower()
-                    for value in next_arrows[:5]
-                    if re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", str(value or "").strip().lower())
-                ]
-
-                def preview_cursor(max_moves: int) -> float:
-                    # Pointer-only movement; no clicks, no engine calls, no extra FEN read.
-                    try:
-                        result = controller.preview_legal_moves(
-                            current_fen,
-                            geometry=screen_geometry,
-                            focus_guard=focus_guard,
-                            max_moves=max_moves,
-                            position_prevalidated=True,
-                        )
-                        return max(0.0, float(result.duration_s))
-                    except Exception:
-                        return 0.0
-
-                if routes or next_highlight:
-                    # Keep the post-move pause tiny and bounded, not another thinking delay.
-                    time.sleep(random.uniform(CURSOR_DRAW_GAP_MIN_SECONDS, CURSOR_DRAW_GAP_MAX_SECONDS))
-
-                for route_index, route in enumerate(routes):
-                    result = controller.draw_arrow(
-                        route[:2],
-                        route[2:4],
-                        expected_fen=expected_fen,
-                        current_fen_reader=current_fen_reader,
-                        geometry=screen_geometry,
-                        game_id=game_id,
-                        focus_guard=focus_guard,
-                        auto_draw_enabled=bool(auto_draw_enabled),
-                        opening_fast_mode=bool(opening_fast_mode),
-                        fast_mode=bool(fast_mode),
-                        bot_clock_seconds=bot_clock,
-                        low_clock_trigger_seconds=low_clock_trigger_seconds,
-                        position_prevalidated=True,
-                    )
-                    if result.ok:
-                        drawn.append(route)
-                        if route_index < len(routes) - 1 or next_highlight:
-                            # Leave the arrow endpoint, preview one possible next move,
-                            # then use a short random gap before the next queued annotation.
-                            target_gap_s = random.uniform(CURSOR_DRAW_GAP_MIN_SECONDS, CURSOR_DRAW_GAP_MAX_SECONDS)
-                            preview_elapsed_s = preview_cursor(max_moves=1)
-                            remaining_gap_s = max(0.0, target_gap_s - preview_elapsed_s)
-                            if remaining_gap_s:
-                                time.sleep(remaining_gap_s)
-
-                if next_highlight:
-                    highlight_result = controller.draw_highlight(
-                        next_highlight,
-                        expected_fen=expected_fen,
-                        current_fen_reader=current_fen_reader,
-                        geometry=screen_geometry,
-                        focus_guard=focus_guard,
-                        auto_draw_enabled=bool(auto_draw_enabled),
-                        opening_fast_mode=bool(opening_fast_mode),
-                        fast_mode=bool(fast_mode),
-                        bot_clock_seconds=bot_clock,
-                        low_clock_trigger_seconds=low_clock_trigger_seconds,
-                        position_prevalidated=True,
-                    )
-                    if highlight_result.ok:
-                        kept_highlight = next_highlight
-                        preview_cursor(max_moves=2)
-                elif drawn:
-                    # After the final arrow, glide over one or two legal next-move
-                    # routes without pressing a mouse button.
-                    preview_cursor(max_moves=2)
-        elif position_matches:
-            for arrow in next_arrows[:5]:
-                if _toggle_native_annotation_arrow(cdp, arrow, geometry):
-                    drawn.append(arrow)
-            if next_highlight and _toggle_native_annotation_square(
-                cdp, next_highlight, geometry
-            ):
-                kept_highlight = next_highlight
-    finally:
-        try:
-            cdp.evaluate(
-                "(() => { if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = false; return true; })()"
-            )
-        except Exception:
-            pass
-    return drawn, kept_highlight
-
-
-
 def _perform_cursor_drag_once(
     driver, uci: str, expected_fen: str, expected_color: str | None,
     allow_premove: bool = False, low_clock_mode: bool = False,
 ) -> dict[str, object]:
-    """Move the real Windows desktop cursor and confirm the action in the page.
+    """Dispatch short multi-waypoint input over CDP and confirm inside the page.
 
-    The site-owned dragTarget() guard validates the requested route first. The
-    visible cursor controller then uses native OS pointer input, while the existing
-    page-side watcher confirms that a move landed or a premove was queued.
+    Browser-side input and confirmation avoid repeated ChromeDriver round-trips.
+    Requested millisecond timings are best-effort; OS scheduling and page event
+    processing can still make measured end-to-end latency longer.
     """
     cdp = _direct_cdp_page_for_driver(driver)
     if cdp is None:
@@ -3901,12 +2736,7 @@ def _perform_cursor_drag_once(
             "const t = api.dragTarget(a[0],a[1],a[2],a[3]); "
             "if (!t || !t.ok) return t || {ok:false,reason:'invalid-drag-target'}; "
             "const r = t.boardElement.getBoundingClientRect(); "
-            "const dpr = Number(window.devicePixelRatio || 1); "
-            "const screenLeft = (Number(window.screenX || 0) + Number(r.left)) * dpr; "
-            "const screenTop = (Number(window.screenY || 0) + Number(window.outerHeight || window.innerHeight) "
-            "- Number(window.innerHeight) + Number(r.top)) * dpr; "
-            "return {ok:true,width:r.width,height:r.height,left:r.left,top:r.top,bottomSide:t.bottomSide, "
-            "screenLeft,screenTop,screenWidth:r.width*dpr,screenHeight:r.height*dpr,windowTitle:String(document.title||'')}; })()"
+            "return {ok:true,width:r.width,height:r.height,left:r.left,top:r.top,bottomSide:t.bottomSide}; })()"
         )
         target = cdp.evaluate(target_expression, timeout=0.8)
     except Exception:
@@ -3932,13 +2762,57 @@ def _perform_cursor_drag_once(
         return {"ok": False, "reason": "invalid-board-geometry"}
 
     rng = random.SystemRandom()
-    pre_delay_ms = 0
-    waypoint_count = 4 if low_clock_mode else 12
-    total_drag_ms = 0
+    square_w = width / 8.0
+    square_h = height / 8.0
+
+    def square_point(square: str) -> tuple[float, float]:
+        file_index = ord(square[0]) - ord("a")
+        rank_number = int(square[1])
+        if bottom_side == "white":
+            col, row = file_index, 8 - rank_number
+        else:
+            col, row = 7 - file_index, rank_number - 1
+        return (
+            (col + 0.5 + rng.uniform(-0.22, 0.22)) * square_w,
+            (row + 0.5 + rng.uniform(-0.22, 0.22)) * square_h,
+        )
+
+    sx, sy = square_point(text[:2])
+    dx, dy = square_point(text[2:4])
+    vx, vy = dx - sx, dy - sy
+    distance = max(1.0, (vx * vx + vy * vy) ** 0.5)
+    normal_x, normal_y = -vy / distance, vx / distance
+    curve_size = rng.uniform(0.035, 0.085) * min(width, height) * rng.choice((-1.0, 1.0))
+    control_x = min(max(2.0, (sx + dx) / 2.0 + normal_x * curve_size), width - 2.0)
+    control_y = min(max(2.0, (sy + dy) / 2.0 + normal_y * curve_size), height - 2.0)
+
+    total_drag_ms = rng.randint(3, 30)
+    waypoint_count = min(rng.randint(2, 4), total_drag_ms)
+    segment_durations = [1] * waypoint_count
+    remaining_drag_ms = total_drag_ms - waypoint_count
+    while remaining_drag_ms > 0:
+        segment_durations[rng.randrange(waypoint_count)] += 1
+        remaining_drag_ms -= 1
+
+    path_points: list[tuple[float, float]] = []
+    for index in range(1, waypoint_count + 1):
+        t = index / waypoint_count
+        omt = 1.0 - t
+        px = omt * omt * sx + 2.0 * omt * t * control_x + t * t * dx
+        py = omt * omt * sy + 2.0 * omt * t * control_y + t * t * dy
+        if index < waypoint_count:
+            px = min(max(2.0, px + rng.uniform(-2.0, 2.0)), width - 2.0)
+            py = min(max(2.0, py + rng.uniform(-2.0, 2.0)), height - 2.0)
+        else:
+            px, py = dx, dy
+        path_points.append((left + px, top + py))
+
+    source_x, source_y = left + sx, top + sy
+    pre_delay_ms = rng.randint(1, 5)
+    hover_ms = rng.randint(3, 8)
+    pickup_hold_ms = rng.randint(1, 3)
     confirm_interval_ms = rng.randint(4, 10)
-    # A native desktop-cursor gesture can take longer than synthetic CDP input.
-    # This timeout is post-action confirmation time, so it does not consume the move's clock.
-    confirmation_timeout_ms = int(80 if low_clock_mode else 220)
+    confirmation_timeout_ms = int(120 if low_clock_mode else (450 if allow_premove else 900))
 
     # Start a page-side watcher before sending mouse input. MutationObserver is
     # immediate; a 4-10ms in-page interval is the fallback for API-only updates.
@@ -3970,104 +2844,44 @@ def _perform_cursor_drag_once(
             time.sleep(pre_delay_ms / 1000.0)
 
         action_started_at = time.monotonic()
-        controller = _get_visible_cursor_controller(low_clock_mode=low_clock_mode)
-        if controller is None or BoardGeometry is None:
-            return {
-                "ok": False,
-                "reason": "visible-cursor-controller-unavailable",
-                "drag_ms": total_drag_ms,
-                "pre_delay_ms": pre_delay_ms,
-                "waypoints": waypoint_count,
-            }
-        try:
-            screen_geometry = BoardGeometry(
-                left=float(target["screenLeft"]),
-                top=float(target["screenTop"]),
-                width=float(target["screenWidth"]),
-                height=float(target["screenHeight"]),
-                bottom_side=bottom_side,
-            )
-            window_title = str(target.get("windowTitle") or "").strip()
-        except (KeyError, TypeError, ValueError, WebDriverException):
-            return {
-                "ok": False,
-                "reason": "visible-cursor-geometry-or-window-title-unavailable",
-                "drag_ms": total_drag_ms,
-                "pre_delay_ms": pre_delay_ms,
-                "waypoints": waypoint_count,
-            }
-        if not window_title:
-            return {
-                "ok": False,
-                "reason": "visible-cursor-window-title-empty",
-                "drag_ms": total_drag_ms,
-                "pre_delay_ms": pre_delay_ms,
-                "waypoints": waypoint_count,
-            }
+        command_ids: set[int] = set()
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": source_x, "y": source_y, "button": "none",
+            "buttons": 0, "pointerType": "mouse",
+        }))
+        time.sleep(hover_ms / 1000.0)
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": source_x, "y": source_y, "button": "left",
+            "buttons": 1, "clickCount": 1, "pointerType": "mouse",
+        }))
+        time.sleep(pickup_hold_ms / 1000.0)
 
-        def current_fen_reader():
-            try:
-                return str(cdp.evaluate(
-                    "(() => String(window.__liveGameApiReader?.current?.()?.fen || ''))()"
-                ) or "").strip()
-            except Exception:
-                return ""
+        for (px, py), segment_ms in zip(path_points, segment_durations):
+            command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+                "type": "mouseMoved", "x": px, "y": py, "button": "left",
+                "buttons": 1, "pointerType": "mouse",
+            }))
+            time.sleep(segment_ms / 1000.0)
 
-        focus_guard = lambda: controller.backend.foreground_title_contains(window_title)
-
-        def preview_cursor_for_upcoming_moves(preview_fen: str) -> float:
-            """Pointer-only look-ahead; no engine search, button press, or FEN re-read."""
-            try:
-                preview_result = controller.preview_legal_moves(
-                    preview_fen,
-                    geometry=screen_geometry,
-                    focus_guard=focus_guard,
-                    max_moves=1 if low_clock_mode else 2,
-                    position_prevalidated=True,
-                )
-                return max(0.0, float(preview_result.duration_s) * 1000.0)
-            except Exception:
-                return 0.0
-
-        try:
-            cursor_result = controller.move_uci(
-                text,
-                expected_fen=expected_fen,
-                current_fen_reader=current_fen_reader,
-                geometry=screen_geometry,
-                bot_color=str(expected_color or ""),
-                focus_guard=focus_guard,
-                allow_premove=bool(allow_premove),
-                premove_prevalidated=bool(allow_premove),
-                position_prevalidated=True,
-            )
-        except Exception as exc:
-            return {
-                "ok": False,
-                "reason": "visible-cursor-action-failed",
-                "error_type": type(exc).__name__,
-                "drag_ms": total_drag_ms,
-                "pre_delay_ms": pre_delay_ms,
-                "waypoints": waypoint_count,
-            }
-
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": left + dx, "y": top + dy, "button": "left",
+            "buttons": 0, "clickCount": 1, "pointerType": "mouse",
+        }))
+        # Await all CDP acknowledgements together instead of paying one network
+        # round-trip per mouse event.
+        cdp.wait_for(command_ids, timeout=1.0)
         action_elapsed_ms = (time.monotonic() - action_started_at) * 1000.0
-        total_drag_ms = int(round(action_elapsed_ms))
-        waypoint_count = int(cursor_result.waypoints or waypoint_count)
-        if not cursor_result.ok:
-            return {
-                "ok": False,
-                "reason": f"visible-cursor-{cursor_result.reason}",
-                "error_type": "VisibleCursorError",
-                "drag_ms": total_drag_ms,
-                "pre_delay_ms": pre_delay_ms,
-                "waypoints": waypoint_count,
-                "action_elapsed_ms": round(action_elapsed_ms, 1),
-            }
     except Exception as exc:
+        try:
+            cdp.send("Input.dispatchMouseEvent", {
+                "type": "mouseReleased", "button": "left", "buttons": 0,
+                "pointerType": "mouse",
+            })
+        except Exception:
+            pass
         return {
             "ok": False,
-            "reason": "cursor-watcher-or-input-failed",
+            "reason": "direct-cdp-input-failed",
             "error_type": type(exc).__name__,
             "drag_ms": total_drag_ms,
             "pre_delay_ms": pre_delay_ms,
@@ -4091,7 +2905,6 @@ def _perform_cursor_drag_once(
     page_detected_ms = observed.get("detected_ms")
     pending_premove = bool(observed.get("pending"))
     if current_fen and uci_move_reaches_fen(expected_fen, current_fen, text):
-        cursor_preview_ms = preview_cursor_for_upcoming_moves(current_fen)
         return {
             "ok": True,
             "confirmed": True,
@@ -4103,10 +2916,8 @@ def _perform_cursor_drag_once(
             "confirm_elapsed_ms": round(confirm_elapsed_ms, 1),
             "confirm_detected_ms": round(float(page_detected_ms or 0.0), 1),
             "confirm_interval_ms": confirm_interval_ms,
-            "cursor_preview_ms": round(cursor_preview_ms, 1),
         }
     if allow_premove and pending_premove:
-        cursor_preview_ms = preview_cursor_for_upcoming_moves(current_fen or expected_fen)
         return {
             "ok": True, "uci": text, "premove_attempted": True,
             "premove_confirmed": True, "premove_source": "page-side observer",
@@ -4116,10 +2927,8 @@ def _perform_cursor_drag_once(
             "confirm_elapsed_ms": round(confirm_elapsed_ms, 1),
             "confirm_detected_ms": round(float(page_detected_ms or 0.0), 1),
             "confirm_interval_ms": confirm_interval_ms,
-            "cursor_preview_ms": round(cursor_preview_ms, 1),
         }
     if allow_premove:
-        cursor_preview_ms = preview_cursor_for_upcoming_moves(current_fen or expected_fen)
         return {
             "ok": True, "uci": text, "premove_attempted": True,
             "premove_confirmed": False, "premove_source": "not-exposed",
@@ -4129,7 +2938,6 @@ def _perform_cursor_drag_once(
             "confirm_elapsed_ms": round(confirm_elapsed_ms, 1),
             "confirm_detected_ms": round(float(page_detected_ms or 0.0), 1),
             "confirm_interval_ms": confirm_interval_ms,
-            "cursor_preview_ms": round(cursor_preview_ms, 1),
         }
     return {
         "ok": False,
@@ -5485,16 +4293,6 @@ def parse_args() -> argparse.Namespace:
     premove_group.add_argument("--premove", dest="premove_enabled", action="store_true", help="Try best-effort premoves on the configured authorized site.")
     premove_group.add_argument("--no-premove", dest="premove_enabled", action="store_false", help="Disable premove attempts.")
     parser.set_defaults(premove_enabled=None)
-    auto_draw_group = parser.add_mutually_exclusive_group()
-    auto_draw_group.add_argument(
-        "--auto-draw", dest="auto_draw", action="store_true",
-        help="Enable coaching arrows after our completed move, except in fast modes.",
-    )
-    auto_draw_group.add_argument(
-        "--no-auto-draw", dest="auto_draw", action="store_false",
-        help="Disable automatic coaching arrows.",
-    )
-    parser.set_defaults(auto_draw=None)
     next_game_group = parser.add_mutually_exclusive_group()
     next_game_group.add_argument(
         "--auto-next-game", dest="auto_next_game", action="store_true",
@@ -5510,9 +4308,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    analyzer_process: subprocess.Popen | None = None
-    autoplay_control_file: Path | None = None
-    last_analyzer_mode: bool | None = None
     try:
         blocked_platforms = load_blocked_platforms()
     except RuntimeError:
@@ -5539,13 +4334,6 @@ def main() -> int:
     if args.premove_enabled is None:
         raw_premove = load_optional_txt_setting("premove_enabled").strip().lower()
         args.premove_enabled = raw_premove in {"1", "true", "yes", "on", "enabled"} if raw_premove else True
-    if args.auto_draw is None:
-        raw_auto_draw_setting = load_optional_txt_setting("auto_draw").strip().lower()
-        args.auto_draw = (
-            raw_auto_draw_setting in {"1", "true", "yes", "on", "enabled"}
-            if raw_auto_draw_setting else True
-        )
-    print(f"[CONFIG] Auto-Draw default: {'enabled' if args.auto_draw else 'disabled'}.", flush=True)
     print(f"[CONFIG] Premove attempts: {'enabled' if args.premove_enabled else 'disabled'}.", flush=True)
     if args.auto_next_game is None:
         next_setting = load_optional_txt_setting("auto_next_game").strip().lower()
@@ -5857,14 +4645,8 @@ def main() -> int:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         new_file = not csv_path.exists() or csv_path.stat().st_size == 0
         previous_fen = ""
-        auto_analysis_arrows: list[str] = []
-        auto_analysis_highlight_square: str | None = None
-        # Never display the same arrow twice in one game, even after it disappears.
-        shown_coaching_arrows: set[str] = set()
         last_dashboard_eval_fen = ""
         reconstructed_history: list[dict[str, str]] = []
-        last_dashboard_history_signature = None
-        last_dashboard_reference_id = ""
         game_number = 1
         if chess is None:
             print("[NOTE] Full SAN move reconstruction needs python-chess: python -m pip install python-chess", flush=True)
@@ -5888,86 +4670,12 @@ def main() -> int:
             except Exception:
                 print("[GUI] Runtime settings window could not be opened; continuing with TXT/CLI settings.", flush=True)
 
-            # The tracker remains the only move-submission process. The analyzer
-            # is launched as a companion and controls this existing BOT switch
-            # through a private temporary mode file.
-            analyzer_path = BASE_DIR / "variation_line_analyzer.py"
-            if args.browser_mode == "attach" and analyzer_path.is_file():
-                try:
-                    if is_public_competitive_host(allowed_host):
-                        raise RuntimeError("public competitive host is blocked")
-                    temp_handle = tempfile.NamedTemporaryFile(
-                        prefix="variation_line_mode_", suffix=".json",
-                        dir=str(BASE_DIR), delete=False,
-                    )
-                    autoplay_control_file = Path(temp_handle.name)
-                    temp_handle.close()
-                    analyzer_command = [
-                        sys.executable, str(analyzer_path),
-                        "--debugger-address", args.debugger_address,
-                        "--allowed-domain", allowed_host,
-                        "--board-selector", args.board_selector,
-                        "--window-handle", str(chosen_handle),
-                        "--autoplay-control-file", str(autoplay_control_file),
-                    ]
-                    if args.stockfish_path.strip():
-                        analyzer_command.extend(["--stockfish-path", args.stockfish_path.strip()])
-                    analyzer_process = subprocess.Popen(
-                        analyzer_command, cwd=str(BASE_DIR)
-                    )
-                    print(
-                        "[ANALYZER] variation_line_analyzer.py started automatically. "
-                        "SHOW MOVE: ON pauses tracker autoplay; OFF selects autoplay mode "
-                        "for the configured authorized test site.",
-                        flush=True,
-                    )
-                except (OSError, RuntimeError) as exc:
-                    print(
-                        f"[ANALYZER] Auto-start skipped ({type(exc).__name__}); "
-                        "the live tracker remains available.",
-                        flush=True,
-                    )
-                    if autoplay_control_file is not None:
-                        try:
-                            autoplay_control_file.unlink()
-                        except OSError:
-                            pass
-                        autoplay_control_file = None
-            elif args.browser_mode != "attach":
-                print(
-                    "[ANALYZER] Auto-start requires browser_mode=attach; "
-                    "the UC-mode tracker continues unchanged.",
-                    flush=True,
-                )
-
             while True:
                 if settings_window is not None:
                     settings_window.pump()
                     if settings_window.stop_requested:
                         print("[STOP] Stop requested from runtime settings window.", flush=True)
                         break
-                requested_autoplay = read_analyzer_autoplay_request(autoplay_control_file)
-                if requested_autoplay is not None and requested_autoplay != last_analyzer_mode:
-                    last_analyzer_mode = requested_autoplay
-                    if requested_autoplay and is_public_competitive_host(allowed_host):
-                        args.auto_play = False
-                        if settings_window is not None:
-                            settings_window.set_enabled("auto_play", False)
-                        print("[MODE] Autoplay request rejected for a public competitive host.", flush=True)
-                    else:
-                        args.auto_play = requested_autoplay
-                        if settings_window is not None:
-                            settings_window.set_enabled("auto_play", requested_autoplay)
-                            settings_window.status.set(
-                                "SHOW MOVE is OFF; tracker autoplay is active on the configured test site."
-                                if requested_autoplay else
-                                "SHOW MOVE is ON; tracker autoplay is paused."
-                            )
-                        print(
-                            "[MODE] SHOW MOVE: "
-                            + ("OFF -> tracker BOT ON." if requested_autoplay else "ON -> tracker BOT OFF."),
-                            flush=True,
-                        )
                 # If Bot was OFF at startup, initialize the engine only when it is switched ON.
                 if args.auto_play and engine is None:
                     try:
@@ -6253,10 +4961,8 @@ def main() -> int:
                         clock_source_reported = True
                     last_move: dict[str, str] | None = None
                     note = "DOM/API state change; identifiers omitted"
-                    position_before_fen = previous_fen
-                    position_changed = bool(fen and fen != previous_fen)
 
-                    if position_changed:
+                    if fen and fen != previous_fen:
                         if previous_fen:
                             last_move = infer_move_between_fens(previous_fen, fen)
                             if last_move:
@@ -6265,11 +4971,25 @@ def main() -> int:
                                 except (ValueError, IndexError):
                                     last_move["game_ply"] = str(len(reconstructed_history) + 1)
                                 reconstructed_history.append(last_move)
+                                if settings_window is not None:
+                                    try:
+                                        observed_ply = (
+                                            chess.Board(fen).ply()
+                                            if chess is not None and fen
+                                            else len(reconstructed_history)
+                                        )
+                                        settings_window.record_observed_move(
+                                            game_number,
+                                            observed_ply,
+                                            last_move,
+                                            eval_white_cp=settings_window.last_eval_white_cp,
+                                        )
+                                    except Exception:
+                                        pass
                                 note = "Move reconstructed from consecutive FEN states"
                             elif is_start_position(fen) and not is_start_position(previous_fen):
                                 game_number += 1
                                 reconstructed_history = []
-                                shown_coaching_arrows.clear()
                                 note = "New game detected; move history reset"
                             elif chess is not None:
                                 note = "Position changed but transition could not be inferred as one legal move"
@@ -6288,219 +5008,17 @@ def main() -> int:
                                 f"[HISTORY SYNC] Reconciled {len(dom_history)} plies against current FEN.",
                                 flush=True,
                             )
-                    # Draw coaching only after our completed move is visible. While it is
-                    # our turn to think, do no coaching search or annotation input: this
-                    # protects clock management. The board clears its native arrows on
-                    # the opponent's move, so drawn arrows naturally stay until then.
-                    if position_changed and chess is not None and fen:
-                        last_move_side = (
-                            normalize_chess_color(last_move.get("side"))
-                            if isinstance(last_move, dict) else None
-                        )
-                        coaching_from_bot_move = should_render_post_move_coaching(
-                            bool(args.auto_play),
-                            engine is not None,
-                            active_bot_color,
-                            last_move_side,
-                            fen,
-                            position_before_fen,
-                        )
-                        draw_suppression_reason = ""
-                        if coaching_from_bot_move:
-                            draw_suppression_reason = auto_draw_suppression_reason(
-                                bool(args.auto_draw),
-                                active_bot_color,
-                                fen,
-                                position_before_fen,
-                                white_clock_seconds,
-                                black_clock_seconds,
-                                low_clock_trigger_seconds,
-                                short_control_fast_mode,
-                                getattr(args, "opening_premove_fullmove_max", PREMOVE_OPENING_FULLMOVE_MAX),
-                            )
-                        if coaching_from_bot_move and not draw_suppression_reason:
-                            coaching_plan: dict[str, object] = {
-                                "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
-                            }
-                            # If the board transition confirms a queued premove, show
-                            # danger arrows only; don't spend time drawing a tactical queue.
-                            premove_followup = bool(
-                                position_before_fen
-                                and position_before_fen == last_premove_attempt_fen
-                            )
-                            if premove_followup:
-                                try:
-                                    coaching_plan = build_current_position_danger_plan(
-                                        fen,
-                                        active_bot_color,
-                                        engine=engine,
-                                        search_seconds=max(
-                                            0.03,
-                                            min(0.12, float(getattr(args, "engine_time", 0.4)) * 0.15),
-                                        ),
-                                    )
-                                except (ValueError, IndexError, TypeError, RuntimeError):
-                                    coaching_plan = {
-                                        "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
-                                    }
-                            else:
-                                try:
-                                    analysis_seconds = max(
-                                        0.08,
-                                        min(0.25, float(getattr(args, "engine_time", 0.4)) * 0.25),
-                                    )
-                                    coaching_plan = build_move_coaching_plan(
-                                        engine,
-                                        position_before_fen,
-                                        fen,
-                                        str(last_move.get("uci") or ""),
-                                        active_bot_color,
-                                        max_plies=3,
-                                        search_seconds=analysis_seconds,
-                                    )
-                                except (ValueError, IndexError, TypeError, RuntimeError):
-                                    coaching_plan = {
-                                        "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
-                                    }
-
-                            next_coaching_arrows = [
-                                str(value) for value in (coaching_plan.get("arrows") or [])
-                                if isinstance(value, str)
-                            ][:5]
-                            next_coaching_arrows = filter_new_coaching_arrows(
-                                next_coaching_arrows,
-                                shown_coaching_arrows,
-                            )
-                            next_highlight_square = (
-                                str(coaching_plan.get("highlight_square") or "").strip().lower() or None
-                            )
-                            auto_analysis_arrows, auto_analysis_highlight_square = (
-                                _replace_native_coaching_annotations(
-                                    driver,
-                                    args.board_selector,
-                                    auto_analysis_arrows,
-                                    auto_analysis_highlight_square,
-                                    next_coaching_arrows,
-                                    next_highlight_square,
-                                    fen,
-                                    use_visible_cursor=(args.move_input == "cursor"),
-                                    game_id=game_number,
-                                    auto_draw_enabled=bool(args.auto_draw),
-                                    bot_color=active_bot_color,
-                                    white_clock_seconds=white_clock_seconds,
-                                    black_clock_seconds=black_clock_seconds,
-                                    low_clock_trigger_seconds=low_clock_trigger_seconds,
-                                    opening_fast_mode=bool(
-                                        position_before_fen
-                                        and min(
-                                            chess.Board(fen).fullmove_number,
-                                            chess.Board(position_before_fen).fullmove_number,
-                                        ) <= int(getattr(
-                                            args, "opening_premove_fullmove_max",
-                                            PREMOVE_OPENING_FULLMOVE_MAX,
-                                        ))
-                                    ),
-                                    fast_mode=bool(short_control_fast_mode),
-                                )
-                            )
-                            shown_coaching_arrows.update(
-                                arrow for arrow in next_coaching_arrows
-                                if arrow in auto_analysis_arrows
-                            )
-                            plan_mode = str(coaching_plan.get("mode") or "none")
-                            plan_reason = str(coaching_plan.get("reason") or "")
-                            tactical_queue = [
-                                str(value) for value in (coaching_plan.get("tactical_queue") or [])
-                                if isinstance(value, str)
-                            ][:3]
-                            danger_arrows = [
-                                str(value) for value in (coaching_plan.get("danger_arrows") or [])
-                                if isinstance(value, str)
-                            ][:4]
-                            if plan_mode == "tactical-queue" and tactical_queue:
-                                print(
-                                    f"[COACHING] Tactical queue ({len(tactical_queue)} ply): "
-                                    f"{plan_reason} | {' -> '.join(tactical_queue)}.",
-                                    flush=True,
-                                )
-                            if danger_arrows:
-                                print(
-                                    f"[COACHING] Danger arrows: {'; '.join(danger_arrows)}"
-                                    + (f" | {plan_reason}" if plan_mode != "tactical-queue" else ""),
-                                    flush=True,
-                                )
-                        elif coaching_from_bot_move:
-                            print(
-                                f"[COACHING] Auto-Draw skipped: {draw_suppression_reason}.",
-                                flush=True,
-                            )
-
-                    # Send the complete validated history through one idempotent
-                    # dashboard path. This is independent of BOT state and catches
-                    # manual moves plus fast bot/reply transitions missed by polling.
-                    dashboard_history_signature = (
-                        game_number,
-                        tuple(
-                            (
-                                str(item.get("game_ply") or index + 1),
-                                str(item.get("uci") or ""),
-                                str(item.get("san") or ""),
-                            )
-                            for index, item in enumerate(reconstructed_history)
-                            if isinstance(item, dict)
-                        ),
-                    )
-                    if (
-                        settings_window is not None
-                        and dashboard_history_signature != last_dashboard_history_signature
-                    ):
-                        synced_moves = sync_dashboard_history(
-                            settings_window, game_number, reconstructed_history
-                        )
-                        last_dashboard_history_signature = dashboard_history_signature
-                        if synced_moves:
-                            print(
-                                f"[DASHBOARD HISTORY] Synced {synced_moves} actual on-board "
-                                f"plies (game {game_number}; BOT-independent).",
-                                flush=True,
-                            )
-
-                    # SHOW MOVE references come from the analyzer process. Keep them
-                    # in separate dashboard rows so actual board history is not overwritten.
-                    if settings_window is not None and chess is not None and fen:
-                        move_reference = read_analyzer_move_reference(autoplay_control_file)
-                        if isinstance(move_reference, dict):
-                            reference_id = str(move_reference.get("event_id") or "").strip()
-                            reference_fen = str(move_reference.get("fen") or "").strip()
-                            if (
-                                reference_id
-                                and reference_id != last_dashboard_reference_id
-                                and reference_fen == fen
-                            ):
-                                try:
-                                    reference_board = chess.Board(fen)
-                                    reference_move = chess.Move.from_uci(
-                                        str(move_reference.get("uci") or "").strip().lower()
-                                    )
-                                    if reference_move in reference_board.legal_moves:
-                                        selected_san = reference_board.san(reference_move)
-                                        selected_side = (
-                                            "White" if reference_board.turn == chess.WHITE else "Black"
+                            if settings_window is not None:
+                                for history_item in dom_history:
+                                    try:
+                                        settings_window.record_observed_move(
+                                            game_number,
+                                            int(history_item["game_ply"]),
+                                            history_item,
+                                            eval_white_cp=settings_window.last_eval_white_cp,
                                         )
-                                        selected_ply = reference_board.ply() + 1
-                                        reference_label = format_move_reference_label(move_reference)
-                                        settings_window.record_move_reference(
-                                            game_number, selected_ply, selected_side,
-                                            selected_san, reference_label,
-                                        )
-                                        print(
-                                            f"[DASHBOARD REFERENCE] {selected_san} | "
-                                            f"{reference_label} | ply={selected_ply}.",
-                                            flush=True,
-                                        )
-                                    last_dashboard_reference_id = reference_id
-                                except (ValueError, TypeError):
-                                    last_dashboard_reference_id = reference_id
+                                    except Exception:
+                                        pass
 
                     # Keep a persistent python-chess board so the ChessKida strategy
                     # sees the same move_stack/history state as the original bot.
@@ -7096,9 +5614,7 @@ def main() -> int:
                                         low_clock_mode=low_clock_mode,
                                         elapsed_seconds_before_delay=time.monotonic() - move_cycle_started_at,
                                         submission_reserve_seconds=(
-                                            (0.075 if low_clock_mode else 0.32)
-                                            if args.move_input == "cursor"
-                                            else 0.035
+                                            0.075 if args.move_input == "cursor" else 0.035
                                         ),
                                     )
                                     if natural_delay > 0:
@@ -7158,13 +5674,13 @@ def main() -> int:
                                             )
                                         if args.move_input == "cursor" and submit.get("drag_ms") is not None:
                                             print(
-                                                f"[CURSOR] Visible desktop pointer gesture accepted | path+drag={int(submit.get('drag_ms', 0))} ms "
+                                                f"[CURSOR] Direct CDP gesture accepted | configured-travel={int(submit.get('drag_ms', 0))} ms "
                                                 f"| input-roundtrip={float(submit.get('action_elapsed_ms', 0.0)):.1f} ms "
                                                 f"| confirm-roundtrip={float(submit.get('confirm_elapsed_ms', 0.0)):.1f} ms "
                                                 f"| page-detected={float(submit.get('confirm_detected_ms', 0.0)):.1f} ms "
                                                 f"| confirm-poll={int(submit.get('confirm_interval_ms', 0))} ms "
-                                                f"| next-move-preview={float(submit.get('cursor_preview_ms', 0.0)):.1f} ms "
-                                                f"| path-steps={int(submit.get('waypoints', 0))}.",
+                                                f"| pre-delay={int(submit.get('pre_delay_ms', 0))} ms "
+                                                f"| waypoints={int(submit.get('waypoints', 0))}.",
                                                 flush=True,
                                             )
                                         print(f"[AUTO] Submitted selected move: {chosen_san} ({chosen_move.uci()}).", flush=True)
@@ -7481,22 +5997,6 @@ def main() -> int:
         print("[ERROR] Browser session or site-tab selection failed. Site details were not logged.", file=sys.stderr, flush=True)
         return 2
     finally:
-        if analyzer_process is not None:
-            try:
-                if analyzer_process.poll() is None:
-                    analyzer_process.terminate()
-                    try:
-                        analyzer_process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        analyzer_process.kill()
-                        analyzer_process.wait(timeout=2)
-            except Exception:
-                pass
-        if autoplay_control_file is not None:
-            try:
-                autoplay_control_file.unlink()
-            except OSError:
-                pass
         if book is not None:
             try:
                 book.close()
