@@ -7,7 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 import chess
-from variation_line_analyzer import classify_autoplay_transition, dispatch_native_annotation_arrow
+from variation_line_analyzer import (
+    INSTALL_LINE_WATCHER,
+    classify_autoplay_transition,
+    dispatch_native_annotation_arrow,
+    piece_controlled_squares,
+)
 from seleniumbase_live_game_tracker import (
     PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP,
     PREMOVE_OPENING_MAX_EVAL_DROP_CP,
@@ -352,6 +357,32 @@ class DomHistoryRecoveryTests(unittest.TestCase):
         self.assertIsNone(reconstruct_history_from_dom_moves(dom_moves[:-1], board.fen()))
 
 
+
+
+class PieceControlMapTests(unittest.TestCase):
+    def test_knight_control_map_returns_geometric_attack_squares(self):
+        board = chess.Board("8/8/8/8/8/8/8/1N2K3 w - - 0 1")
+        self.assertEqual(
+            set(piece_controlled_squares(board, "b1")),
+            {"a3", "c3", "d2"},
+        )
+
+    def test_pawn_control_map_includes_empty_diagonal_squares(self):
+        board = chess.Board("8/8/8/8/3P4/8/8/K7 w - - 0 1")
+        self.assertEqual(
+            set(piece_controlled_squares(board, "d4")),
+            {"c5", "e5"},
+        )
+
+    def test_empty_or_invalid_source_square_has_no_control_map(self):
+        board = chess.Board()
+        self.assertEqual(piece_controlled_squares(board, "e4"), [])
+        self.assertEqual(piece_controlled_squares(board, "not-a-square"), [])
+
+    def test_single_right_click_requests_control_map_only_in_autoplay_mode(self):
+        self.assertIn("autoplayControlEnabled && !turnHintEnabled", INSTALL_LINE_WATCHER)
+        self.assertIn("action:'attack_map'", INSTALL_LINE_WATCHER)
+        self.assertIn("action:'clear_all'", INSTALL_LINE_WATCHER)
 
 
 class NativeAnnotationDispatchTests(unittest.TestCase):
