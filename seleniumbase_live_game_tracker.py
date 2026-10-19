@@ -55,6 +55,21 @@ try:
 except ImportError:
     chess = None  # FEN/DOM capture works; reconstruction/autoplay need python-chess.
 
+try:
+    from visible_cursor_controller import (
+        BoardGeometry,
+        CursorMotionConfig,
+        VisibleCursorController,
+        WindowsMouseBackend,
+        read_selenium_board_geometry,
+    )
+except ImportError:
+    BoardGeometry = None
+    CursorMotionConfig = None
+    VisibleCursorController = None
+    WindowsMouseBackend = None
+    read_selenium_board_geometry = None
+
 BASE_DIR = Path(__file__).resolve().parent
 BLOCKED_PLATFORMS_FILE = BASE_DIR / "blocked_platforms.txt"
 # Use a new private log so a prior CSV with raw URLs is not appended to.
@@ -67,6 +82,41 @@ CSV_FIELDS = [
     "legal_move_count", "legal_moves_json", "white_clock",
     "black_clock", "result", "note",
 ]
+
+
+_VISIBLE_CURSOR_CONTROLLER = None
+
+
+def _get_visible_cursor_controller(low_clock_mode: bool = False):
+    """Lazily create the OS-cursor backend and choose a clock-aware gesture profile."""
+    global _VISIBLE_CURSOR_CONTROLLER
+    if (
+        VisibleCursorController is None
+        or WindowsMouseBackend is None
+        or CursorMotionConfig is None
+    ):
+        return None
+    motion = CursorMotionConfig(
+        approach_duration_s=0.01 if low_clock_mode else 0.10,
+        move_drag_duration_s=0.015 if low_clock_mode else 0.16,
+        arrow_drag_duration_s=0.14,
+        settle_after_press_s=0.0 if low_clock_mode else 0.006,
+        settle_after_release_s=0.002 if low_clock_mode else 0.010,
+        min_steps=4 if low_clock_mode else 8,
+        max_steps=4 if low_clock_mode else 32,
+        curve_pixels=0.5 if low_clock_mode else 2.0,
+    )
+    try:
+        if _VISIBLE_CURSOR_CONTROLLER is None:
+            _VISIBLE_CURSOR_CONTROLLER = VisibleCursorController(
+                backend=WindowsMouseBackend(),
+                motion=motion,
+            )
+        else:
+            _VISIBLE_CURSOR_CONTROLLER.motion = motion
+        return _VISIBLE_CURSOR_CONTROLLER
+    except Exception:
+        return None
 
 
 def now_utc() -> str:
