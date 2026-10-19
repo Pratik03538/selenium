@@ -18,6 +18,9 @@ class FakeMouseBackend:
         self.last_position = (0, 0)
         self.fail_next_position = False
 
+    def get_position(self):
+        return self.last_position
+
     def set_position(self, x, y):
         if self.fail_next_position:
             self.fail_next_position = False
