@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import chess
 from seleniumbase_live_game_tracker import (
@@ -435,10 +435,9 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
 
         controller = SimpleNamespace(
             backend=FakeBackend(),
-            draw_arrow=patch("unused").start,
+            draw_arrow=Mock(return_value=SimpleNamespace(ok=True)),
+            draw_highlight=Mock(return_value=SimpleNamespace(ok=True)),
         )
-        controller.draw_arrow = unittest.mock.Mock(return_value=SimpleNamespace(ok=True))
-        controller.draw_highlight = unittest.mock.Mock(return_value=SimpleNamespace(ok=True))
 
         with (
             patch("seleniumbase_live_game_tracker._direct_cdp_page_for_driver") as cdp,
