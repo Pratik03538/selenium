@@ -3786,18 +3786,17 @@ def _replace_native_coaching_annotations(
 
                 def preview_cursor(max_moves: int) -> float:
                     # Pointer-only movement; no clicks, no engine calls, no extra FEN read.
-                    preview_started = time.monotonic()
                     try:
-                        controller.preview_legal_moves(
+                        result = controller.preview_legal_moves(
                             current_fen,
                             geometry=screen_geometry,
                             focus_guard=focus_guard,
                             max_moves=max_moves,
                             position_prevalidated=True,
                         )
+                        return max(0.0, float(result.duration_s))
                     except Exception:
-                        pass
-                    return max(0.0, time.monotonic() - preview_started)
+                        return 0.0
 
                 if routes or next_highlight:
                     # Keep the post-move pause tiny and bounded, not another thinking delay.
