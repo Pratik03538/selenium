@@ -3784,8 +3784,9 @@ def _replace_native_coaching_annotations(
                     if re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", str(value or "").strip().lower())
                 ]
 
-                def preview_cursor(max_moves: int) -> None:
+                def preview_cursor(max_moves: int) -> float:
                     # Pointer-only movement; no clicks, no engine calls, no extra FEN read.
+                    preview_started = time.monotonic()
                     try:
                         controller.preview_legal_moves(
                             current_fen,
@@ -3796,6 +3797,7 @@ def _replace_native_coaching_annotations(
                         )
                     except Exception:
                         pass
+                    return max(0.0, time.monotonic() - preview_started)
 
                 if routes or next_highlight:
                     # Keep the post-move pause tiny and bounded, not another thinking delay.
@@ -3822,8 +3824,11 @@ def _replace_native_coaching_annotations(
                         if route_index < len(routes) - 1 or next_highlight:
                             # Leave the arrow endpoint, preview one possible next move,
                             # then use a short random gap before the next queued annotation.
-                            preview_cursor(max_moves=1)
-                            time.sleep(random.uniform(0.010, 0.030))
+                            target_gap_s = random.uniform(0.010, 0.030)
+                            preview_elapsed_s = preview_cursor(max_moves=1)
+                            remaining_gap_s = max(0.0, target_gap_s - preview_elapsed_s)
+                            if remaining_gap_s:
+                                time.sleep(remaining_gap_s)
 
                 if next_highlight:
                     highlight_result = controller.draw_highlight(
