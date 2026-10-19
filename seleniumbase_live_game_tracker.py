@@ -431,6 +431,7 @@ class RuntimeSettingsWindow:
         "auto_rematch": "REMATCH",
         "premove_enabled": "NORMAL PREMOVES",
         "low_clock_extra_premoves": "LAST 7–10s EXTRA PREMOVES",
+        "auto_draw": "AUTO-DRAW",
         "clock_management": "CLOCK-BASED TIME MANAGEMENT",
     }
     BUTTON_LABELS = {
@@ -439,6 +440,7 @@ class RuntimeSettingsWindow:
         "auto_rematch": "REMATCH",
         "premove_enabled": "PREMOVES",
         "low_clock_extra_premoves": "EXTRA PREMOVES · 7–10s",
+        "auto_draw": "AUTO-DRAW",
         "clock_management": "CLOCK MANAGEMENT",
     }
 
@@ -2592,6 +2594,60 @@ def is_low_clock_mode(
     except (TypeError, ValueError):
         return False
     return bool(force_fast_mode or remaining <= threshold)
+
+
+def auto_draw_suppression_reason(
+    auto_draw_enabled: bool,
+    bot_color: object,
+    current_fen: str,
+    previous_fen: str,
+    white_clock_seconds: float | None,
+    black_clock_seconds: float | None,
+    low_clock_trigger_seconds: float = 10.0,
+    force_fast_mode: bool = False,
+    opening_premove_fullmove_max: int | None = None,
+) -> str:
+    """Explain why native coaching annotations should be skipped for this position."""
+    if not auto_draw_enabled:
+        return "Auto-Draw switch is OFF"
+    normalized_bot_color = normalize_chess_color(bot_color)
+    if normalized_bot_color not in {"white", "black"}:
+        return "bot side is unconfirmed"
+    if force_fast_mode:
+        return "short-time-control fast mode is active"
+    if chess is None:
+        return "python-chess is unavailable"
+    try:
+        current_board = chess.Board(str(current_fen or "").strip())
+        previous_board = chess.Board(str(previous_fen or "").strip())
+    except (ValueError, TypeError, IndexError):
+        return "position FEN is unavailable"
+    try:
+        configured_limit = (
+            PREMOVE_OPENING_FULLMOVE_MAX
+            if opening_premove_fullmove_max is None
+            else int(opening_premove_fullmove_max)
+        )
+        opening_limit = max(
+            PREMOVE_OPENING_FULLMOVE_MIN,
+            min(PREMOVE_OPENING_FULLMOVE_MAX, configured_limit),
+        )
+        # Check both FENs: a Black move increments fullmove_number, but that move
+        # still belongs to the opening window that was in effect before it.
+        if min(current_board.fullmove_number, previous_board.fullmove_number) <= opening_limit:
+            return "opening fast/premove window is active"
+    except (AttributeError, TypeError, ValueError):
+        return "opening phase could not be determined"
+
+    bot_clock = (
+        white_clock_seconds if normalized_bot_color == "white"
+        else black_clock_seconds
+    )
+    if bot_clock is None:
+        return "bot clock is unavailable (fail-safe)"
+    if is_low_clock_mode(bot_clock, low_clock_trigger_seconds):
+        return f"bot low-clock fast mode is active ({float(bot_clock):.2f}s)"
+    return ""
 
 
 def calculate_engine_search_limit(
@@ -5209,6 +5265,16 @@ def parse_args() -> argparse.Namespace:
     premove_group.add_argument("--premove", dest="premove_enabled", action="store_true", help="Try best-effort premoves on the configured authorized site.")
     premove_group.add_argument("--no-premove", dest="premove_enabled", action="store_false", help="Disable premove attempts.")
     parser.set_defaults(premove_enabled=None)
+    auto_draw_group = parser.add_mutually_exclusive_group()
+    auto_draw_group.add_argument(
+        "--auto-draw", dest="auto_draw", action="store_true",
+        help="Enable coaching arrows after our completed move, except in fast modes.",
+    )
+    auto_draw_group.add_argument(
+        "--no-auto-draw", dest="auto_draw", action="store_false",
+        help="Disable automatic coaching arrows.",
+    )
+    parser.set_defaults(auto_draw=None)
     next_game_group = parser.add_mutually_exclusive_group()
     next_game_group.add_argument(
         "--auto-next-game", dest="auto_next_game", action="store_true",
@@ -5253,6 +5319,13 @@ def main() -> int:
     if args.premove_enabled is None:
         raw_premove = load_optional_txt_setting("premove_enabled").strip().lower()
         args.premove_enabled = raw_premove in {"1", "true", "yes", "on", "enabled"} if raw_premove else True
+    if args.auto_draw is None:
+        raw_auto_draw_setting = load_optional_txt_setting("auto_draw").strip().lower()
+        args.auto_draw = (
+            raw_auto_draw_setting in {"1", "true", "yes", "on", "enabled"}
+            if raw_auto_draw_setting else True
+        )
+    print(f"[CONFIG] Auto-Draw default: {'enabled' if args.auto_draw else 'disabled'}.", flush=True)
     print(f"[CONFIG] Premove attempts: {'enabled' if args.premove_enabled else 'disabled'}.", flush=True)
     if args.auto_next_game is None:
         next_setting = load_optional_txt_setting("auto_next_game").strip().lower()
@@ -6012,7 +6085,20 @@ def main() -> int:
                             fen,
                             position_before_fen,
                         )
+                        draw_suppression_reason = ""
                         if coaching_from_bot_move:
+                            draw_suppression_reason = auto_draw_suppression_reason(
+                                bool(args.auto_draw),
+                                active_bot_color,
+                                fen,
+                                position_before_fen,
+                                white_clock_seconds,
+                                black_clock_seconds,
+                                low_clock_trigger_seconds,
+                                short_control_fast_mode,
+                                getattr(args, "opening_premove_fullmove_max", PREMOVE_OPENING_FULLMOVE_MAX),
+                            )
+                        if coaching_from_bot_move and not draw_suppression_reason:
                             coaching_plan: dict[str, object] = {
                                 "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
                             }
@@ -6105,6 +6191,11 @@ def main() -> int:
                                     + (f" | {plan_reason}" if plan_mode != "tactical-queue" else ""),
                                     flush=True,
                                 )
+                        elif coaching_from_bot_move:
+                            print(
+                                f"[COACHING] Auto-Draw skipped: {draw_suppression_reason}.",
+                                flush=True,
+                            )
 
                     # Send the complete validated history through one idempotent
                     # dashboard path. This is independent of BOT state and catches
