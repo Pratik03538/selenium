@@ -541,21 +541,9 @@ class VisibleCursorController:
             requested = 2
         target_count = random.SystemRandom().randint(1, min(requested, len(legal_moves)))
 
-        # Keep the preview plausible without Stockfish or any additional search:
-        # prefer captures/checks/castles when available, then sample different pieces.
-        forcing = []
-        quiet = []
-        for move in legal_moves:
-            try:
-                (forcing if (
-                    board.is_capture(move)
-                    or move.promotion is not None
-                    or board.is_castling(move)
-                    or board.gives_check(move)
-                ) else quiet).append(move)
-            except Exception:
-                quiet.append(move)
-        candidate_pool = forcing + quiet
+        # No Stockfish or tactical scoring here: shuffle the already-generated
+        # legal moves, then visit source/destination squares for distinct pieces.
+        candidate_pool = list(legal_moves)
         random.SystemRandom().shuffle(candidate_pool)
 
         selected = []
