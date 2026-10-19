@@ -6323,6 +6323,24 @@ def main() -> int:
                                     next_coaching_arrows,
                                     next_highlight_square,
                                     fen,
+                                    use_visible_cursor=(args.move_input == "cursor"),
+                                    game_id=game_number,
+                                    auto_draw_enabled=bool(args.auto_draw),
+                                    bot_color=active_bot_color,
+                                    white_clock_seconds=white_clock_seconds,
+                                    black_clock_seconds=black_clock_seconds,
+                                    low_clock_trigger_seconds=low_clock_trigger_seconds,
+                                    opening_fast_mode=bool(
+                                        position_before_fen
+                                        and min(
+                                            chess.Board(fen).fullmove_number,
+                                            chess.Board(position_before_fen).fullmove_number,
+                                        ) <= int(getattr(
+                                            args, "opening_premove_fullmove_max",
+                                            PREMOVE_OPENING_FULLMOVE_MAX,
+                                        ))
+                                    ),
+                                    fast_mode=bool(short_control_fast_mode),
                                 )
                             )
                             shown_coaching_arrows.update(
