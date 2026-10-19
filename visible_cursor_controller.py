@@ -125,6 +125,7 @@ class CursorActionResult:
 class MouseBackend(Protocol):
     """Minimal mouse backend interface; also useful for safe unit tests."""
 
+    def get_position(self) -> tuple[int, int]: ...
     def set_position(self, x: int, y: int) -> bool: ...
     def press(self, button: MouseButton) -> None: ...
     def release(self, button: MouseButton) -> None: ...
@@ -144,6 +145,12 @@ class WindowsMouseBackend:
         if os.name != "nt":
             raise OSError("WindowsMouseBackend requires Windows")
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+        self._point_type = POINT
+        self._user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+        self._user32.GetCursorPos.restype = ctypes.c_bool
         self._user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
         self._user32.SetCursorPos.restype = ctypes.c_bool
         self._user32.mouse_event.argtypes = [
@@ -165,6 +172,12 @@ class WindowsMouseBackend:
             self._user32.SetProcessDPIAware()
         except Exception:
             pass
+
+    def get_position(self) -> tuple[int, int]:
+        point = self._point_type()
+        if not self._user32.GetCursorPos(ctypes.byref(point)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(point.x), int(point.y)
 
     def set_position(self, x: int, y: int) -> bool:
         return bool(self._user32.SetCursorPos(int(x), int(y)))
@@ -368,13 +381,9 @@ class VisibleCursorController:
         current_fen_reader: FenReader,
         focus_guard: FocusGuard,
     ) -> None:
-        self._follow_curve(
-            start,
-            start,
-            0.0,
-        )
+        # The caller has already glided the visible cursor to the source square.
+        # Snap only the final sub-pixel rounding, not the whole on-screen approach.
         self._set_position(start)
-        time.sleep(self.motion.approach_duration_s)
         if not self._call_guard(focus_guard):
             raise PermissionError("foreground-window-guard-failed")
         valid, reason = self._position_guard(expected_fen, current_fen_reader)
@@ -441,7 +450,10 @@ class VisibleCursorController:
             return CursorActionResult(False, "move", "illegal-or-invalid-uci", (token,))
 
         try:
-            self._set_position(source)
+            current_pointer = self.backend.get_position()
+            self._follow_curve(
+                current_pointer, source, self.motion.approach_duration_s
+            )
             self._drag(
                 source,
                 destination,
@@ -528,7 +540,10 @@ class VisibleCursorController:
         start_point = geometry.square_center(start)
         end_point = geometry.square_center(end)
         try:
-            self._set_position(start_point)
+            current_pointer = self.backend.get_position()
+            self._follow_curve(
+                current_pointer, start_point, self.motion.approach_duration_s
+            )
             self._drag(
                 start_point,
                 end_point,
