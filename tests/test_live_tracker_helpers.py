@@ -178,7 +178,7 @@ class MoveCoachingPlanTests(unittest.TestCase):
         self.assertTrue(all(uci.startswith("e4") for uci in plan["arrows"]))
 
     def test_capture_without_recapture_uses_single_target_square_highlight(self):
-        before = chess.Board("4k3/8/4p3/3B4/8/8/8/4K3 w - - 0 1")
+        before = chess.Board("r3k3/8/4p3/3B4/8/8/8/4K3 w - - 0 1")
         move = chess.Move.from_uci("d5e6")
         self.assertIn(move, before.legal_moves)
         after = before.copy(stack=True)
@@ -193,18 +193,16 @@ class MoveCoachingPlanTests(unittest.TestCase):
         self.assertEqual(plan["arrows"], [])
 
     def test_checking_move_uses_a_forcing_queue_capped_at_five_plies(self):
-        before = chess.Board()
-        for uci in ("e2e4", "e7e5", "f1c4", "b8c6"):
-            before.push_uci(uci)
-        move = chess.Move.from_uci("d1h5")
+        before = chess.Board("4k3/8/8/8/8/8/4R3/4K3 w - - 0 1")
+        move = chess.Move.from_uci("e2e7")
         self.assertIn(move, before.legal_moves)
         after = before.copy(stack=True)
         after.push(move)
         self.assertTrue(after.is_check())
-        engine = self.FakeEngine(["g7g6", "h5e5", "d8f6", "e5f6", "c6d4"])
+        engine = self.FakeEngine(["e8f8", "e7e2", "f8g8", "e2e8", "g8h7"])
 
         plan = build_move_coaching_plan(
-            engine, before.fen(), after.fen(), "d1h5", "white",
+            engine, before.fen(), after.fen(), "e2e7", "white",
             max_plies=5, search_seconds=0.08,
         )
         self.assertEqual(plan["mode"], "tactical-queue")
