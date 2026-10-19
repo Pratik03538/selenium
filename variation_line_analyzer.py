@@ -651,7 +651,21 @@ function onUp(event) {
   if (!fen || fen !== saved.fen) return;
 
   if (to === saved.from) {
-    // A right-click without a drag is the user's explicit clear-all gesture.
+    // In tracker-launched autoplay mode, a click on a piece requests its
+    // control/attack map. SHOW MOVE keeps the existing clear-all gesture.
+    if (autoplayControlEnabled && !turnHintEnabled) {
+      queue.push({
+        action:'attack_map',
+        square:saved.from,
+        fen,
+        geometry:saved.rect,
+        bottomSide:saved.side,
+        at:Date.now()
+      });
+      if (queue.length > 20) queue.splice(0, queue.length-20);
+      return;
+    }
+    // In manual SHOW MOVE mode, a right-click without a drag clears the queue.
     userArrows.clear();
     queue.push({action:'clear_all', fen, remainingArrows:0, at:Date.now()});
     if (queue.length > 20) queue.splice(0, queue.length-20);
@@ -1012,6 +1026,91 @@ def autoplay_preview_plies(reason: str) -> int:
         "TACTICAL EVAL SWING",
     )
     return 4 if any(token in str(reason).upper() for token in tactical_tokens) else 2
+
+
+def piece_controlled_squares(board: chess.Board, square_name: str) -> list[str]:
+    """Return geometric squares attacked/controlled by the piece on a square."""
+    try:
+        source = chess.parse_square(str(square_name or "").strip().lower())
+    except ValueError:
+        return []
+    if board.piece_at(source) is None:
+        return []
+    return [chess.square_name(square) for square in sorted(board.attacks(source))]
+
+
+def draw_native_piece_control_map(
+    driver,
+    board: chess.Board,
+    source_square: str,
+    geometry: dict,
+    generated: list[tuple[str, dict]],
+) -> list[str]:
+    """Draw native right-drag arrows from a selected piece to its attacked squares."""
+    try:
+        source = chess.parse_square(str(source_square or "").strip().lower())
+        piece = board.piece_at(source)
+        if piece is None:
+            print(f"[CONTROL MAP] No piece on {source_square}.", flush=True)
+            return []
+        geom = {
+            "left": float(geometry.get("left", 0)),
+            "top": float(geometry.get("top", 0)),
+            "width": float(geometry.get("width", 0)),
+            "height": float(geometry.get("height", 0)),
+            "bottom_side": str(geometry.get("bottom_side", "")),
+        }
+        if (
+            geom["width"] <= 8
+            or geom["height"] <= 8
+            or abs(geom["width"] - geom["height"]) > max(8.0, geom["width"] * 0.08)
+            or geom["bottom_side"] not in {"white", "black"}
+        ):
+            print("[CONTROL MAP] Invalid board geometry; no arrows drawn.", flush=True)
+            return []
+
+        targets = piece_controlled_squares(board, source_square)
+        if not targets:
+            print(f"[CONTROL MAP] {piece.symbol()} on {source_square} controls no squares.", flush=True)
+            return []
+        cdp = tracker._direct_cdp_page_for_driver(driver)
+        if cdp is None and callable(getattr(driver, "execute_cdp_cmd", None)):
+            cdp = driver
+        if cdp is None:
+            print("[CONTROL MAP] Native arrow channel unavailable.", flush=True)
+            return []
+
+        shown: list[str] = []
+        set_listener_suppressed(driver, True)
+        try:
+            for target in targets:
+                uci = str(source_square).lower() + target
+                result = dispatch_native_annotation_arrow(
+                    cdp, uci,
+                    left=geom["left"], top=geom["top"],
+                    width=geom["width"], height=geom["height"],
+                    bottom_side=geom["bottom_side"],
+                )
+                if result.get("ok"):
+                    generated.append((uci, dict(geom)))
+                    shown.append(target)
+                    time.sleep(0.004)
+                else:
+                    print(
+                        f"[CONTROL MAP] Could not draw {uci} ({result.get('reason', 'unknown')}).",
+                        flush=True,
+                    )
+        finally:
+            set_listener_suppressed(driver, False)
+        print(
+            f"[CONTROL MAP] {piece.symbol()} on {source_square}: "
+            f"{len(shown)}/{len(targets)} controlled squares annotated.",
+            flush=True,
+        )
+        return shown
+    except Exception as exc:
+        print(f"[CONTROL MAP] Drawing failed ({type(exc).__name__}).", flush=True)
+        return []
 
 
 def draw_native_autoplay_preview(
@@ -1648,6 +1747,7 @@ def main() -> int:
         last_autoplay_eval_fen = ""
         last_autoplay_eval_value: float | None = None
         last_autoplay_mate_distance: int | None = None
+        last_attack_map_square = ""
         off_hint_status = (
             "OFF · autoplay mode" if mode_control_file is not None
             else "OFF · no move is played"
@@ -1748,6 +1848,7 @@ def main() -> int:
                     if not autoplay_preview_mode:
                         if generated:
                             clear_generated(driver, generated)
+                        last_attack_map_square = ""
                         last_autoplay_eval_fen = ""
                         last_autoplay_eval_value = None
                         last_autoplay_mate_distance = None
@@ -1773,6 +1874,7 @@ def main() -> int:
                                 observed_move = None
 
                         clear_generated(driver, generated)
+                        last_attack_map_square = ""
                         try:
                             driver.execute_script("window.__variationLineAnalyzer?.clearLabels?.();")
                             next_board = chess.Board(current_fen)
@@ -2084,6 +2186,41 @@ def main() -> int:
                             continue
 
                         action = str(event.get("action") or "draw").lower()
+                        if action == "attack_map":
+                            source_square = str(event.get("square") or "").strip().lower()
+                            try:
+                                map_board = chess.Board(event_fen or current_fen)
+                                source = chess.parse_square(source_square)
+                            except ValueError:
+                                print("[CONTROL MAP] Invalid position or square; no arrows drawn.", flush=True)
+                                continue
+
+                            # Toggle off a repeated click on the same piece; selecting
+                            # a different piece replaces the prior control map.
+                            if last_attack_map_square == source_square and generated:
+                                clear_generated(driver, generated)
+                                last_attack_map_square = ""
+                                print(f"[CONTROL MAP] Cleared map for {source_square}.", flush=True)
+                                continue
+
+                            if generated:
+                                clear_generated(driver, generated)
+                            last_attack_map_square = ""
+                            piece = map_board.piece_at(source)
+                            if piece is None:
+                                print(f"[CONTROL MAP] No piece on {source_square}.", flush=True)
+                                continue
+                            shown_squares = draw_native_piece_control_map(
+                                driver,
+                                map_board,
+                                source_square,
+                                event.get("geometry") if isinstance(event.get("geometry"), dict) else {},
+                                generated,
+                            )
+                            if shown_squares:
+                                last_attack_map_square = source_square
+                            continue
+
                         if action in {"clear", "clear_all"}:
                             remaining_arrows = int(event.get("remainingArrows", 0) or 0)
                             if action == "clear" and remaining_arrows > 0:
