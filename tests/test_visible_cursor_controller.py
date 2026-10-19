@@ -174,6 +174,28 @@ class VisibleMoveTests(unittest.TestCase):
         self.assertIn(("release", "left"), backend.events)
         self.assertIn(("release_all",), backend.events)
 
+    def test_tracker_prevalidated_move_reads_fen_only_at_the_final_press_guard(self):
+        controller, backend = make_controller()
+        fen = chess.STARTING_FEN
+        reads = []
+
+        def read_fen():
+            reads.append(1)
+            return fen
+
+        result = controller.move_uci(
+            "e2e4",
+            expected_fen=fen,
+            current_fen_reader=read_fen,
+            geometry=BoardGeometry(0, 0, 800, 800),
+            bot_color="white",
+            focus_guard=lambda: True,
+            position_prevalidated=True,
+        )
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(len(reads), 1)
+        self.assertIn(("release_all",), backend.events)
+
     def test_illegal_move_is_rejected_without_mouse_input(self):
         controller, backend = make_controller()
         fen = chess.STARTING_FEN
@@ -303,6 +325,25 @@ class VisibleArrowTests(unittest.TestCase):
 
         third = self.draw(controller, fen, game_id="game-2")
         self.assertTrue(third.ok, third.reason)
+
+    def test_prevalidated_arrow_skips_duplicate_initial_fen_read(self):
+        controller, backend = make_controller()
+        fen = chess.STARTING_FEN
+        reads = []
+
+        def read_fen():
+            reads.append(1)
+            return fen
+
+        result = self.draw(
+            controller,
+            fen,
+            current_fen_reader=read_fen,
+            position_prevalidated=True,
+        )
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(len(reads), 1)
+        self.assertIn(("release_all",), backend.events)
 
     def test_auto_draw_and_fast_modes_suppress_input(self):
         controller, backend = make_controller()
