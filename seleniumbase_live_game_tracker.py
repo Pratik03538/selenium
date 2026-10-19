@@ -2831,11 +2831,6 @@ def calculate_top_continuation_uci_moves(
     return continuation
 
 
-def chess_value_for_minor_piece() -> int:
-    """Return a minimal material threshold for a meaningful danger arrow."""
-    return 3
-
-
 def build_move_coaching_plan(
     engine,
     previous_fen: str,
@@ -2910,7 +2905,6 @@ def build_move_coaching_plan(
     has_forced_mate = False
     first_reply_recaptures = False
     score_text = ""
-    bot_score_cp: int | None = None
     if engine is not None:
         try:
             info_result = engine.analyse(
@@ -2928,11 +2922,8 @@ def build_move_coaching_plan(
                         if callable(getattr(bot_score, "is_mate", None)) and bot_score.is_mate():
                             mate_distance = bot_score.mate()
                             has_forced_mate = mate_distance is not None and mate_distance > 0
-                        if callable(getattr(bot_score, "score", None)):
-                            bot_score_cp = bot_score.score(mate_score=100000)
                     except Exception:
                         score_text = ""
-                        bot_score_cp = None
                         has_forced_mate = False
 
                 pv = info.get("pv")
@@ -2956,7 +2947,6 @@ def build_move_coaching_plan(
             has_forced_mate = False
             first_reply_recaptures = False
             score_text = ""
-            bot_score_cp = None
 
     # A routine check is not enough. Only queue checks with very few legal
     # replies; forced mate, promotion and a meaningful, confirmed recapture are
@@ -2964,7 +2954,7 @@ def build_move_coaching_plan(
     forcing_check = False
     if after.is_check():
         try:
-            forcing_check = sum(1 for _ in after.legal_moves) <= 3
+            forcing_check = sum(1 for _ in after.legal_moves) <= 2
         except Exception:
             forcing_check = False
 
@@ -3062,7 +3052,7 @@ def build_move_coaching_plan(
             is_engine_choice = reply.uci() == best_reply_uci
             clear_material_risk = (
                 victim_value > attacker_value
-                or (not defenders and victim_value >= chess_value_for_minor_piece())
+                or (not defenders and victim_value >= 3)
             )
             if not is_engine_choice and not clear_material_risk:
                 continue
