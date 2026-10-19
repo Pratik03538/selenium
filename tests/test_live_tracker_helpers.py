@@ -25,6 +25,7 @@ from seleniumbase_live_game_tracker import (
     choose_mate_phase_premove,
     infer_move_between_fens,
     calculate_top_continuation_uci_moves,
+    build_move_coaching_plan,
     premove_phase_allowed,
     reconstruct_history_from_dom_moves,
     sync_dashboard_history,
@@ -145,6 +146,79 @@ class TopContinuationArrowTests(unittest.TestCase):
             [],
         )
         self.assertFalse(engine.called)
+
+
+
+
+class MoveCoachingPlanTests(unittest.TestCase):
+    class FakeEngine:
+        def __init__(self, pv=(), score=None):
+            self.pv = [chess.Move.from_uci(uci) for uci in pv]
+            self.score = score
+
+        def analyse(self, board, limit, multipv=1):
+            result = {"pv": list(self.pv)}
+            if self.score is not None:
+                result["score"] = self.score
+            return result
+
+    def test_quiet_position_does_not_show_generic_opponent_pv(self):
+        before = chess.Board()
+        after = before.copy(stack=True)
+        move = chess.Move.from_uci("e2e4")
+        after.push(move)
+        engine = self.FakeEngine(["e7e5", "g1f3", "b8c6", "f1b5", "a7a6"])
+
+        plan = build_move_coaching_plan(
+            engine, before.fen(), after.fen(), "e2e4", "white",
+            max_plies=5, search_seconds=0.08,
+        )
+        self.assertNotEqual(plan["mode"], "tactical-queue")
+        self.assertLessEqual(len(plan["arrows"]), 2)
+        self.assertTrue(all(uci.startswith("e4") for uci in plan["arrows"]))
+
+    def test_capture_without_recapture_uses_single_target_square_highlight(self):
+        before = chess.Board("4k3/8/4p3/3B4/8/8/8/4K3 w - - 0 1")
+        move = chess.Move.from_uci("d5e6")
+        self.assertIn(move, before.legal_moves)
+        after = before.copy(stack=True)
+        after.push(move)
+        engine = self.FakeEngine([])
+
+        plan = build_move_coaching_plan(
+            engine, before.fen(), after.fen(), "d5e6", "white"
+        )
+        self.assertEqual(plan["mode"], "capture-highlight")
+        self.assertEqual(plan["highlight_square"], "e6")
+        self.assertEqual(plan["arrows"], [])
+
+    def test_checking_move_uses_a_forcing_queue_capped_at_five_plies(self):
+        before = chess.Board()
+        for uci in ("e2e4", "e7e5", "f1c4", "b8c6"):
+            before.push_uci(uci)
+        move = chess.Move.from_uci("d1h5")
+        self.assertIn(move, before.legal_moves)
+        after = before.copy(stack=True)
+        after.push(move)
+        self.assertTrue(after.is_check())
+        engine = self.FakeEngine(["g7g6", "h5e5", "d8f6", "e5f6", "c6d4"])
+
+        plan = build_move_coaching_plan(
+            engine, before.fen(), after.fen(), "d1h5", "white",
+            max_plies=5, search_seconds=0.08,
+        )
+        self.assertEqual(plan["mode"], "tactical-queue")
+        self.assertLessEqual(len(plan["arrows"]), 5)
+
+    def test_invalid_position_transition_shows_nothing(self):
+        before = chess.Board()
+        after = chess.Board()
+        after.push_uci("d2d4")
+        plan = build_move_coaching_plan(
+            None, before.fen(), after.fen(), "e2e4", "white"
+        )
+        self.assertEqual(plan["mode"], "none")
+        self.assertEqual(plan["arrows"], [])
 
 
 
