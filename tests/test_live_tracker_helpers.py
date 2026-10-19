@@ -24,7 +24,7 @@ from seleniumbase_live_game_tracker import (
     _PremoveDeadlineExceeded,
     choose_mate_phase_premove,
     infer_move_between_fens,
-    legal_destination_arrow_uci_moves,
+    calculate_top_continuation_uci_moves,
     premove_phase_allowed,
     reconstruct_history_from_dom_moves,
     sync_dashboard_history,
@@ -91,44 +91,62 @@ class BoardInputSourceGuardTests(unittest.TestCase):
         self.assertIn("unreadable-fen-verified", JS_INSTALL_OBSERVER)
 
 
-class LegalDestinationArrowTests(unittest.TestCase):
-    def test_shows_only_legal_destinations_for_the_piece_that_just_moved(self):
+class TopContinuationArrowTests(unittest.TestCase):
+    class FakeEngine:
+        def __init__(self, pv):
+            self.pv = [chess.Move.from_uci(uci) for uci in pv]
+            self.called = False
+
+        def analyse(self, board, limit, multipv=1):
+            self.called = True
+            self.board_fen_at_search = board.fen()
+            return {"pv": list(self.pv)}
+
+    def test_draw_line_is_limited_to_the_next_two_pv_moves(self):
         board = chess.Board()
-        move = chess.Move.from_uci("e2e4")
-        board.push(move)
+        original_fen = board.fen()
+        engine = self.FakeEngine(["e2e4", "e7e5", "g1f3"])
 
         self.assertEqual(
-            legal_destination_arrow_uci_moves(board, "e2e4", "white"),
-            ["e4e5"],
+            calculate_top_continuation_uci_moves(
+                engine, board, max_plies=2, search_seconds=0.05
+            ),
+            ["e2e4", "e7e5"],
         )
+        self.assertTrue(engine.called)
+        self.assertEqual(board.fen(), original_fen)
 
-    def test_rejects_a_moved_side_mismatch(self):
+    def test_stops_if_stockfish_pv_contains_an_illegal_followup(self):
         board = chess.Board()
-        board.push_uci("e2e4")
+        engine = self.FakeEngine(["e2e4", "e2e3"])
+
         self.assertEqual(
-            legal_destination_arrow_uci_moves(board, "e2e4", "black"),
-            [],
+            calculate_top_continuation_uci_moves(engine, board, max_plies=2),
+            ["e2e4"],
         )
 
-    def test_shows_no_destinations_after_checkmate(self):
+    def test_never_returns_more_than_two_arrows(self):
+        board = chess.Board()
+        engine = self.FakeEngine(["e2e4", "e7e5", "g1f3", "b8c6"])
+
+        self.assertEqual(
+            calculate_top_continuation_uci_moves(engine, board, max_plies=5),
+            ["e2e4", "e7e5"],
+        )
+
+    def test_no_analysis_arrows_after_checkmate(self):
         board = chess.Board()
         for uci in ("f2f3", "e7e5", "g2g4", "d8h4"):
             board.push_uci(uci)
-        self.assertTrue(board.is_checkmate())
-        self.assertEqual(
-            legal_destination_arrow_uci_moves(board, "d8h4", "black"),
-            [],
-        )
+        engine = self.FakeEngine([])
 
-    def test_returns_no_arrows_if_the_moved_piece_is_no_longer_on_its_destination(self):
-        board = chess.Board()
-        board.push_uci("e2e4")
-        board.push_uci("d7d5")
-        board.push_uci("e4e5")
         self.assertEqual(
-            legal_destination_arrow_uci_moves(board, "e2e4", "white"),
+            calculate_top_continuation_uci_moves(engine, board, max_plies=2),
             [],
         )
+        self.assertFalse(engine.called)
+
+
 
 
 class MoveRetryGateTests(unittest.TestCase):
