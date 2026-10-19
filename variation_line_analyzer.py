@@ -1,9 +1,9 @@
 """Interactive line analyzer for an authorized study/test board.
 
 Reuses the tracker's allowlist, Chrome attach, board reader, and native-arrow
-helpers. When launched by the tracker, SHOW MOVE ON switches its existing BOT
-off and shows hints; SHOW MOVE OFF switches the tracker BOT on. This analyzer
-does not submit moves itself, and public competitive hosts remain blocked.
+helpers. Analysis, variation branches, and turn hints run in this companion
+module; it does not submit moves or change the tracker's autoplay settings.
+Public competitive chess hosts remain blocked.
 """
 from __future__ import annotations
 
@@ -44,37 +44,6 @@ def make_observer_config(board_selector: str) -> dict:
         "blackPlayerSelector": tracker.load_optional_txt_setting("black_player_selector") or ".black.player, .player.black, [data-color='black'], [data-side='black'], [data-player-color='black'], #black-player, .black-player",
     }
 
-
-def publish_autoplay_mode(
-    path: Path | None,
-    enabled: bool,
-    move_reference: dict | None = None,
-) -> bool:
-    """Atomically publish the BOT switch and latest SHOW MOVE reference to the tracker."""
-    if path is None:
-        return False
-    payload = {"autoplay_enabled": bool(enabled)}
-    if move_reference is not None:
-        payload["move_reference"] = move_reference
-    else:
-        # Mode changes should not erase the last reference already published.
-        try:
-            previous = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(previous, dict) and isinstance(previous.get("move_reference"), dict):
-                payload["move_reference"] = previous["move_reference"]
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            pass
-    temp_path = path.with_name(path.name + ".tmp")
-    try:
-        temp_path.write_text(json.dumps(payload), encoding="utf-8")
-        temp_path.replace(path)
-        return True
-    except OSError:
-        try:
-            temp_path.unlink()
-        except OSError:
-            pass
-        return False
 
 
 INSTALL_LINE_WATCHER = r"""
@@ -1275,13 +1244,10 @@ def main() -> int:
     parser.add_argument("--allowed-domain", default="")
     parser.add_argument("--board-selector", default="chess-board")
     parser.add_argument("--window-handle", default="", help="Optional tracker-selected Chrome tab handle for automatic launch.")
-    parser.add_argument("--autoplay-control-file", default="", help="Optional private IPC file used only when the tracker launches this companion.")
     parser.add_argument("--stockfish-path", default="")
     parser.add_argument("--plies", type=int, default=0, help="Optional maximum sequential plies; 0 means unlimited (default).")
     parser.add_argument("--search-time", type=float, default=0.05, help="Fast Stockfish search time per position in seconds (0.05-2.0).")
     args = parser.parse_args()
-    mode_control_raw = str(args.autoplay_control_file or "").strip()
-    mode_control_file = Path(mode_control_raw).expanduser().resolve() if mode_control_raw else None
     args.plies = max(0, int(args.plies))
     progress_limit = str(args.plies) if args.plies > 0 else "∞"
     args.search_time = max(0.05, min(2.0, float(args.search_time)))
@@ -1381,7 +1347,7 @@ def main() -> int:
             print("[BOARD ERROR] Board/game API was not detected. Configure the board selector and exposed board game API first.", file=sys.stderr)
             return 2
         watch_result = driver.execute_script(
-            INSTALL_LINE_WATCHER, args.board_selector, mode_control_file is not None
+            INSTALL_LINE_WATCHER, args.board_selector, False
         )
         if not isinstance(watch_result, dict) or not watch_result.get("ok"):
             print("[BOARD ERROR] Could not install the right-click line listener.", file=sys.stderr)
@@ -1455,11 +1421,7 @@ def main() -> int:
         turn_hint_was_enabled = False
         turn_hint_last_key = ""
         turn_hint_last_status = "OFF"
-        last_published_autoplay_state: bool | None = None
-        off_hint_status = (
-            "OFF · autoplay mode" if mode_control_file is not None
-            else "OFF · no move is played"
-        )
+        off_hint_status = "OFF · no move is played"
 
         def show_next_step() -> None:
             nonlocal pending_hints, awaiting_clear, queued_followup_hint
@@ -1564,18 +1526,6 @@ def main() -> int:
                         "return window.__variationLineAnalyzer?.getTurnHintState?.() || {enabled:false};"
                     ) or {}
                     turn_hint_enabled = bool(turn_hint_ui.get("enabled"))
-                    if mode_control_file is not None:
-                        requested_autoplay = not turn_hint_enabled
-                        if requested_autoplay != last_published_autoplay_state:
-                            if publish_autoplay_mode(mode_control_file, requested_autoplay):
-                                last_published_autoplay_state = requested_autoplay
-                                print(
-                                    "[MODE] SHOW MOVE: "
-                                    + ("OFF -> tracker BOT ON." if requested_autoplay else "ON -> tracker BOT OFF."),
-                                    flush=True,
-                                )
-                            else:
-                                print("[MODE] Could not send the toggle state to the tracker.", flush=True)
                     if not turn_hint_enabled:
                         if turn_hint_was_enabled or turn_hint_last_status != "OFF":
                             driver.execute_script(
@@ -1695,28 +1645,6 @@ def main() -> int:
                                                 "source": selected_source,
                                             },
                                         )
-                                        if mode_control_file is not None:
-                                            try:
-                                                selected_rank_value = (
-                                                    int(selected_rank) if selected_rank is not None else None
-                                                )
-                                            except (TypeError, ValueError):
-                                                selected_rank_value = None
-                                            move_reference = {
-                                                "event_id": str(time.time_ns()),
-                                                "fen": current_fen,
-                                                "uci": selected_move.uci(),
-                                                "san": selected_san,
-                                                "ply": turn_board.ply() + 1,
-                                                "side": (
-                                                    "White" if turn_board.turn == chess.WHITE else "Black"
-                                                ),
-                                                "rank": selected_rank_value,
-                                                "source": selected_source,
-                                            }
-                                            publish_autoplay_mode(
-                                                mode_control_file, False, move_reference
-                                            )
                                         if isinstance(shown, dict) and shown.get("ok"):
                                             message = "ON · your turn · " + selected_san
                                             print(
