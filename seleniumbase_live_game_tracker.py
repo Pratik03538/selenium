@@ -83,6 +83,12 @@ CSV_FIELDS = [
     "black_clock", "result", "note",
 ]
 
+# Bound the deliberate pauses between a completed bot move and its annotation
+# queue, and between queued right-drag arrows. Preview-cursor travel counts toward
+# the same interval so it does not add a second pause.
+CURSOR_DRAW_GAP_MIN_SECONDS = 0.010
+CURSOR_DRAW_GAP_MAX_SECONDS = 0.030
+
 
 _VISIBLE_CURSOR_CONTROLLER = None
 
@@ -3800,7 +3806,7 @@ def _replace_native_coaching_annotations(
 
                 if routes or next_highlight:
                     # Keep the post-move pause tiny and bounded, not another thinking delay.
-                    time.sleep(random.uniform(0.010, 0.030))
+                    time.sleep(random.uniform(CURSOR_DRAW_GAP_MIN_SECONDS, CURSOR_DRAW_GAP_MAX_SECONDS))
 
                 for route_index, route in enumerate(routes):
                     result = controller.draw_arrow(
@@ -3823,7 +3829,7 @@ def _replace_native_coaching_annotations(
                         if route_index < len(routes) - 1 or next_highlight:
                             # Leave the arrow endpoint, preview one possible next move,
                             # then use a short random gap before the next queued annotation.
-                            target_gap_s = random.uniform(0.010, 0.030)
+                            target_gap_s = random.uniform(CURSOR_DRAW_GAP_MIN_SECONDS, CURSOR_DRAW_GAP_MAX_SECONDS)
                             preview_elapsed_s = preview_cursor(max_moves=1)
                             remaining_gap_s = max(0.0, target_gap_s - preview_elapsed_s)
                             if remaining_gap_s:
