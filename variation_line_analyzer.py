@@ -866,38 +866,54 @@ def dispatch_native_annotation_arrow(
     sx, sy = square_point(text[:2])
     dx, dy = square_point(text[2:4])
     mx, my = (sx + dx) / 2.0, (sy + dy) / 2.0
+    # A direct websocket is faster, but ChromeDriver's built-in CDP command
+    # is a reliable fallback when a Chrome attach session does not expose the
+    # page websocket. Keep this limited to native right-click annotation input.
+    use_driver_cdp = callable(getattr(cdp, "execute_cdp_cmd", None))
     command_ids: set[int] = set()
+
+    def send_mouse_event(params: dict) -> None:
+        if use_driver_cdp:
+            cdp.execute_cdp_cmd("Input.dispatchMouseEvent", params)
+        else:
+            command_ids.add(cdp.send("Input.dispatchMouseEvent", params))
+
     try:
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+        send_mouse_event({
             "type": "mouseMoved", "x": sx, "y": sy,
             "button": "none", "buttons": 0, "pointerType": "mouse",
-        }))
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+        })
+        send_mouse_event({
             "type": "mousePressed", "x": sx, "y": sy,
             "button": "right", "buttons": 2, "clickCount": 1,
             "pointerType": "mouse",
-        }))
+        })
         time.sleep(0.004)
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+        send_mouse_event({
             "type": "mouseMoved", "x": mx, "y": my,
             "button": "right", "buttons": 2, "pointerType": "mouse",
-        }))
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+        })
+        send_mouse_event({
             "type": "mouseMoved", "x": dx, "y": dy,
             "button": "right", "buttons": 2, "pointerType": "mouse",
-        }))
-        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+        })
+        send_mouse_event({
             "type": "mouseReleased", "x": dx, "y": dy,
             "button": "right", "buttons": 0, "clickCount": 1,
             "pointerType": "mouse",
-        }))
-        cdp.wait_for(command_ids, timeout=1.0)
+        })
+        if not use_driver_cdp:
+            cdp.wait_for(command_ids, timeout=1.0)
     except Exception as exc:
         try:
-            cdp.send("Input.dispatchMouseEvent", {
+            release = {
                 "type": "mouseReleased", "button": "right",
                 "buttons": 0, "pointerType": "mouse",
-            })
+            }
+            if use_driver_cdp:
+                cdp.execute_cdp_cmd("Input.dispatchMouseEvent", release)
+            else:
+                cdp.send("Input.dispatchMouseEvent", release)
         except Exception:
             pass
         return {"ok": False, "reason": "native-arrow-gesture-failed", "error_type": type(exc).__name__}
@@ -908,6 +924,8 @@ def clear_generated(driver, generated: list[tuple[str, dict]]) -> None:
     if not generated:
         return
     cdp = tracker._direct_cdp_page_for_driver(driver)
+    if cdp is None and callable(getattr(driver, "execute_cdp_cmd", None)):
+        cdp = driver
     if cdp is None:
         generated.clear()
         return
@@ -1016,6 +1034,12 @@ def draw_native_autoplay_preview(
         ):
             return []
         cdp = tracker._direct_cdp_page_for_driver(driver)
+        if cdp is None and callable(getattr(driver, "execute_cdp_cmd", None)):
+            cdp = driver
+            print(
+                "[AUTO ARROWS] Direct websocket unavailable; using ChromeDriver CDP for native arrows.",
+                flush=True,
+            )
         if cdp is None:
             print("[AUTO ARROWS] Native board channel is unavailable; no overlay fallback used.", flush=True)
             return []
@@ -1404,6 +1428,8 @@ def remove_unconfirmed_native_arrow(driver, event: dict) -> None:
         uci = str(event.get("from", "")) + str(event.get("to", ""))
         geom = event.get("geometry") or {}
         cdp = tracker._direct_cdp_page_for_driver(driver)
+        if cdp is None and callable(getattr(driver, "execute_cdp_cmd", None)):
+            cdp = driver
         if cdp is None or len(uci) < 4:
             return
         set_listener_suppressed(driver, True)
