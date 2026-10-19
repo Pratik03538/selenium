@@ -569,7 +569,9 @@ class VisibleCursorMovementQueueIntegrationTests(unittest.TestCase):
     def test_premove_queue_also_moves_cursor_to_possible_reply_routes(self):
         from seleniumbase_live_game_tracker import _perform_cursor_drag_once
 
-        before = chess.STARTING_FEN
+        board_before = chess.Board()
+        board_before.push_uci("e2e4")
+        before = board_before.fen()  # Black to move while White's premove is queued.
         target = {
             "ok": True, "width": 800.0, "height": 800.0,
             "left": 10.0, "top": 20.0, "bottomSide": "white",
