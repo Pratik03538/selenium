@@ -3529,7 +3529,8 @@ return {
   screenTop: (Number(window.screenY || 0) + Number(window.outerHeight || window.innerHeight)
       - Number(window.innerHeight) + Number(rect.top)) * dpr,
   screenWidth: Number(rect.width) * dpr,
-  screenHeight: Number(rect.height) * dpr
+  screenHeight: Number(rect.height) * dpr,
+  windowTitle: String(document.title || '')
 };
 """
     try:
@@ -3550,6 +3551,7 @@ return {
             "screen_top": float(result["screenTop"]) if result.get("screenTop") is not None else None,
             "screen_width": float(result["screenWidth"]) if result.get("screenWidth") is not None else None,
             "screen_height": float(result["screenHeight"]) if result.get("screenHeight") is not None else None,
+            "window_title": str(result.get("windowTitle") or ""),
         }
     except (KeyError, TypeError, ValueError):
         return None
@@ -3704,9 +3706,9 @@ def _replace_native_coaching_annotations(
     The board clears native annotations on a move. Never toggle old routes here,
     because a right-drag would recreate them instead of clearing them.
     """
-    cdp = None if use_visible_cursor else _direct_cdp_page_for_driver(driver)
+    cdp = _direct_cdp_page_for_driver(driver)
     geometry = _read_board_annotation_geometry(driver, board_selector)
-    if geometry is None or (not use_visible_cursor and cdp is None):
+    if geometry is None or cdp is None:
         return [], None
 
     try:
@@ -3719,13 +3721,14 @@ def _replace_native_coaching_annotations(
     drawn: list[str] = []
     kept_highlight: str | None = None
     try:
-        current_fen = ""
-        try:
-            current_fen = str(driver.execute_script(
-                "return window.__liveGameApiReader?.current?.()?.fen || '';"
-            ) or "").strip()
-        except Exception:
-            current_fen = ""
+        current_fen = str(geometry.get("fen") or "").strip()
+        if not current_fen:
+            try:
+                current_fen = str(cdp.evaluate(
+                    "(() => String(window.__liveGameApiReader?.current?.()?.fen || ''))()"
+                ) or "").strip()
+            except Exception:
+                current_fen = ""
 
         position_matches = False
         if expected_fen and current_fen and chess is not None:
@@ -3745,20 +3748,33 @@ def _replace_native_coaching_annotations(
                 else None
             )
             try:
-                screen_geometry = (
-                    read_selenium_board_geometry(
-                        driver, board_selector, str(geometry["bottom_side"])
+                if all(
+                    geometry.get(key) is not None
+                    for key in ("screen_left", "screen_top", "screen_width", "screen_height")
+                ):
+                    screen_geometry = BoardGeometry(
+                        left=float(geometry["screen_left"]),
+                        top=float(geometry["screen_top"]),
+                        width=float(geometry["screen_width"]),
+                        height=float(geometry["screen_height"]),
+                        bottom_side=str(geometry["bottom_side"]),
+                    ) if BoardGeometry is not None else None
+                else:
+                    # Compatibility fallback for older geometry readers/tests.
+                    screen_geometry = (
+                        read_selenium_board_geometry(
+                            driver, board_selector, str(geometry["bottom_side"])
+                        )
+                        if read_selenium_board_geometry is not None
+                        else None
                     )
-                    if read_selenium_board_geometry is not None
-                    else None
-                )
-                window_title = str(driver.title or "").strip()
+                window_title = str(geometry.get("window_title") or "").strip()
             except Exception:
                 screen_geometry = None
                 window_title = ""
             if controller is not None and screen_geometry is not None and window_title:
-                current_fen_reader = lambda: str(driver.execute_script(
-                    "return window.__liveGameApiReader?.current?.()?.fen || '';"
+                current_fen_reader = lambda: str(cdp.evaluate(
+                    "(() => String(window.__liveGameApiReader?.current?.()?.fen || ''))()"
                 ) or "").strip()
                 focus_guard = lambda: controller.backend.foreground_title_contains(window_title)
 
@@ -3779,6 +3795,7 @@ def _replace_native_coaching_annotations(
                         fast_mode=bool(fast_mode),
                         bot_clock_seconds=bot_clock,
                         low_clock_trigger_seconds=low_clock_trigger_seconds,
+                        position_prevalidated=True,
                     )
                     if result.ok:
                         drawn.append(route)
@@ -3795,6 +3812,7 @@ def _replace_native_coaching_annotations(
                         fast_mode=bool(fast_mode),
                         bot_clock_seconds=bot_clock,
                         low_clock_trigger_seconds=low_clock_trigger_seconds,
+                        position_prevalidated=True,
                     )
                     if highlight_result.ok:
                         kept_highlight = next_highlight
@@ -3848,7 +3866,7 @@ def _perform_cursor_drag_once(
             "const screenTop = (Number(window.screenY || 0) + Number(window.outerHeight || window.innerHeight) "
             "- Number(window.innerHeight) + Number(r.top)) * dpr; "
             "return {ok:true,width:r.width,height:r.height,left:r.left,top:r.top,bottomSide:t.bottomSide, "
-            "screenLeft,screenTop,screenWidth:r.width*dpr,screenHeight:r.height*dpr}; })()"
+            "screenLeft,screenTop,screenWidth:r.width*dpr,screenHeight:r.height*dpr,windowTitle:String(document.title||'')}; })()"
         )
         target = cdp.evaluate(target_expression, timeout=0.8)
     except Exception:
@@ -3874,13 +3892,13 @@ def _perform_cursor_drag_once(
         return {"ok": False, "reason": "invalid-board-geometry"}
 
     rng = random.SystemRandom()
-    pre_delay_ms = 0 if low_clock_mode else rng.randint(1, 5)
+    pre_delay_ms = 0
     waypoint_count = 4 if low_clock_mode else 12
     total_drag_ms = 0
     confirm_interval_ms = rng.randint(4, 10)
     # A native desktop-cursor gesture can take longer than synthetic CDP input.
     # This timeout is post-action confirmation time, so it does not consume the move's clock.
-    confirmation_timeout_ms = int(350 if low_clock_mode else (650 if allow_premove else 1000))
+    confirmation_timeout_ms = int(120 if low_clock_mode else (450 if allow_premove else 450))
 
     # Start a page-side watcher before sending mouse input. MutationObserver is
     # immediate; a 4-10ms in-page interval is the fallback for API-only updates.
@@ -3929,7 +3947,7 @@ def _perform_cursor_drag_once(
                 height=float(target["screenHeight"]),
                 bottom_side=bottom_side,
             )
-            window_title = str(driver.title or "").strip()
+            window_title = str(target.get("windowTitle") or "").strip()
         except (KeyError, TypeError, ValueError, WebDriverException):
             return {
                 "ok": False,
@@ -3966,6 +3984,7 @@ def _perform_cursor_drag_once(
                 focus_guard=focus_guard,
                 allow_premove=bool(allow_premove),
                 premove_prevalidated=bool(allow_premove),
+                position_prevalidated=True,
             )
         except Exception as exc:
             return {
