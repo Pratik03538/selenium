@@ -3805,20 +3805,8 @@ def _replace_native_coaching_annotations(
                         return 0.0
 
                 if routes or next_highlight:
-                    # Use the post-move gap to glide over one plausible next move,
-                    # instead of leaving the pointer parked on the last moved piece.
-                    # Movement time counts toward the same 10–30ms gap budget.
-                    target_gap_s = random.uniform(
-                        CURSOR_DRAW_GAP_MIN_SECONDS, CURSOR_DRAW_GAP_MAX_SECONDS
-                    )
-                    preview_elapsed_s = preview_cursor(max_moves=1) if routes else 0.0
-                    remaining_gap_s = max(0.0, target_gap_s - preview_elapsed_s)
-                    if remaining_gap_s:
-                        time.sleep(remaining_gap_s)
-                else:
-                    # No annotation to draw this turn? Still don't park the pointer
-                    # at the move destination; preview one or two legal next-move paths.
-                    preview_cursor(max_moves=2)
+                    # Keep the post-move pause tiny and bounded, not another thinking delay.
+                    time.sleep(random.uniform(CURSOR_DRAW_GAP_MIN_SECONDS, CURSOR_DRAW_GAP_MAX_SECONDS))
 
                 for route_index, route in enumerate(routes):
                     result = controller.draw_arrow(
