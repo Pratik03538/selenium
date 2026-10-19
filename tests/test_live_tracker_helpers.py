@@ -464,6 +464,12 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
                 return_value=object(),
             ) as fallback_geometry,
             patch("seleniumbase_live_game_tracker._same_chess_position", return_value=True),
+            patch("seleniumbase_live_game_tracker.time.sleep") as gap_sleep,
+            patch("seleniumbase_live_game_tracker.random.uniform", return_value=0.015) as random_gap,
+            patch(
+                "seleniumbase_live_game_tracker.time.monotonic",
+                side_effect=[0.0, 0.005, 1.0, 1.005, 2.0, 2.005],
+            ),
         ):
             arrows, highlight = _replace_native_coaching_annotations(
                 FakeDriver(), "board", [], None, ["d4d8", "a4a8"], "e4", fen,
@@ -488,8 +494,8 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
         controller.draw_highlight.assert_called_once()
         self.assertEqual(controller.preview_legal_moves.call_count, 3)
         self.assertEqual(
-            [item.args[0] for item in gap_sleep.call_args_list],
-            [0.015, 0.015, 0.015],
+            [round(item.args[0], 3) for item in gap_sleep.call_args_list],
+            [0.015, 0.010, 0.010],
         )
         self.assertEqual(random_gap.call_count, 3)
         for call_item in random_gap.call_args_list:
