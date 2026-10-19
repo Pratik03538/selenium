@@ -7152,13 +7152,13 @@ def main() -> int:
                                             )
                                         if args.move_input == "cursor" and submit.get("drag_ms") is not None:
                                             print(
-                                                f"[CURSOR] Direct CDP gesture accepted | configured-travel={int(submit.get('drag_ms', 0))} ms "
+                                                f"[CURSOR] Visible desktop pointer gesture accepted | path+drag={int(submit.get('drag_ms', 0))} ms "
                                                 f"| input-roundtrip={float(submit.get('action_elapsed_ms', 0.0)):.1f} ms "
                                                 f"| confirm-roundtrip={float(submit.get('confirm_elapsed_ms', 0.0)):.1f} ms "
                                                 f"| page-detected={float(submit.get('confirm_detected_ms', 0.0)):.1f} ms "
                                                 f"| confirm-poll={int(submit.get('confirm_interval_ms', 0))} ms "
-                                                f"| pre-delay={int(submit.get('pre_delay_ms', 0))} ms "
-                                                f"| waypoints={int(submit.get('waypoints', 0))}.",
+                                                f"| next-move-preview={float(submit.get('cursor_preview_ms', 0.0)):.1f} ms "
+                                                f"| path-steps={int(submit.get('waypoints', 0))}.",
                                                 flush=True,
                                             )
                                         print(f"[AUTO] Submitted selected move: {chosen_san} ({chosen_move.uci()}).", flush=True)
