@@ -3778,10 +3778,30 @@ def _replace_native_coaching_annotations(
                 ) or "").strip()
                 focus_guard = lambda: controller.backend.foreground_title_contains(window_title)
 
-                for arrow in next_arrows[:5]:
-                    route = str(arrow or "").strip().lower()
-                    if not re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", route):
-                        continue
+                routes = [
+                    str(value or "").strip().lower()
+                    for value in next_arrows[:5]
+                    if re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", str(value or "").strip().lower())
+                ]
+
+                def preview_cursor(max_moves: int) -> None:
+                    # Pointer-only movement; no clicks, no engine calls, no extra FEN read.
+                    try:
+                        controller.preview_legal_moves(
+                            current_fen,
+                            geometry=screen_geometry,
+                            focus_guard=focus_guard,
+                            max_moves=max_moves,
+                            position_prevalidated=True,
+                        )
+                    except Exception:
+                        pass
+
+                if routes or next_highlight:
+                    # Keep the post-move pause tiny and bounded, not another thinking delay.
+                    time.sleep(random.uniform(0.010, 0.030))
+
+                for route_index, route in enumerate(routes):
                     result = controller.draw_arrow(
                         route[:2],
                         route[2:4],
@@ -3799,6 +3819,11 @@ def _replace_native_coaching_annotations(
                     )
                     if result.ok:
                         drawn.append(route)
+                        if route_index < len(routes) - 1 or next_highlight:
+                            # Leave the arrow endpoint, preview one possible next move,
+                            # then use a short random gap before the next queued annotation.
+                            preview_cursor(max_moves=1)
+                            time.sleep(random.uniform(0.010, 0.030))
 
                 if next_highlight:
                     highlight_result = controller.draw_highlight(
@@ -3816,6 +3841,11 @@ def _replace_native_coaching_annotations(
                     )
                     if highlight_result.ok:
                         kept_highlight = next_highlight
+                        preview_cursor(max_moves=2)
+                elif drawn:
+                    # After the final arrow, glide over one or two legal next-move
+                    # routes without pressing a mouse button.
+                    preview_cursor(max_moves=2)
         elif position_matches:
             for arrow in next_arrows[:5]:
                 if _toggle_native_annotation_arrow(cdp, arrow, geometry):
