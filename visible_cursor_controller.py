@@ -101,8 +101,8 @@ class CursorMotionConfig:
     def __post_init__(self) -> None:
         for name in ("approach_duration_s", "move_drag_duration_s", "arrow_drag_duration_s"):
             value = float(getattr(self, name))
-            if not 0.01 <= value <= 2.0:
-                raise ValueError(f"{name} must be between 0.01 and 2.0 seconds")
+            if not 0.001 <= value <= 2.0:
+                raise ValueError(f"{name} must be between 0.001 and 2.0 seconds")
         if not 0 <= self.settle_after_press_s <= 0.15:
             raise ValueError("settle_after_press_s must be between 0 and 0.15 seconds")
         if not 0 <= self.settle_after_release_s <= 0.2:
