@@ -2786,6 +2786,279 @@ def _direct_cdp_page_for_driver(driver):
         return None
 
 
+def legal_destination_arrow_uci_moves(
+    board_after_move: "chess.Board",
+    move_uci: str,
+    moved_side: str | None = None,
+) -> list[str]:
+    """Return legal destination arrows for the piece that just moved.
+
+    This is rule-based python-chess move generation only; it does not call Stockfish.
+    The board is the authoritative position immediately after the move. The moved
+    side is temporarily made side-to-move so legal destinations for that piece can
+    be calculated without submitting a move to the game.
+    """
+    if chess is None or board_after_move is None:
+        return []
+    try:
+        moved = chess.Move.from_uci(str(move_uci or "").strip().lower())
+    except (ValueError, TypeError):
+        return []
+    piece = board_after_move.piece_at(moved.to_square)
+    if piece is None:
+        return []
+    normalized_side = normalize_chess_color(moved_side) if moved_side else None
+    piece_side = "white" if piece.color == chess.WHITE else "black"
+    if normalized_side is not None and normalized_side != piece_side:
+        return []
+
+    probe = board_after_move.copy(stack=True)
+    probe.turn = piece.color
+    by_destination: dict[int, str] = {}
+    try:
+        for candidate in probe.legal_moves:
+            if candidate.from_square != moved.to_square:
+                continue
+            existing = by_destination.get(candidate.to_square)
+            if existing is None or candidate.promotion == chess.QUEEN:
+                # A promotion arrow is visual only, so show one arrow per square
+                # and prefer the queen when several promotion choices share a target.
+                by_destination[candidate.to_square] = candidate.uci()
+    except (ValueError, AssertionError):
+        return []
+    return [by_destination[square] for square in sorted(by_destination)]
+
+
+def _read_board_annotation_geometry(driver, board_selector: str) -> dict[str, object] | None:
+    """Read visible board geometry and orientation for native right-click arrows."""
+    script = r"""
+const requested = String(arguments[0] || '').trim();
+const state = window.__liveGameApiReader?.current?.() || {};
+const selectors = Array.from(new Set([
+  requested, 'wc-chess-board', 'chess-board', '#board-single'
+].filter(Boolean)));
+const roots = [document];
+const visited = new Set();
+let found = null;
+while (roots.length) {
+  const root = roots.shift();
+  if (!root || visited.has(root)) continue;
+  visited.add(root);
+  for (const selector of selectors) {
+    try {
+      for (const candidate of root.querySelectorAll(selector)) {
+        const rect = candidate.getBoundingClientRect();
+        if (rect.width > 8 && rect.height > 8) {
+          found = candidate;
+          break;
+        }
+      }
+    } catch (_) {}
+    if (found) break;
+  }
+  if (found) break;
+  try {
+    for (const element of root.querySelectorAll('*')) {
+      if (element.shadowRoot && !visited.has(element.shadowRoot)) roots.push(element.shadowRoot);
+    }
+  } catch (_) {}
+}
+if (!found) return {ok:false, reason:'board-not-found'};
+const rect = found.getBoundingClientRect();
+let side = String(state.bottomSide || '').trim().toLowerCase();
+if (side !== 'white' && side !== 'black') {
+  let node = found;
+  for (let depth = 0; node && depth < 6; depth++) {
+    for (const attr of ['data-orientation','data-board-orientation','orientation']) {
+      const value = String(node.getAttribute?.(attr) || '').trim().toLowerCase();
+      if (value === 'white' || value === 'black') side = value;
+    }
+    if (side === 'white' || side === 'black') break;
+    const classes = String(node.className?.baseVal || node.className || '').toLowerCase().split(/\s+/);
+    if (classes.some(v => ['flipped','orientation-black','black-bottom'].includes(v))) side = 'black';
+    else if (classes.some(v => ['orientation-white','white-bottom'].includes(v))) side = 'white';
+    if (side === 'white' || side === 'black') break;
+    node = node.parentElement || node.getRootNode?.().host || null;
+  }
+}
+if (side !== 'white' && side !== 'black') {
+  const coordinateRoots = [found, found.shadowRoot].filter(Boolean);
+  for (const root of coordinateRoots) {
+    try {
+      for (const el of root.querySelectorAll('.coordinates')) {
+        let y1 = null, y8 = null;
+        for (const child of Array.from(el.children || [])) {
+          const label = String(child.innerText || child.textContent || '').trim();
+          if (label !== '1' && label !== '8') continue;
+          const itemRect = child.getBoundingClientRect?.();
+          if (!itemRect || !itemRect.width || !itemRect.height) continue;
+          const y = itemRect.top + itemRect.height / 2;
+          if (label === '1') y1 = y;
+          if (label === '8') y8 = y;
+        }
+        if (y1 !== null && y8 !== null && Math.abs(y1 - y8) > 20) {
+          side = y1 > y8 ? 'white' : 'black';
+          break;
+        }
+      }
+    } catch (_) {}
+    if (side === 'white' || side === 'black') break;
+  }
+}
+return {
+  ok: rect.width > 8 && rect.height > 8 && Math.abs(rect.width - rect.height) <= Math.max(8, rect.width * 0.08)
+      && (side === 'white' || side === 'black'),
+  reason: (side === 'white' || side === 'black') ? 'invalid-board-geometry' : 'board-orientation-unknown',
+  left: rect.left, top: rect.top, width: rect.width, height: rect.height, bottomSide: side
+};
+"""
+    try:
+        result = driver.execute_script(script, str(board_selector or ""))
+    except Exception:
+        return None
+    if not isinstance(result, dict) or not result.get("ok"):
+        return None
+    try:
+        geometry = {
+            "left": float(result["left"]),
+            "top": float(result["top"]),
+            "width": float(result["width"]),
+            "height": float(result["height"]),
+            "bottom_side": str(result["bottomSide"]),
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+    if geometry["bottom_side"] not in {"white", "black"}:
+        return None
+    return geometry
+
+
+def _toggle_native_annotation_arrow(cdp, uci: str, geometry: dict[str, object]) -> bool:
+    """Toggle one native board annotation arrow using right-button input."""
+    text = str(uci or "").strip().lower()
+    if chess is None or not re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", text):
+        return False
+    try:
+        left = float(geometry["left"])
+        top = float(geometry["top"])
+        width = float(geometry["width"])
+        height = float(geometry["height"])
+        bottom_side = str(geometry["bottom_side"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if width <= 0 or height <= 0 or bottom_side not in {"white", "black"}:
+        return False
+
+    def square_point(square: str) -> tuple[float, float]:
+        file_index = ord(square[0]) - ord("a")
+        rank_number = int(square[1])
+        board_file = file_index if bottom_side == "white" else 7 - file_index
+        board_row = 8 - rank_number if bottom_side == "white" else rank_number - 1
+        return (
+            left + (board_file + 0.5) * width / 8.0,
+            top + (board_row + 0.5) * height / 8.0,
+        )
+
+    sx, sy = square_point(text[:2])
+    dx, dy = square_point(text[2:4])
+    mx, my = (sx + dx) / 2.0, (sy + dy) / 2.0
+    command_ids: set[int] = set()
+    try:
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": sx, "y": sy,
+            "button": "none", "buttons": 0, "pointerType": "mouse",
+        }))
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mousePressed", "x": sx, "y": sy,
+            "button": "right", "buttons": 2, "clickCount": 1,
+            "pointerType": "mouse",
+        }))
+        time.sleep(0.004)
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": mx, "y": my,
+            "button": "right", "buttons": 2, "pointerType": "mouse",
+        }))
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved", "x": dx, "y": dy,
+            "button": "right", "buttons": 2, "pointerType": "mouse",
+        }))
+        command_ids.add(cdp.send("Input.dispatchMouseEvent", {
+            "type": "mouseReleased", "x": dx, "y": dy,
+            "button": "right", "buttons": 0, "clickCount": 1,
+            "pointerType": "mouse",
+        }))
+        cdp.wait_for(command_ids, timeout=1.0)
+        return True
+    except Exception:
+        try:
+            cdp.send("Input.dispatchMouseEvent", {
+                "type": "mouseReleased", "button": "right",
+                "buttons": 0, "pointerType": "mouse",
+            })
+        except Exception:
+            pass
+        return False
+
+
+def _replace_native_legal_destination_arrows(
+    driver,
+    board_selector: str,
+    previous_arrows: list[str],
+    next_arrows: list[str],
+    expected_fen: str,
+) -> list[str]:
+    """Replace generated legal-destination arrows; never uses Stockfish or moves pieces."""
+    cdp = _direct_cdp_page_for_driver(driver)
+    geometry = _read_board_annotation_geometry(driver, board_selector)
+    if cdp is None or geometry is None:
+        return list(previous_arrows)
+
+    # Generated right-click arrows must not be reinterpreted as a user's line
+    # selection by the optional companion analyzer.
+    try:
+        driver.execute_script(
+            "if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = true;"
+        )
+    except Exception:
+        pass
+
+    remaining_previous: list[str] = []
+    drawn: list[str] = []
+    try:
+        for arrow in reversed(previous_arrows):
+            if not _toggle_native_annotation_arrow(cdp, arrow, geometry):
+                remaining_previous.append(arrow)
+
+        current_fen = ""
+        try:
+            current_fen = str(driver.execute_script(
+                "return window.__liveGameApiReader?.current?.()?.fen || '';"
+            ) or "").strip()
+        except Exception:
+            current_fen = ""
+        position_matches = False
+        if expected_fen and current_fen and chess is not None:
+            try:
+                position_matches = _same_chess_position(
+                    chess.Board(expected_fen), chess.Board(current_fen)
+                )
+            except (ValueError, IndexError):
+                position_matches = False
+
+        if position_matches:
+            for arrow in next_arrows:
+                if _toggle_native_annotation_arrow(cdp, arrow, geometry):
+                    drawn.append(arrow)
+    finally:
+        try:
+            driver.execute_script(
+                "if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = false;"
+            )
+        except Exception:
+            pass
+    return remaining_previous + drawn
+
+
 def _perform_cursor_drag_once(
     driver, uci: str, expected_fen: str, expected_color: str | None,
     allow_premove: bool = False, low_clock_mode: bool = False,
@@ -4724,6 +4997,7 @@ def main() -> int:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         new_file = not csv_path.exists() or csv_path.stat().st_size == 0
         previous_fen = ""
+        auto_legal_destination_arrows: list[str] = []
         last_dashboard_eval_fen = ""
         reconstructed_history: list[dict[str, str]] = []
         last_dashboard_history_signature = None
@@ -5116,8 +5390,9 @@ def main() -> int:
                         clock_source_reported = True
                     last_move: dict[str, str] | None = None
                     note = "DOM/API state change; identifiers omitted"
+                    position_changed = bool(fen and fen != previous_fen)
 
-                    if fen and fen != previous_fen:
+                    if position_changed:
                         if previous_fen:
                             last_move = infer_move_between_fens(previous_fen, fen)
                             if last_move:
@@ -5148,6 +5423,43 @@ def main() -> int:
                                 f"[HISTORY SYNC] Reconciled {len(dom_history)} plies against current FEN.",
                                 flush=True,
                             )
+                    # Native legal-destination arrows are independent of SHOW MOVE hints.
+                    # When autoplay is active, show where the bot's just-moved piece can
+                    # legally move next. This uses python-chess only, not Stockfish.
+                    if position_changed and chess is not None and fen:
+                        next_legal_arrows: list[str] = []
+                        if (
+                            args.auto_play
+                            and active_bot_color in {"white", "black"}
+                            and isinstance(last_move, dict)
+                            and normalize_chess_color(last_move.get("side")) == active_bot_color
+                        ):
+                            try:
+                                position_after_move = chess.Board(fen)
+                                next_legal_arrows = legal_destination_arrow_uci_moves(
+                                    position_after_move,
+                                    str(last_move.get("uci") or ""),
+                                    active_bot_color,
+                                )
+                            except (ValueError, IndexError, TypeError):
+                                next_legal_arrows = []
+                        previous_arrow_count = len(auto_legal_destination_arrows)
+                        auto_legal_destination_arrows = _replace_native_legal_destination_arrows(
+                            driver,
+                            args.board_selector,
+                            auto_legal_destination_arrows,
+                            next_legal_arrows,
+                            fen,
+                        )
+                        if next_legal_arrows and auto_legal_destination_arrows:
+                            print(
+                                f"[LEGAL DESTINATIONS] Native arrows for bot's moved piece: "
+                                f"{len(next_legal_arrows)} legal destination(s); Stockfish not used for this display.",
+                                flush=True,
+                            )
+                        elif previous_arrow_count and not auto_legal_destination_arrows:
+                            print("[LEGAL DESTINATIONS] Previous generated arrows cleared.", flush=True)
+
                     # Send the complete validated history through one idempotent
                     # dashboard path. This is independent of BOT state and catches
                     # manual moves plus fast bot/reply transitions missed by polling.
