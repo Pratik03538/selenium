@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import chess
-from variation_line_analyzer import classify_autoplay_transition
+from variation_line_analyzer import classify_autoplay_transition, dispatch_native_annotation_arrow
 from seleniumbase_live_game_tracker import (
     PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP,
     PREMOVE_OPENING_MAX_EVAL_DROP_CP,
@@ -352,6 +352,33 @@ class DomHistoryRecoveryTests(unittest.TestCase):
         self.assertIsNone(reconstruct_history_from_dom_moves(dom_moves[:-1], board.fen()))
 
 
+
+
+class NativeAnnotationDispatchTests(unittest.TestCase):
+    def test_driver_cdp_fallback_sends_native_right_click_arrow_events(self):
+        class FakeDriver:
+            def __init__(self):
+                self.calls = []
+
+            def execute_cdp_cmd(self, method, params):
+                self.calls.append((method, dict(params)))
+                return {}
+
+        driver = FakeDriver()
+        result = dispatch_native_annotation_arrow(
+            driver, "e2e4",
+            left=0, top=0, width=640, height=640,
+            bottom_side="white",
+        )
+
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(
+            [params["type"] for _, params in driver.calls],
+            ["mouseMoved", "mousePressed", "mouseMoved", "mouseMoved", "mouseReleased"],
+        )
+        self.assertTrue(all(method == "Input.dispatchMouseEvent" for method, _ in driver.calls))
+        self.assertEqual(driver.calls[1][1]["button"], "right")
+        self.assertEqual(driver.calls[1][1]["buttons"], 2)
 
 
 class AutoplayTacticalArrowTriggerTests(unittest.TestCase):
