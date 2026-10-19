@@ -2840,12 +2840,12 @@ def build_move_coaching_plan(
     max_plies: int = 5,
     search_seconds: float = 0.16,
 ) -> dict[str, object]:
-    """Choose sparse coaching annotations; show a line only for forcing tactics.
+    """Keep ordinary-position coaching minimal and reserve arrows for tactics.
 
-    Ordinary positions show at most two new threats/control arrows, or a native
-    square highlight for a just-captured target. A multi-ply principal-variation
-    queue is reserved for check, forced mate, likely recapture, or a forcing
-    capture/check sequence. Analysis does not submit moves.
+    Normal moves never display an opponent PV. If the moved piece newly attacks
+    an opponent piece, highlight only the single most important target square.
+    A short multi-move arrow queue is used only for a forcing check, forced mate,
+    promotion, meaningful piece capture, or a likely recapture sequence.
     """
     empty = {"mode": "none", "arrows": [], "highlight_square": None, "reason": ""}
     if chess is None or not previous_fen or not current_fen:
@@ -2874,6 +2874,14 @@ def build_move_coaching_plan(
 
     was_capture = before.is_capture(move)
     opponent_color = not bot_turn
+    captured_piece = before.piece_at(move.to_square)
+    if before.is_en_passant(move):
+        captured_square = (
+            move.to_square - 8 if bot_turn == chess.WHITE
+            else move.to_square + 8
+        )
+        captured_piece = before.piece_at(captured_square)
+
     immediate_recapture = False
     try:
         immediate_recapture = any(
@@ -2887,7 +2895,6 @@ def build_move_coaching_plan(
     search_seconds = max(0.05, min(0.30, float(search_seconds)))
     pv_uci: list[str] = []
     has_forced_mate = False
-    forcing_event_count = 0
     first_reply_recaptures = False
     score_text = ""
     if engine is not None:
@@ -2912,41 +2919,44 @@ def build_move_coaching_plan(
                     for candidate in pv:
                         if len(pv_uci) >= max_plies or candidate not in probe.legal_moves:
                             break
-                        is_capture = probe.is_capture(candidate)
-                        gives_check = probe.gives_check(candidate)
-                        if is_capture or gives_check:
-                            forcing_event_count += 1
                         if not pv_uci:
                             first_reply_recaptures = (
                                 was_capture
                                 and candidate.to_square == move.to_square
-                                and is_capture
+                                and probe.is_capture(candidate)
                             )
                         pv_uci.append(candidate.uci())
                         probe.push(candidate)
                         if probe.is_game_over(claim_draw=True):
                             break
         except Exception:
-            # A missing/slow analysis must not suppress inexpensive board-based hints.
             pv_uci = []
             has_forced_mate = False
-            forcing_event_count = 0
             first_reply_recaptures = False
 
     forcing_check = after.is_check()
-    recapture_queue = immediate_recapture and first_reply_recaptures
-    tactical_queue = bool(
+    recapture_queue = was_capture and immediate_recapture and first_reply_recaptures
+    valuable_capture = bool(
+        was_capture
+        and captured_piece is not None
+        and captured_piece.piece_type in {
+            chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN
+        }
+    )
+    tactical_move = bool(
         has_forced_mate
         or forcing_check
         or recapture_queue
-        or forcing_event_count >= 2
+        or move.promotion is not None
+        or valuable_capture
     )
-    if tactical_queue and pv_uci:
+    if tactical_move and pv_uci:
         reason = (
             "forced mate" if has_forced_mate else
-            "check line" if forcing_check else
-            "recapture line" if recapture_queue else
-            "forcing tactical sequence"
+            "checking move" if forcing_check else
+            "recapture sequence" if recapture_queue else
+            "promotion" if move.promotion is not None else
+            "valuable capture"
         )
         return {
             "mode": "tactical-queue",
@@ -2956,90 +2966,40 @@ def build_move_coaching_plan(
             "score": score_text,
         }
 
-    # Quiet/non-forcing moves must not display generic opponent best-move arrows.
-    # For a capture without a forcing recapture, mark the captured square once.
-    if was_capture:
-        return {
-            "mode": "capture-highlight",
-            "arrows": [],
-            "highlight_square": chess.square_name(move.to_square),
-            "reason": "captured piece square",
-            "score": score_text,
-        }
-
-    # Highlight only newly-created attacks on enemy pieces, not every legal move.
+    # For ordinary moves, never draw opponent reply arrows or generic move queues.
+    # Highlight just one opponent piece freshly attacked by the piece that moved.
     attacked_targets: list[tuple[int, int]] = []
     try:
-        attacked_squares = after.attacks(move.to_square)
-        for target_square in attacked_squares:
+        for target_square in after.attacks(move.to_square):
             target_piece = after.piece_at(target_square)
             if target_piece is None or target_piece.color == bot_turn:
                 continue
             if before.is_attacked_by(bot_turn, target_square):
                 continue
-            defended = after.is_attacked_by(opponent_color, target_square)
             target_value = int(chess.piece_value(target_piece.piece_type))
-            # Prefer valuable and undefended targets. The arrow describes a new
-            # threat created by the moved piece; it is not an opponent move.
-            priority = target_value * 10 + (0 if defended else 7)
+            opponent_defends = after.is_attacked_by(opponent_color, target_square)
+            priority = target_value * 10 + (0 if opponent_defends else 7)
             attacked_targets.append((priority, target_square))
     except Exception:
         attacked_targets = []
     attacked_targets.sort(reverse=True)
+
     if attacked_targets:
-        arrows = [
-            chess.square_name(move.to_square) + chess.square_name(square)
-            for _priority, square in attacked_targets[:2]
-        ]
+        target_square = attacked_targets[0][1]
+        target_piece = after.piece_at(target_square)
+        target_name = (
+            chess.piece_name(target_piece.piece_type)
+            if target_piece is not None else "piece"
+        )
         return {
-            "mode": "new-threat",
-            "arrows": arrows,
-            "highlight_square": None,
-            "reason": "newly attacked enemy piece",
+            "mode": "threat-highlight",
+            "arrows": [],
+            "highlight_square": chess.square_name(target_square),
+            "reason": f"new threat to opponent {target_name}",
             "score": score_text,
         }
 
-    # No direct piece target: show at most one newly controlled meaningful square.
-    # This keeps a strategic move readable instead of spraying every attack square.
-    try:
-        enemy_king = after.king(opponent_color)
-        opponent_destinations = {candidate.to_square for candidate in after.legal_moves}
-        controlled: list[tuple[int, int]] = []
-        center_squares = {
-            chess.D4, chess.E4, chess.D5, chess.E5,
-            chess.C4, chess.F4, chess.C5, chess.F5,
-        }
-        for square in after.attacks(move.to_square):
-            if after.piece_at(square) is not None:
-                continue
-            if before.is_attacked_by(bot_turn, square):
-                continue
-            score = 0
-            if square in center_squares:
-                score += 4
-            if square in opponent_destinations:
-                score += 3
-            if enemy_king is not None:
-                distance = chess.square_distance(square, enemy_king)
-                if distance <= 2:
-                    score += 3 - distance
-            if score > 0:
-                controlled.append((score, square))
-        controlled.sort(reverse=True)
-        if controlled:
-            return {
-                "mode": "controlled-square",
-                "arrows": [
-                    chess.square_name(move.to_square)
-                    + chess.square_name(controlled[0][1])
-                ],
-                "highlight_square": None,
-                "reason": "newly controlled key square",
-                "score": score_text,
-            }
-    except Exception:
-        pass
-
+    # No new threat: leave the board clean. No control-square arrows, no normal PV.
     return empty
 
 
