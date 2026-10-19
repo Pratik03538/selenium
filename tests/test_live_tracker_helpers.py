@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import chess
 from seleniumbase_live_game_tracker import (
@@ -466,7 +466,7 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
             patch("seleniumbase_live_game_tracker._same_chess_position", return_value=True),
         ):
             arrows, highlight = _replace_native_coaching_annotations(
-                FakeDriver(), "board", [], None, ["d4d8"], "e4", fen,
+                FakeDriver(), "board", [], None, ["d4d8", "a4a8"], "e4", fen,
                 use_visible_cursor=True,
                 game_id=7,
                 auto_draw_enabled=True,
@@ -482,11 +482,18 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
         cdp.return_value.evaluate.assert_any_call(
             "(() => { if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = true; return true; })()"
         )
-        self.assertEqual(arrows, ["d4d8"])
+        self.assertEqual(arrows, ["d4d8", "a4a8"])
         self.assertEqual(highlight, "e4")
-        controller.draw_arrow.assert_called_once()
+        self.assertEqual(controller.draw_arrow.call_count, 2)
         controller.draw_highlight.assert_called_once()
-        self.assertEqual(controller.preview_legal_moves.call_count, 2)
+        self.assertEqual(controller.preview_legal_moves.call_count, 3)
+        self.assertEqual(
+            [item.args[0] for item in gap_sleep.call_args_list],
+            [0.015, 0.015, 0.015],
+        )
+        self.assertEqual(random_gap.call_count, 3)
+        for call_item in random_gap.call_args_list:
+            self.assertEqual(call_item.args, (0.010, 0.030))
         fallback_geometry.assert_not_called()
 
 
