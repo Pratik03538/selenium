@@ -2976,7 +2976,14 @@ def build_move_coaching_plan(
                 continue
             if before.is_attacked_by(bot_turn, target_square):
                 continue
-            target_value = int(chess.piece_value(target_piece.piece_type))
+            target_value = {
+                chess.PAWN: 1,
+                chess.KNIGHT: 3,
+                chess.BISHOP: 3,
+                chess.ROOK: 5,
+                chess.QUEEN: 9,
+                chess.KING: 100,
+            }.get(target_piece.piece_type, 0)
             opponent_defends = after.is_attacked_by(opponent_color, target_square)
             priority = target_value * 10 + (0 if opponent_defends else 7)
             attacked_targets.append((priority, target_square))
