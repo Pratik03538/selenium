@@ -237,6 +237,23 @@ class VisibleMoveTests(unittest.TestCase):
         self.assertTrue(accepted.ok, accepted.reason)
         self.assertIn(("press", "left"), backend.events)
 
+    def test_site_validated_promotion_premove_can_use_visible_drag(self):
+        controller, backend = make_controller()
+        fen = "7k/P7/8/8/8/8/8/7K b - - 0 1"
+        result = controller.move_uci(
+            "a7a8q",
+            expected_fen=fen,
+            current_fen_reader=lambda: fen,
+            geometry=BoardGeometry(0, 0, 800, 800),
+            bot_color="white",
+            focus_guard=lambda: True,
+            allow_premove=True,
+            premove_prevalidated=True,
+        )
+        self.assertTrue(result.ok, result.reason)
+        self.assertIn(("press", "left"), backend.events)
+        self.assertIn(("release", "left"), backend.events)
+
     def test_foreground_guard_is_required(self):
         controller, backend = make_controller()
         fen = chess.STARTING_FEN
