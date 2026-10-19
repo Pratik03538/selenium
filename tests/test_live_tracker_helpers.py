@@ -258,6 +258,21 @@ class MoveCoachingPlanTests(unittest.TestCase):
         self.assertIn("d4d8", plan["danger_arrows"])
         self.assertLessEqual(len(plan["danger_arrows"]), 2)
 
+    def test_multiple_opponent_danger_pieces_are_prioritized_over_our_risk(self):
+        before = chess.Board("k2q4/8/8/8/3R3r/8/8/4K3 w - - 0 1")
+        move = chess.Move.from_uci("e1f1")
+        self.assertIn(move, before.legal_moves)
+        after = before.copy(stack=True)
+        after.push(move)
+        plan = build_move_coaching_plan(
+            self.FakeEngine([]), before.fen(), after.fen(), "e1f1", "white"
+        )
+        self.assertEqual(plan["mode"], "threat-arrows")
+        self.assertGreaterEqual(len(plan["danger_arrows"]), 2)
+        self.assertIn("d4d8", plan["danger_arrows"])
+        self.assertIn("d4h4", plan["danger_arrows"][:3])
+        self.assertLessEqual(len(plan["arrows"]), 4)
+
     def test_valuable_bot_piece_that_can_be_captured_gets_a_danger_arrow(self):
         before = chess.Board("k3r3/8/8/8/8/8/P3Q3/7K w - - 0 1")
         move = chess.Move.from_uci("a2a3")
@@ -301,43 +316,38 @@ class MoveCoachingPlanTests(unittest.TestCase):
 
 class CoachingArrowDeduplicationTests(unittest.TestCase):
     def test_same_arrow_is_not_repeated_after_opponent_reply_while_threat_persists(self):
-        active_arrows = set()
+        shown_arrows = set()
 
-        first_plan = filter_new_coaching_arrows(["d4d8"], active_arrows)
+        first_plan = filter_new_coaching_arrows(["d4d8"], shown_arrows)
         self.assertEqual(first_plan, ["d4d8"])
         # Production records an arrow only after the board renderer drew it.
-        active_arrows.update(first_plan)
+        shown_arrows.update(first_plan)
 
-        # Opponent's reply clears the board annotation but deliberately does not
-        # call the filter or clear its memory.
-        second_plan = filter_new_coaching_arrows(["d4d8"], active_arrows)
+        second_plan = filter_new_coaching_arrows(["d4d8"], shown_arrows)
         self.assertEqual(second_plan, [])
-        self.assertIn("d4d8", active_arrows)
+        self.assertIn("d4d8", shown_arrows)
 
-    def test_new_arrow_is_allowed_and_stale_arrow_expires_when_threat_disappears(self):
-        active_arrows = set()
-        first_plan = filter_new_coaching_arrows(["d4d8"], active_arrows)
-        active_arrows.update(first_plan)
+    def test_new_unseen_arrows_are_allowed_but_old_arrows_remain_suppressed(self):
+        shown_arrows = set()
+        first_plan = filter_new_coaching_arrows(["d4d8"], shown_arrows)
+        shown_arrows.update(first_plan)
         self.assertEqual(first_plan, ["d4d8"])
 
-        new_plan = filter_new_coaching_arrows(["a4a8"], active_arrows)
+        new_plan = filter_new_coaching_arrows(["d4d8", "a4a8", "a4a8"], shown_arrows)
         self.assertEqual(new_plan, ["a4a8"])
-        active_arrows.update(new_plan)
-        self.assertNotIn("d4d8", active_arrows)
-        self.assertIn("a4a8", active_arrows)
+        shown_arrows.update(new_plan)
+        self.assertEqual(shown_arrows, {"d4d8", "a4a8"})
 
-    def test_same_arrow_can_return_after_it_was_absent_from_a_bot_move_plan(self):
-        active_arrows = set()
-        first_plan = filter_new_coaching_arrows(["d4d8"], active_arrows)
-        active_arrows.update(first_plan)
+    def test_same_arrow_stays_suppressed_even_after_absent_from_multiple_plans(self):
+        shown_arrows = set()
+        first_plan = filter_new_coaching_arrows(["d4d8"], shown_arrows)
+        shown_arrows.update(first_plan)
         self.assertEqual(first_plan, ["d4d8"])
 
-        self.assertEqual(filter_new_coaching_arrows([], active_arrows), [])
-        self.assertEqual(active_arrows, set())
-
-        later_plan = filter_new_coaching_arrows(["d4d8"], active_arrows)
-        self.assertEqual(later_plan, ["d4d8"])
-
+        self.assertEqual(filter_new_coaching_arrows([], shown_arrows), [])
+        self.assertEqual(filter_new_coaching_arrows(["a4a8"], shown_arrows), ["a4a8"])
+        self.assertEqual(filter_new_coaching_arrows(["d4d8"], shown_arrows), [])
+        self.assertIn("d4d8", shown_arrows)
 
 
 class MoveRetryGateTests(unittest.TestCase):
