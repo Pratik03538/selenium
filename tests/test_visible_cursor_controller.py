@@ -154,6 +154,51 @@ class PositionGuardTests(unittest.TestCase):
         self.assertEqual(backend.events, [])
 
 
+class PreviewLegalMovesTests(unittest.TestCase):
+    def test_preview_visits_one_or_two_legal_moves_without_clicking(self):
+        controller, backend = make_controller()
+        result = controller.preview_legal_moves(
+            chess.STARTING_FEN,
+            geometry=BoardGeometry(0, 0, 800, 800),
+            focus_guard=lambda: True,
+            max_moves=2,
+            position_prevalidated=True,
+        )
+        self.assertTrue(result.ok, result.reason)
+        self.assertIn(len(result.route), (1, 2))
+        self.assertGreater(result.waypoints, 0)
+        self.assertTrue(any(event[0] == "position" for event in backend.events))
+        self.assertFalse(any(event[0] == "press" for event in backend.events))
+        self.assertFalse(any(event[0] == "release" for event in backend.events))
+
+    def test_prevalidated_preview_does_not_request_an_extra_fen_read(self):
+        controller, backend = make_controller()
+        result = controller.preview_legal_moves(
+            chess.STARTING_FEN,
+            geometry=BoardGeometry(0, 0, 800, 800),
+            focus_guard=lambda: True,
+            max_moves=1,
+            position_prevalidated=True,
+            current_fen_reader=lambda: self.fail("unexpected extra FEN read"),
+        )
+        self.assertTrue(result.ok, result.reason)
+        self.assertFalse(any(event[0] == "press" for event in backend.events))
+
+    def test_preview_fails_closed_on_stale_position(self):
+        controller, backend = make_controller()
+        changed = chess.Board()
+        changed.push_uci("e2e4")
+        result = controller.preview_legal_moves(
+            chess.STARTING_FEN,
+            geometry=BoardGeometry(0, 0, 800, 800),
+            focus_guard=lambda: True,
+            current_fen_reader=lambda: changed.fen(),
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "board-position-changed")
+        self.assertEqual(backend.events, [])
+
+
 class VisibleMoveTests(unittest.TestCase):
     def test_legal_move_uses_left_button_and_releases_mouse(self):
         controller, backend = make_controller()
