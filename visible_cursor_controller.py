@@ -369,7 +369,7 @@ class VisibleCursorController:
             if interval:
                 time.sleep(interval)
 
-        self._set_position(end)
+        # The final loop iteration already placed the cursor at the exact endpoint.
         return steps
 
     def _drag(
@@ -383,9 +383,8 @@ class VisibleCursorController:
         current_fen_reader: FenReader,
         focus_guard: FocusGuard,
     ) -> int:
-        # The caller has already glided the visible cursor to the source square.
-        # Snap only the final sub-pixel rounding, not the whole on-screen approach.
-        self._set_position(start)
+        # The caller has already placed the cursor on the source square.
+        # Avoid an extra OS cursor-position command immediately before the press.
         if not self._call_guard(focus_guard):
             raise PermissionError("foreground-window-guard-failed")
         valid, reason = self._position_guard(expected_fen, current_fen_reader)
@@ -421,6 +420,7 @@ class VisibleCursorController:
         promotion_handler: Callable[[str], bool] | None = None,
         allow_premove: bool = False,
         premove_prevalidated: bool = False,
+        position_prevalidated: bool = False,
     ) -> CursorActionResult:
         """Legality-check and perform a visible left-button piece drag."""
         started = time.monotonic()
@@ -431,9 +431,10 @@ class VisibleCursorController:
             return CursorActionResult(False, "move", "python-chess-required", (token,))
         if not self._call_guard(focus_guard):
             return CursorActionResult(False, "move", "foreground-window-guard-failed", (token,))
-        valid, reason = self._position_guard(expected_fen, current_fen_reader)
-        if not valid:
-            return CursorActionResult(False, "move", reason, (token,))
+        if not position_prevalidated:
+            valid, reason = self._position_guard(expected_fen, current_fen_reader)
+            if not valid:
+                return CursorActionResult(False, "move", reason, (token,))
 
         normalized_color = str(bot_color or "").strip().lower()
         if normalized_color not in {"white", "black"}:
@@ -509,6 +510,7 @@ class VisibleCursorController:
         fast_mode: bool,
         bot_clock_seconds: float | None,
         low_clock_trigger_seconds: float = 10.0,
+        position_prevalidated: bool = False,
     ) -> CursorActionResult:
         """Perform a native right-click on one square to highlight it."""
         started = time.monotonic()
@@ -534,9 +536,10 @@ class VisibleCursorController:
             return CursorActionResult(False, "highlight", "invalid-square", route)
         if not self._call_guard(focus_guard):
             return CursorActionResult(False, "highlight", "foreground-window-guard-failed", route)
-        valid, reason = self._position_guard(expected_fen, current_fen_reader)
-        if not valid:
-            return CursorActionResult(False, "highlight", reason, route)
+        if not position_prevalidated:
+            valid, reason = self._position_guard(expected_fen, current_fen_reader)
+            if not valid:
+                return CursorActionResult(False, "highlight", reason, route)
 
         point = geometry.square_center(token)
         try:
@@ -592,6 +595,7 @@ class VisibleCursorController:
         fast_mode: bool,
         bot_clock_seconds: float | None,
         low_clock_trigger_seconds: float = 10.0,
+        position_prevalidated: bool = False,
     ) -> CursorActionResult:
         """Perform a native right-button drag to draw an arrow on the board."""
         started = time.monotonic()
@@ -620,9 +624,10 @@ class VisibleCursorController:
             return CursorActionResult(False, "draw", "same-square-route", route)
         if not self._call_guard(focus_guard):
             return CursorActionResult(False, "draw", "foreground-window-guard-failed", route)
-        valid, reason = self._position_guard(expected_fen, current_fen_reader)
-        if not valid:
-            return CursorActionResult(False, "draw", reason, route)
+        if not position_prevalidated:
+            valid, reason = self._position_guard(expected_fen, current_fen_reader)
+            if not valid:
+                return CursorActionResult(False, "draw", reason, route)
 
         current_game_id = str(game_id)
         if current_game_id != self._game_id:
