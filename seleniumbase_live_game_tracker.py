@@ -3965,6 +3965,7 @@ def _perform_cursor_drag_once(
 
         action_elapsed_ms = (time.monotonic() - action_started_at) * 1000.0
         total_drag_ms = int(round(action_elapsed_ms))
+        waypoint_count = int(cursor_result.waypoints or waypoint_count)
         if not cursor_result.ok:
             return {
                 "ok": False,
