@@ -28,6 +28,7 @@ from seleniumbase_live_game_tracker import (
     build_move_coaching_plan,
     build_current_position_danger_plan,
     should_render_post_move_coaching,
+    auto_draw_suppression_reason,
     filter_new_coaching_arrows,
     _replace_native_coaching_annotations,
     premove_phase_allowed,
@@ -356,6 +357,62 @@ class NativeAnnotationRedrawTests(unittest.TestCase):
         self.assertEqual(arrows, [])
         self.assertIsNone(highlight)
 
+
+
+class AutoDrawFastModeTests(unittest.TestCase):
+    @staticmethod
+    def fen_at_fullmove(fullmove_number):
+        fields = chess.STARTING_FEN.split()
+        fields[5] = str(fullmove_number)
+        return " ".join(fields)
+
+    def test_dashboard_switch_off_disables_drawing(self):
+        fen = self.fen_at_fullmove(15)
+        self.assertEqual(
+            auto_draw_suppression_reason(
+                False, "white", fen, fen, 60.0, 60.0, 9.0, False, 5
+            ),
+            "Auto-Draw switch is OFF",
+        )
+
+    def test_short_time_control_fast_mode_disables_drawing(self):
+        fen = self.fen_at_fullmove(15)
+        self.assertEqual(
+            auto_draw_suppression_reason(
+                True, "white", fen, fen, 60.0, 60.0, 9.0, True, 5
+            ),
+            "short-time-control fast mode is active",
+        )
+
+    def test_opening_window_disables_drawing_across_black_move_counter_increment(self):
+        previous_fen = self.fen_at_fullmove(10)
+        current_fen = self.fen_at_fullmove(11)
+        self.assertEqual(
+            auto_draw_suppression_reason(
+                True, "black", current_fen, previous_fen, 60.0, 60.0, 9.0, False, 10
+            ),
+            "opening fast/premove window is active",
+        )
+
+    def test_our_low_clock_disables_drawing_but_opponents_low_clock_does_not(self):
+        fen = self.fen_at_fullmove(15)
+        own_clock_reason = auto_draw_suppression_reason(
+            True, "white", fen, fen, 8.5, 45.0, 9.0, False, 5
+        )
+        self.assertEqual(own_clock_reason, "bot low-clock fast mode is active (8.50s)")
+        opponent_clock_reason = auto_draw_suppression_reason(
+            True, "white", fen, fen, 45.0, 8.5, 9.0, False, 5
+        )
+        self.assertEqual(opponent_clock_reason, "")
+
+    def test_normal_mode_allows_auto_draw_when_bot_has_clock_reserve(self):
+        fen = self.fen_at_fullmove(15)
+        self.assertEqual(
+            auto_draw_suppression_reason(
+                True, "white", fen, fen, 45.0, 8.5, 9.0, False, 5
+            ),
+            "",
+        )
 
 
 class PostMoveCoachingGateTests(unittest.TestCase):
