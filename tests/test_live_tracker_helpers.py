@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import chess
@@ -413,6 +414,69 @@ class AutoDrawFastModeTests(unittest.TestCase):
             ),
             "",
         )
+
+
+class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
+    def test_visible_mode_uses_desktop_cursor_for_arrows_and_highlights(self):
+        fen = chess.STARTING_FEN
+        from seleniumbase_live_game_tracker import _replace_native_coaching_annotations
+
+        class FakeDriver:
+            title = "Owned Chess Site - Browser"
+
+            def execute_script(self, script):
+                if "__liveGameApiReader" in script:
+                    return fen
+                return None
+
+        class FakeBackend:
+            def foreground_title_contains(self, fragment):
+                return fragment == "Owned Chess Site - Browser"
+
+        controller = SimpleNamespace(
+            backend=FakeBackend(),
+            draw_arrow=patch("unused").start,
+        )
+        controller.draw_arrow = unittest.mock.Mock(return_value=SimpleNamespace(ok=True))
+        controller.draw_highlight = unittest.mock.Mock(return_value=SimpleNamespace(ok=True))
+
+        with (
+            patch("seleniumbase_live_game_tracker._direct_cdp_page_for_driver") as cdp,
+            patch(
+                "seleniumbase_live_game_tracker._read_board_annotation_geometry",
+                return_value={
+                    "left": 0.0, "top": 0.0, "width": 800.0, "height": 800.0,
+                    "bottom_side": "white",
+                },
+            ),
+            patch(
+                "seleniumbase_live_game_tracker._get_visible_cursor_controller",
+                return_value=controller,
+            ),
+            patch(
+                "seleniumbase_live_game_tracker.read_selenium_board_geometry",
+                return_value=object(),
+            ),
+            patch("seleniumbase_live_game_tracker._same_chess_position", return_value=True),
+        ):
+            arrows, highlight = _replace_native_coaching_annotations(
+                FakeDriver(), "board", [], None, ["d4d8"], "e4", fen,
+                use_visible_cursor=True,
+                game_id=7,
+                auto_draw_enabled=True,
+                bot_color="white",
+                white_clock_seconds=60.0,
+                black_clock_seconds=40.0,
+                low_clock_trigger_seconds=9.0,
+                opening_fast_mode=False,
+                fast_mode=False,
+            )
+
+        cdp.assert_not_called()
+        self.assertEqual(arrows, ["d4d8"])
+        self.assertEqual(highlight, "e4")
+        controller.draw_arrow.assert_called_once()
+        controller.draw_highlight.assert_called_once()
 
 
 class PostMoveCoachingGateTests(unittest.TestCase):
