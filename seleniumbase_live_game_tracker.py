@@ -3807,11 +3807,11 @@ def _perform_cursor_drag_once(
     driver, uci: str, expected_fen: str, expected_color: str | None,
     allow_premove: bool = False, low_clock_mode: bool = False,
 ) -> dict[str, object]:
-    """Dispatch short multi-waypoint input over CDP and confirm inside the page.
+    """Move the real Windows desktop cursor and confirm the action in the page.
 
-    Browser-side input and confirmation avoid repeated ChromeDriver round-trips.
-    Requested millisecond timings are best-effort; OS scheduling and page event
-    processing can still make measured end-to-end latency longer.
+    The site-owned dragTarget() guard validates the requested route first. The
+    visible cursor controller then uses native OS pointer input, while the existing
+    page-side watcher confirms that a move landed or a premove was queued.
     """
     cdp = _direct_cdp_page_for_driver(driver)
     if cdp is None:
@@ -3860,55 +3860,9 @@ def _perform_cursor_drag_once(
         return {"ok": False, "reason": "invalid-board-geometry"}
 
     rng = random.SystemRandom()
-    square_w = width / 8.0
-    square_h = height / 8.0
-
-    def square_point(square: str) -> tuple[float, float]:
-        file_index = ord(square[0]) - ord("a")
-        rank_number = int(square[1])
-        if bottom_side == "white":
-            col, row = file_index, 8 - rank_number
-        else:
-            col, row = 7 - file_index, rank_number - 1
-        return (
-            (col + 0.5 + rng.uniform(-0.22, 0.22)) * square_w,
-            (row + 0.5 + rng.uniform(-0.22, 0.22)) * square_h,
-        )
-
-    sx, sy = square_point(text[:2])
-    dx, dy = square_point(text[2:4])
-    vx, vy = dx - sx, dy - sy
-    distance = max(1.0, (vx * vx + vy * vy) ** 0.5)
-    normal_x, normal_y = -vy / distance, vx / distance
-    curve_size = rng.uniform(0.035, 0.085) * min(width, height) * rng.choice((-1.0, 1.0))
-    control_x = min(max(2.0, (sx + dx) / 2.0 + normal_x * curve_size), width - 2.0)
-    control_y = min(max(2.0, (sy + dy) / 2.0 + normal_y * curve_size), height - 2.0)
-
-    total_drag_ms = rng.randint(3, 30)
-    waypoint_count = min(rng.randint(2, 4), total_drag_ms)
-    segment_durations = [1] * waypoint_count
-    remaining_drag_ms = total_drag_ms - waypoint_count
-    while remaining_drag_ms > 0:
-        segment_durations[rng.randrange(waypoint_count)] += 1
-        remaining_drag_ms -= 1
-
-    path_points: list[tuple[float, float]] = []
-    for index in range(1, waypoint_count + 1):
-        t = index / waypoint_count
-        omt = 1.0 - t
-        px = omt * omt * sx + 2.0 * omt * t * control_x + t * t * dx
-        py = omt * omt * sy + 2.0 * omt * t * control_y + t * t * dy
-        if index < waypoint_count:
-            px = min(max(2.0, px + rng.uniform(-2.0, 2.0)), width - 2.0)
-            py = min(max(2.0, py + rng.uniform(-2.0, 2.0)), height - 2.0)
-        else:
-            px, py = dx, dy
-        path_points.append((left + px, top + py))
-
-    source_x, source_y = left + sx, top + sy
-    pre_delay_ms = rng.randint(1, 5)
-    hover_ms = rng.randint(3, 8)
-    pickup_hold_ms = rng.randint(1, 3)
+    pre_delay_ms = 0 if low_clock_mode else rng.randint(1, 5)
+    waypoint_count = 4 if low_clock_mode else 12
+    total_drag_ms = 0
     confirm_interval_ms = rng.randint(4, 10)
     confirmation_timeout_ms = int(120 if low_clock_mode else (450 if allow_premove else 900))
 
