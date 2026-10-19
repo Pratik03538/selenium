@@ -448,7 +448,10 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
                 "seleniumbase_live_game_tracker._read_board_annotation_geometry",
                 return_value={
                     "left": 0.0, "top": 0.0, "width": 800.0, "height": 800.0,
-                    "bottom_side": "white",
+                    "bottom_side": "white", "fen": chess.STARTING_FEN,
+                    "screen_left": 100.0, "screen_top": 200.0,
+                    "screen_width": 800.0, "screen_height": 800.0,
+                    "window_title": "Owned Chess Site - Browser",
                 },
             ),
             patch(
