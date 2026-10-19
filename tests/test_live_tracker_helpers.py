@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import chess
+from variation_line_analyzer import classify_autoplay_transition
 from seleniumbase_live_game_tracker import (
     PREMOVE_LOW_CLOCK_MAX_EVAL_DROP_CP,
     PREMOVE_OPENING_MAX_EVAL_DROP_CP,
@@ -350,6 +351,56 @@ class DomHistoryRecoveryTests(unittest.TestCase):
         self.assertEqual(history[-1]["game_ply"], str(len(sans)))
         self.assertIsNone(reconstruct_history_from_dom_moves(dom_moves[:-1], board.fen()))
 
+
+
+
+class AutoplayTacticalArrowTriggerTests(unittest.TestCase):
+    def test_quiet_normal_move_does_not_trigger_arrows(self):
+        before = chess.Board()
+        move = before.parse_san("e4")
+        after = before.copy()
+        after.push(move)
+
+        self.assertEqual(
+            classify_autoplay_transition(before, after, move, eval_delta_white=0.12),
+            "",
+        )
+
+    def test_capture_triggers_native_arrow_preview(self):
+        before = chess.Board()
+        before.push_san("e4")
+        before.push_san("d5")
+        move = before.parse_san("exd5")
+        after = before.copy()
+        after.push(move)
+
+        reason = classify_autoplay_transition(before, after, move, eval_delta_white=0.28)
+        self.assertIn("CAPTURE", reason)
+
+    def test_checkmate_triggers_explanation(self):
+        before = chess.Board()
+        for san in ("f3", "e5", "g4"):
+            before.push_san(san)
+        move = before.parse_san("Qh4#")
+        after = before.copy()
+        after.push(move)
+
+        reason = classify_autoplay_transition(before, after, move)
+        self.assertIn("CHECKMATE", reason)
+
+    def test_large_evaluation_change_triggers_tactical_preview(self):
+        board = chess.Board()
+        self.assertIn(
+            "TACTICAL EVAL SWING",
+            classify_autoplay_transition(None, board, None, eval_delta_white=-1.35),
+        )
+
+    def test_forced_mate_triggers_three_ply_preview_reason(self):
+        board = chess.Board()
+        reason = classify_autoplay_transition(
+            None, board, None, current_mate_distance=3,
+        )
+        self.assertIn("FORCED MATE IN 3", reason)
 
 
 class DashboardMoveReferenceTests(unittest.TestCase):
