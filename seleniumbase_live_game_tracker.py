@@ -2786,53 +2786,49 @@ def _direct_cdp_page_for_driver(driver):
         return None
 
 
-def legal_destination_arrow_uci_moves(
-    board_after_move: "chess.Board",
-    move_uci: str,
-    moved_side: str | None = None,
+def calculate_top_continuation_uci_moves(
+    engine,
+    board: "chess.Board",
+    max_plies: int = 2,
+    search_seconds: float = 0.08,
 ) -> list[str]:
-    """Return legal destination arrows for the piece that just moved.
+    """Return at most two moves from Stockfish's best continuation (principal variation).
 
-    This is rule-based python-chess move generation only; it does not call Stockfish.
-    The board is the authoritative position immediately after the move. The moved
-    side is temporarily made side-to-move so legal destinations for that piece can
-    be calculated without submitting a move to the game.
+    Move one is the strongest predicted reply from the current position; move two
+    is the engine follow-up after that hypothetical reply. This is analysis only:
+    no move is submitted and the real game board is never changed.
     """
-    if chess is None or board_after_move is None:
+    if chess is None or engine is None or board is None:
         return []
     try:
-        # A finished game has no remaining legal destinations in the actual game.
-        if board_after_move.is_game_over(claim_draw=True):
+        if board.is_game_over(claim_draw=True):
             return []
+        max_plies = max(1, min(2, int(max_plies)))
+        search_seconds = max(0.025, min(0.15, float(search_seconds)))
+        result = engine.analyse(
+            board.copy(stack=True),
+            chess.engine.Limit(time=search_seconds),
+            multipv=1,
+        )
+        info = result[0] if isinstance(result, list) and result else result
+        pv = info.get("pv") if isinstance(info, dict) else None
     except Exception:
         return []
-    try:
-        moved = chess.Move.from_uci(str(move_uci or "").strip().lower())
-    except (ValueError, TypeError):
-        return []
-    piece = board_after_move.piece_at(moved.to_square)
-    if piece is None:
-        return []
-    normalized_side = normalize_chess_color(moved_side) if moved_side else None
-    piece_side = "white" if piece.color == chess.WHITE else "black"
-    if normalized_side is not None and normalized_side != piece_side:
+    if not isinstance(pv, (list, tuple)):
         return []
 
-    probe = board_after_move.copy(stack=True)
-    probe.turn = piece.color
-    by_destination: dict[int, str] = {}
-    try:
-        for candidate in probe.legal_moves:
-            if candidate.from_square != moved.to_square:
-                continue
-            existing = by_destination.get(candidate.to_square)
-            if existing is None or candidate.promotion == chess.QUEEN:
-                # A promotion arrow is visual only, so show one arrow per square
-                # and prefer the queen when several promotion choices share a target.
-                by_destination[candidate.to_square] = candidate.uci()
-    except (ValueError, AssertionError):
-        return []
-    return [by_destination[square] for square in sorted(by_destination)]
+    probe = board.copy(stack=True)
+    continuation: list[str] = []
+    for move in pv:
+        if len(continuation) >= max_plies:
+            break
+        if move not in probe.legal_moves:
+            break
+        continuation.append(move.uci())
+        probe.push(move)
+        if probe.is_game_over(claim_draw=True):
+            break
+    return continuation
 
 
 def _read_board_annotation_geometry(driver, board_selector: str) -> dict[str, object] | None:
@@ -3006,14 +3002,14 @@ def _toggle_native_annotation_arrow(cdp, uci: str, geometry: dict[str, object]) 
         return False
 
 
-def _replace_native_legal_destination_arrows(
+def _replace_native_analysis_arrows(
     driver,
     board_selector: str,
     previous_arrows: list[str],
     next_arrows: list[str],
     expected_fen: str,
 ) -> list[str]:
-    """Replace generated legal-destination arrows; never uses Stockfish or moves pieces."""
+    """Replace generated two-ply analysis arrows without submitting chess moves."""
     cdp = _direct_cdp_page_for_driver(driver)
     geometry = _read_board_annotation_geometry(driver, board_selector)
     if cdp is None or geometry is None:
@@ -5003,7 +4999,7 @@ def main() -> int:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         new_file = not csv_path.exists() or csv_path.stat().st_size == 0
         previous_fen = ""
-        auto_legal_destination_arrows: list[str] = []
+        auto_analysis_arrows: list[str] = []
         last_dashboard_eval_fen = ""
         reconstructed_history: list[dict[str, str]] = []
         last_dashboard_history_signature = None
@@ -5429,42 +5425,49 @@ def main() -> int:
                                 f"[HISTORY SYNC] Reconciled {len(dom_history)} plies against current FEN.",
                                 flush=True,
                             )
-                    # Native legal-destination arrows are independent of SHOW MOVE hints.
-                    # When autoplay is active, show where the bot's just-moved piece can
-                    # legally move next. This uses python-chess only, not Stockfish.
+                    # Native two-ply analysis arrows are independent of SHOW MOVE hints.
+                    # After the bot moves, display the top predicted opponent reply and
+                    # the engine's follow-up. Do not draw every legal destination.
                     if position_changed and chess is not None and fen:
-                        next_legal_arrows: list[str] = []
+                        next_analysis_arrows: list[str] = []
                         if (
                             args.auto_play
+                            and engine is not None
                             and active_bot_color in {"white", "black"}
                             and isinstance(last_move, dict)
                             and normalize_chess_color(last_move.get("side")) == active_bot_color
                         ):
                             try:
                                 position_after_move = chess.Board(fen)
-                                next_legal_arrows = legal_destination_arrow_uci_moves(
-                                    position_after_move,
-                                    str(last_move.get("uci") or ""),
-                                    active_bot_color,
+                                analysis_seconds = max(
+                                    0.04,
+                                    min(0.12, float(getattr(args, "engine_time", 0.4)) * 0.15),
                                 )
-                            except (ValueError, IndexError, TypeError):
-                                next_legal_arrows = []
-                        previous_arrow_count = len(auto_legal_destination_arrows)
-                        auto_legal_destination_arrows = _replace_native_legal_destination_arrows(
+                                next_analysis_arrows = calculate_top_continuation_uci_moves(
+                                    engine,
+                                    position_after_move,
+                                    max_plies=2,
+                                    search_seconds=analysis_seconds,
+                                )
+                            except (ValueError, IndexError, TypeError, RuntimeError):
+                                next_analysis_arrows = []
+                        previous_arrow_count = len(auto_analysis_arrows)
+                        auto_analysis_arrows = _replace_native_analysis_arrows(
                             driver,
                             args.board_selector,
-                            auto_legal_destination_arrows,
-                            next_legal_arrows,
+                            auto_analysis_arrows,
+                            next_analysis_arrows,
                             fen,
                         )
-                        if next_legal_arrows and auto_legal_destination_arrows:
+                        if next_analysis_arrows and auto_analysis_arrows:
+                            readable_line = " → ".join(next_analysis_arrows)
                             print(
-                                f"[LEGAL DESTINATIONS] Native arrows for bot's moved piece: "
-                                f"{len(next_legal_arrows)} legal destination(s); Stockfish not used for this display.",
+                                f"[NEXT ANALYSIS] Native board arrows for top continuation "
+                                f"({len(next_analysis_arrows)} ply): {readable_line}.",
                                 flush=True,
                             )
-                        elif previous_arrow_count and not auto_legal_destination_arrows:
-                            print("[LEGAL DESTINATIONS] Previous generated arrows cleared.", flush=True)
+                        elif previous_arrow_count and not auto_analysis_arrows:
+                            print("[NEXT ANALYSIS] Previous generated arrows cleared.", flush=True)
 
                     # Send the complete validated history through one idempotent
                     # dashboard path. This is independent of BOT state and catches
