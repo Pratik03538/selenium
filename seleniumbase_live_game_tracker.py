@@ -3976,6 +3976,15 @@ def _perform_cursor_drag_once(
                 "waypoints": waypoint_count,
                 "action_elapsed_ms": round(action_elapsed_ms, 1),
             }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "reason": "cursor-watcher-or-input-failed",
+            "error_type": type(exc).__name__,
+            "drag_ms": total_drag_ms,
+            "pre_delay_ms": pre_delay_ms,
+            "waypoints": waypoint_count,
+        }
 
     confirmation_started_at = time.monotonic()
     try:
