@@ -440,6 +440,7 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
             backend=FakeBackend(),
             draw_arrow=Mock(return_value=SimpleNamespace(ok=True)),
             draw_highlight=Mock(return_value=SimpleNamespace(ok=True)),
+            preview_legal_moves=Mock(return_value=SimpleNamespace(ok=True, duration_s=0.005, waypoints=4)),
         )
 
         with (
@@ -485,6 +486,7 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
         self.assertEqual(highlight, "e4")
         controller.draw_arrow.assert_called_once()
         controller.draw_highlight.assert_called_once()
+        self.assertEqual(controller.preview_legal_moves.call_count, 2)
         fallback_geometry.assert_not_called()
 
 
