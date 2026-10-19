@@ -466,10 +466,6 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
             patch("seleniumbase_live_game_tracker._same_chess_position", return_value=True),
             patch("seleniumbase_live_game_tracker.time.sleep") as gap_sleep,
             patch("seleniumbase_live_game_tracker.random.uniform", return_value=0.015) as random_gap,
-            patch(
-                "seleniumbase_live_game_tracker.time.monotonic",
-                side_effect=[0.0, 0.005, 1.0, 1.005, 2.0, 2.005],
-            ),
         ):
             arrows, highlight = _replace_native_coaching_annotations(
                 FakeDriver(), "board", [], None, ["d4d8", "a4a8"], "e4", fen,
