@@ -17,6 +17,7 @@ class FakeMouseBackend:
         self.events = []
         self.last_position = (0, 0)
         self.fail_next_position = False
+        self.fail_after_press = False
 
     def get_position(self):
         return self.last_position
@@ -24,6 +25,8 @@ class FakeMouseBackend:
     def set_position(self, x, y):
         if self.fail_next_position:
             self.fail_next_position = False
+            return False
+        if self.fail_after_press and any(event[0] == "press" for event in self.events):
             return False
         self.last_position = (x, y)
         self.events.append(("position", x, y))
@@ -148,6 +151,28 @@ class VisibleMoveTests(unittest.TestCase):
         self.assertIn(("release", "left"), backend.events)
         self.assertIn(("release_all",), backend.events)
         self.assertNotIn(("press", "right"), backend.events)
+        press_index = backend.events.index(("press", "left"))
+        pointer_steps_before_press = [
+            event for event in backend.events[:press_index] if event[0] == "position"
+        ]
+        self.assertGreater(len(pointer_steps_before_press), 3)
+        self.assertGreater(result.waypoints, 0)
+
+    def test_drag_failure_releases_mouse_buttons(self):
+        controller, backend = make_controller()
+        backend.fail_after_press = True
+        fen = chess.STARTING_FEN
+        result = controller.move_uci(
+            "e2e4",
+            expected_fen=fen,
+            current_fen_reader=lambda: fen,
+            geometry=BoardGeometry(0, 0, 800, 800),
+            bot_color="white",
+            focus_guard=lambda: True,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn(("release", "left"), backend.events)
+        self.assertIn(("release_all",), backend.events)
 
     def test_illegal_move_is_rejected_without_mouse_input(self):
         controller, backend = make_controller()
