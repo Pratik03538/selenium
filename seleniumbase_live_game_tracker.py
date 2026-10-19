@@ -2801,6 +2801,12 @@ def legal_destination_arrow_uci_moves(
     if chess is None or board_after_move is None:
         return []
     try:
+        # A finished game has no remaining legal destinations in the actual game.
+        if board_after_move.is_game_over(claim_draw=True):
+            return []
+    except Exception:
+        return []
+    try:
         moved = chess.Move.from_uci(str(move_uci or "").strip().lower())
     except (ValueError, TypeError):
         return []
