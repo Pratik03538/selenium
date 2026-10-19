@@ -2834,21 +2834,19 @@ def calculate_top_continuation_uci_moves(
 
 def filter_new_coaching_arrows(
     arrows: list[str],
-    active_arrows: set[str],
+    shown_arrows: set[str],
 ) -> list[str]:
-    """Suppress duplicate arrows while the same danger persists across replies.
+    """Return valid arrows that have never been shown earlier in this game.
 
-    Call this only for a new bot move. An opponent reply should clear the native
-    board annotation but must not clear this memory; the repeated arrow becomes
-    eligible again only after it disappears from a later bot-move plan.
+    The shown-arrows set is intentionally sticky: absence from later positions
+    does not remove an arrow from the set. Only a new-game reset clears history.
     """
     current: list[str] = []
     for value in arrows:
         arrow = str(value or "").strip().lower()
         if re.fullmatch(r"[a-h][1-8][a-h][1-8][qrbn]?", arrow) and arrow not in current:
             current.append(arrow)
-    active_arrows.intersection_update(current)
-    return [arrow for arrow in current if arrow not in active_arrows]
+    return [arrow for arrow in current if arrow not in shown_arrows]
 
 
 def build_move_coaching_plan(
@@ -3001,8 +2999,9 @@ def build_move_coaching_plan(
     )
     tactical_queue = pv_uci[:max_plies] if queue_triggered else []
 
-    # Find the strongest NEW attack on an opponent's non-pawn piece. Compare
-    # attacker sets (not just occupied squares) so discovered attacks count too.
+    # Collect meaningful attacks against opponent material. Prefer newly-created
+    # attacks and higher-value targets, but include an existing unresolved attack
+    # as well so the coaching can show more than one concrete danger.
     enemy_threats: list[tuple[int, str, str]] = []
     try:
         for target_square, target_piece in after.piece_map().items():
@@ -3010,16 +3009,14 @@ def build_move_coaching_plan(
                 continue
             if target_piece.piece_type in {chess.PAWN, chess.KING}:
                 continue
-            old_target = before.piece_at(target_square)
-            if old_target is None or old_target.color != opponent_color:
+            attackers = set(after.attackers(bot_turn, target_square))
+            if not attackers:
                 continue
             old_attackers = set(before.attackers(bot_turn, target_square))
-            new_attackers = set(after.attackers(bot_turn, target_square)) - old_attackers
-            if not new_attackers:
-                continue
-
+            new_attackers = attackers - old_attackers
+            candidates = new_attackers or attackers
             attacker_squares = [
-                square for square in new_attackers
+                square for square in candidates
                 if after.piece_at(square) is not None
                 and after.piece_at(square).color == bot_turn
             ]
@@ -3035,22 +3032,27 @@ def build_move_coaching_plan(
             attacker_value = piece_values.get(attacker_piece.piece_type, 0)
             target_value = piece_values.get(target_piece.piece_type, 0)
             defenders = after.attackers(opponent_color, target_square)
-
-            # Avoid noisy arrows for attacks that simply hang a more valuable
-            # attacker into an adequately defended lower-value target.
-            if target_value <= attacker_value and defenders:
+            # Avoid noise when an adequately defended lower-value target is
+            # attacked by our more valuable piece, unless the attack is new.
+            if target_value < attacker_value and defenders and not new_attackers:
                 continue
-            priority = target_value * 10 - attacker_value * 2 + (5 if not defenders else 0)
+            priority = (
+                target_value * 20
+                - attacker_value * 2
+                + (12 if not defenders else 0)
+                + (10 if new_attackers else 0)
+            )
             arrow = chess.square_name(attacker_square) + chess.square_name(target_square)
-            label = f"opponent {chess.piece_name(target_piece.piece_type)} at {chess.square_name(target_square)}"
+            label = (
+                f"opponent {chess.piece_name(target_piece.piece_type)} "
+                f"at {chess.square_name(target_square)}"
+            )
             enemy_threats.append((priority, arrow, label))
     except Exception:
         enemy_threats = []
     enemy_threats.sort(reverse=True)
 
-    # Detect one meaningful capture threat against our own material. Prefer the
-    # engine's best reply if it captures; otherwise keep only clear material
-    # risks, rather than drawing arrows at every attacked pawn.
+    # Prefer one clear risk to our own valuable material as a secondary warning.
     own_piece_risks: list[tuple[int, str, str]] = []
     try:
         best_reply_uci = pv_uci[0] if pv_uci else ""
@@ -3083,54 +3085,64 @@ def build_move_coaching_plan(
             if is_engine_choice:
                 priority += 30
             arrow = reply.uci()
-            label = f"our {chess.piece_name(victim.piece_type)} at {chess.square_name(reply.to_square)} can be captured"
+            label = (
+                f"our {chess.piece_name(victim.piece_type)} "
+                f"at {chess.square_name(reply.to_square)} can be captured"
+            )
             own_piece_risks.append((priority, arrow, label))
     except Exception:
         own_piece_risks = []
     own_piece_risks.sort(reverse=True)
 
-    danger_arrows: list[str] = []
+    # More opponent dangers than own-piece warnings: up to three enemy arrows
+    # and one own-risk arrow in quiet positions.
+    enemy_danger_arrows: list[str] = []
     reasons: list[str] = []
-    if enemy_threats:
-        _, arrow, label = enemy_threats[0]
-        danger_arrows.append(arrow)
-        reasons.append(f"{label} is under threat")
+    for _, arrow, label in enemy_threats:
+        if arrow not in enemy_danger_arrows:
+            enemy_danger_arrows.append(arrow)
+            reasons.append(f"{label} is under threat")
+        if len(enemy_danger_arrows) >= 3:
+            break
+    own_danger_arrows: list[str] = []
     if own_piece_risks:
-        _, arrow, label = own_piece_risks[0]
-        if arrow not in danger_arrows:
-            danger_arrows.append(arrow)
-            reasons.append(label)
-
-    # Even in a tactical position, keep the visual queue bounded: at most two
-    # danger arrows plus a three-ply line (five board arrows total).
-    combined_arrows: list[str] = []
-    for arrow in danger_arrows + tactical_queue:
-        if arrow not in combined_arrows and len(combined_arrows) < 5:
-            combined_arrows.append(arrow)
+        _, own_arrow, own_label = own_piece_risks[0]
+        if own_arrow not in enemy_danger_arrows:
+            own_danger_arrows.append(own_arrow)
+            reasons.append(own_label)
 
     if tactical_queue:
+        # Keep the tactical sequence visible and reserve up to two slots for
+        # opponent danger arrows first; show own risk only if no enemy target exists.
+        selected_dangers = enemy_danger_arrows[:2]
+        if not selected_dangers and own_danger_arrows:
+            selected_dangers = own_danger_arrows[:1]
+        combined_arrows: list[str] = []
+        for arrow in selected_dangers + tactical_queue[:3]:
+            if arrow not in combined_arrows and len(combined_arrows) < 5:
+                combined_arrows.append(arrow)
         queue_reason = (
             "forced mate" if has_forced_mate else
             "forcing check" if forcing_check else
             "recapture sequence" if recapture_queue else
             "promotion"
         )
-        reason = "; ".join([queue_reason] + reasons)
         return {
             "mode": "tactical-queue",
             "arrows": combined_arrows,
-            "danger_arrows": danger_arrows,
-            "tactical_queue": tactical_queue,
+            "danger_arrows": selected_dangers,
+            "tactical_queue": tactical_queue[:3],
             "highlight_square": None,
-            "reason": reason,
+            "reason": "; ".join([queue_reason] + reasons),
             "score": score_text,
         }
 
+    danger_arrows = enemy_danger_arrows[:3] + own_danger_arrows[:1]
     if danger_arrows:
         return {
             "mode": "threat-arrows",
-            "arrows": danger_arrows[:2],
-            "danger_arrows": danger_arrows[:2],
+            "arrows": danger_arrows[:4],
+            "danger_arrows": danger_arrows[:4],
             "tactical_queue": [],
             "highlight_square": None,
             "reason": "; ".join(reasons),
@@ -3296,7 +3308,12 @@ def _toggle_native_annotation_arrow(cdp, uci: str, geometry: dict[str, object]) 
             "button": "right", "buttons": 0, "clickCount": 1,
             "pointerType": "mouse",
         }))
-        cdp.wait_for(command_ids, timeout=1.0)
+        try:
+            cdp.wait_for(command_ids, timeout=1.0)
+        except Exception:
+            # The gesture events were already dispatched. A late acknowledgement
+            # must not leave this old arrow pending for a later move.
+            pass
         return True
     except Exception:
         try:
@@ -5370,9 +5387,10 @@ def main() -> int:
         previous_fen = ""
         auto_analysis_arrows: list[str] = []
         auto_analysis_highlight_square: str | None = None
-        # Remember coaching arrows across opponent replies so the same persistent
-        # danger is not repeatedly redrawn after each move.
-        active_coaching_arrows: set[str] = set()
+        # Never display the same arrow twice in one game, even after it disappears.
+        shown_coaching_arrows: set[str] = set()
+        # Retry stale-arrow clearing if the board/CDP is temporarily unavailable.
+        pending_stale_coaching_arrows: list[str] = []
         last_dashboard_eval_fen = ""
         reconstructed_history: list[dict[str, str]] = []
         last_dashboard_history_signature = None
@@ -5866,6 +5884,10 @@ def main() -> int:
                                 arrow for arrow in next_coaching_arrows
                                 if arrow in auto_analysis_arrows
                             )
+                        pending_stale_coaching_arrows = [
+                            arrow for arrow in auto_analysis_arrows
+                            if arrow not in next_coaching_arrows
+                        ]
                         plan_mode = str(coaching_plan.get("mode") or "none")
                         plan_reason = str(coaching_plan.get("reason") or "")
                         tactical_queue = [
@@ -5875,7 +5897,7 @@ def main() -> int:
                         danger_arrows = [
                             str(value) for value in (coaching_plan.get("danger_arrows") or [])
                             if isinstance(value, str)
-                        ][:2]
+                        ][:4]
                         if plan_mode == "tactical-queue" and tactical_queue:
                             print(
                                 f"[COACHING] Tactical queue ({len(tactical_queue)} ply): "
@@ -5888,6 +5910,26 @@ def main() -> int:
                                 + (f" | {plan_reason}" if plan_mode != "tactical-queue" else ""),
                                 flush=True,
                             )
+
+                    elif pending_stale_coaching_arrows and fen:
+                        current_arrows = [
+                            arrow for arrow in auto_analysis_arrows
+                            if arrow not in pending_stale_coaching_arrows
+                        ]
+                        cleared_or_pending, _ = _replace_native_coaching_annotations(
+                            driver,
+                            args.board_selector,
+                            pending_stale_coaching_arrows,
+                            None,
+                            [],
+                            None,
+                            fen,
+                        )
+                        pending_stale_coaching_arrows = list(cleared_or_pending)
+                        auto_analysis_arrows = pending_stale_coaching_arrows + [
+                            arrow for arrow in current_arrows
+                            if arrow not in pending_stale_coaching_arrows
+                        ]
 
                     # Send the complete validated history through one idempotent
                     # dashboard path. This is independent of BOT state and catches
