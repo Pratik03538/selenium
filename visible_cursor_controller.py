@@ -416,6 +416,8 @@ class VisibleCursorController:
         bot_color: str,
         focus_guard: FocusGuard | None,
         promotion_handler: Callable[[str], bool] | None = None,
+        allow_premove: bool = False,
+        premove_prevalidated: bool = False,
     ) -> CursorActionResult:
         """Legality-check and perform a visible left-button piece drag."""
         started = time.monotonic()
@@ -436,9 +438,16 @@ class VisibleCursorController:
         try:
             board = chess.Board(str(expected_fen))
             expected_turn = chess.WHITE if normalized_color == "white" else chess.BLACK
-            if board.turn != expected_turn:
-                return CursorActionResult(False, "move", "not-bot-turn", (token,))
-            move = board.parse_uci(token)
+            if allow_premove:
+                # A premove isn't necessarily legal in the current position.
+                # The caller must first validate it with its site's queue/drag API.
+                if not premove_prevalidated:
+                    return CursorActionResult(False, "move", "premove-validation-required", (token,))
+                move = chess.Move.from_uci(token)
+            else:
+                if board.turn != expected_turn:
+                    return CursorActionResult(False, "move", "not-bot-turn", (token,))
+                move = board.parse_uci(token)
             piece = board.piece_at(move.from_square)
             if piece is None or piece.color != expected_turn:
                 return CursorActionResult(False, "move", "source-piece-not-owned-by-bot", (token,))
@@ -480,6 +489,86 @@ class VisibleCursorController:
                 pass
             return CursorActionResult(
                 False, "move", f"input-failed: {exc}", (token,),
+                time.monotonic() - started,
+            )
+
+    def draw_highlight(
+        self,
+        square: Square,
+        *,
+        expected_fen: str,
+        current_fen_reader: FenReader | None,
+        geometry: BoardGeometry,
+        focus_guard: FocusGuard | None,
+        auto_draw_enabled: bool,
+        opening_fast_mode: bool,
+        fast_mode: bool,
+        bot_clock_seconds: float | None,
+        low_clock_trigger_seconds: float = 10.0,
+    ) -> CursorActionResult:
+        """Perform a native right-click on one square to highlight it."""
+        started = time.monotonic()
+        token = str(square or "").strip().lower()
+        route = (token,)
+        if not self.enabled:
+            return CursorActionResult(False, "highlight", "controller-disabled", route)
+        if not auto_draw_enabled:
+            return CursorActionResult(False, "highlight", "auto-draw-disabled", route)
+        if opening_fast_mode:
+            return CursorActionResult(False, "highlight", "opening-fast-mode", route)
+        if fast_mode:
+            return CursorActionResult(False, "highlight", "fast-mode", route)
+        if bot_clock_seconds is None:
+            return CursorActionResult(False, "highlight", "bot-clock-unavailable", route)
+        try:
+            threshold = min(10.0, max(5.0, float(low_clock_trigger_seconds)))
+            if float(bot_clock_seconds) <= threshold:
+                return CursorActionResult(False, "highlight", "bot-low-clock", route)
+        except (TypeError, ValueError):
+            return CursorActionResult(False, "highlight", "invalid-bot-clock", route)
+        if not re.fullmatch(r"[a-h][1-8]", token):
+            return CursorActionResult(False, "highlight", "invalid-square", route)
+        if not self._call_guard(focus_guard):
+            return CursorActionResult(False, "highlight", "foreground-window-guard-failed", route)
+        valid, reason = self._position_guard(expected_fen, current_fen_reader)
+        if not valid:
+            return CursorActionResult(False, "highlight", reason, route)
+
+        point = geometry.square_center(token)
+        try:
+            self._follow_curve(
+                self.backend.get_position(), point, self.motion.approach_duration_s
+            )
+            if not self._call_guard(focus_guard):
+                return CursorActionResult(
+                    False, "highlight", "foreground-window-guard-failed", route,
+                    time.monotonic() - started,
+                )
+            valid, reason = self._position_guard(expected_fen, current_fen_reader)
+            if not valid:
+                return CursorActionResult(
+                    False, "highlight", reason, route, time.monotonic() - started
+                )
+            self._set_position(point)
+            self.backend.press("right")
+            try:
+                if self.motion.settle_after_press_s:
+                    time.sleep(self.motion.settle_after_press_s)
+            finally:
+                self.backend.release("right")
+                self.backend.release_all()
+            if self.motion.settle_after_release_s:
+                time.sleep(self.motion.settle_after_release_s)
+            return CursorActionResult(
+                True, "highlight", "", route, time.monotonic() - started
+            )
+        except Exception as exc:
+            try:
+                self.backend.release_all()
+            except Exception:
+                pass
+            return CursorActionResult(
+                False, "highlight", f"input-failed: {exc}", route,
                 time.monotonic() - started,
             )
 
