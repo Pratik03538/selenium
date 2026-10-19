@@ -96,15 +96,17 @@ def _get_visible_cursor_controller(low_clock_mode: bool = False):
         or CursorMotionConfig is None
     ):
         return None
+    # Stay comfortably inside the tracker's existing input reserve. The clock
+    # manager still decides thinking delay; this profile adds no independent wait.
     motion = CursorMotionConfig(
-        approach_duration_s=0.01 if low_clock_mode else 0.10,
-        move_drag_duration_s=0.015 if low_clock_mode else 0.16,
-        arrow_drag_duration_s=0.14,
-        settle_after_press_s=0.0 if low_clock_mode else 0.006,
-        settle_after_release_s=0.002 if low_clock_mode else 0.010,
-        min_steps=4 if low_clock_mode else 8,
-        max_steps=4 if low_clock_mode else 32,
-        curve_pixels=0.5 if low_clock_mode else 2.0,
+        approach_duration_s=0.004 if low_clock_mode else 0.018,
+        move_drag_duration_s=0.008 if low_clock_mode else 0.045,
+        arrow_drag_duration_s=0.018,
+        settle_after_press_s=0.0,
+        settle_after_release_s=0.0,
+        min_steps=4 if low_clock_mode else 5,
+        max_steps=4 if low_clock_mode else 12,
+        curve_pixels=0.25 if low_clock_mode else 1.0,
     )
     try:
         if _VISIBLE_CURSOR_CONTROLLER is None:
@@ -3516,11 +3518,18 @@ if (side !== 'white' && side !== 'black') {
     if (side === 'white' || side === 'black') break;
   }
 }
+const dpr = Number(window.devicePixelRatio || 1);
 return {
   ok: rect.width > 8 && rect.height > 8 && Math.abs(rect.width - rect.height) <= Math.max(8, rect.width * 0.08)
       && (side === 'white' || side === 'black'),
   reason: (side === 'white' || side === 'black') ? 'invalid-board-geometry' : 'board-orientation-unknown',
-  left: rect.left, top: rect.top, width: rect.width, height: rect.height, bottomSide: side
+  left: rect.left, top: rect.top, width: rect.width, height: rect.height, bottomSide: side,
+  fen: String(state.fen || ''),
+  screenLeft: (Number(window.screenX || 0) + Number(rect.left)) * dpr,
+  screenTop: (Number(window.screenY || 0) + Number(window.outerHeight || window.innerHeight)
+      - Number(window.innerHeight) + Number(rect.top)) * dpr,
+  screenWidth: Number(rect.width) * dpr,
+  screenHeight: Number(rect.height) * dpr
 };
 """
     try:
@@ -3536,6 +3545,11 @@ return {
             "width": float(result["width"]),
             "height": float(result["height"]),
             "bottom_side": str(result["bottomSide"]),
+            "fen": str(result.get("fen") or ""),
+            "screen_left": float(result["screenLeft"]) if result.get("screenLeft") is not None else None,
+            "screen_top": float(result["screenTop"]) if result.get("screenTop") is not None else None,
+            "screen_width": float(result["screenWidth"]) if result.get("screenWidth") is not None else None,
+            "screen_height": float(result["screenHeight"]) if result.get("screenHeight") is not None else None,
         }
     except (KeyError, TypeError, ValueError):
         return None
