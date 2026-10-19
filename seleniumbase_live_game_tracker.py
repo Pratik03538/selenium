@@ -5544,6 +5544,9 @@ def main() -> int:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         new_file = not csv_path.exists() or csv_path.stat().st_size == 0
         previous_fen = ""
+        # Delay reply annotations until the current loop has had a chance to queue
+        # any legal premove; the next poll then analyses the post-premove board.
+        deferred_coaching_fen = ""
         auto_analysis_arrows: list[str] = []
         auto_analysis_highlight_square: str | None = None
         # Never display the same arrow twice in one game, even after it disappears.
@@ -5957,6 +5960,7 @@ def main() -> int:
                                 game_number += 1
                                 reconstructed_history = []
                                 shown_coaching_arrows.clear()
+                                deferred_coaching_fen = ""
                                 note = "New game detected; move history reset"
                             elif chess is not None:
                                 note = "Position changed but transition could not be inferred as one legal move"
@@ -5975,9 +5979,9 @@ def main() -> int:
                                 f"[HISTORY SYNC] Reconciled {len(dom_history)} plies against current FEN.",
                                 flush=True,
                             )
-                    # Coaching is independent of SHOW MOVE. Bot moves can produce a
-                    # bounded tactical queue; after an opponent reply, recalculate
-                    # danger arrows from the new current FEN rather than replaying old ones.
+                    # Coaching is independent of SHOW MOVE. Tactical queues are capped
+                    # at three plies. Reply analysis is deferred by one poll so a premove
+                    # can be queued first; premove follow-ups get danger arrows only.
                     if position_changed and chess is not None and fen:
                         coaching_plan: dict[str, object] = {
                             "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
@@ -5999,7 +6003,33 @@ def main() -> int:
                             and active_bot_color in {"white", "black"}
                             and last_move_side == ("black" if active_bot_color == "white" else "white")
                         )
-                        if coaching_from_bot_move:
+                        # A queued premove is usually submitted against the FEN in
+                        # which it was requested. If the next transition came from
+                        # that FEN, don't show a move queue for the premove itself.
+                        premove_followup = bool(
+                            position_before_fen
+                            and (
+                                position_before_fen == last_premove_attempt_fen
+                                or position_before_fen == deferred_coaching_fen
+                            )
+                        )
+                        if coaching_from_bot_move and premove_followup:
+                            try:
+                                coaching_plan = build_current_position_danger_plan(
+                                    fen,
+                                    active_bot_color,
+                                    engine=engine,
+                                    search_seconds=max(
+                                        0.03,
+                                        min(0.12, float(getattr(args, "engine_time", 0.4)) * 0.15),
+                                    ),
+                                )
+                            except (ValueError, IndexError, TypeError, RuntimeError):
+                                coaching_plan = {
+                                    "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
+                                }
+                            deferred_coaching_fen = ""
+                        elif coaching_from_bot_move:
                             try:
                                 analysis_seconds = max(
                                     0.08,
@@ -6019,20 +6049,10 @@ def main() -> int:
                                     "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
                                 }
                         elif coaching_after_opponent_move:
-                            try:
-                                coaching_plan = build_current_position_danger_plan(
-                                    fen,
-                                    active_bot_color,
-                                    engine=engine,
-                                    search_seconds=max(
-                                        0.03,
-                                        min(0.12, float(getattr(args, "engine_time", 0.4)) * 0.15),
-                                    ),
-                                )
-                            except (ValueError, IndexError, TypeError, RuntimeError):
-                                coaching_plan = {
-                                    "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
-                                }
+                            # Let the premove-selection/submission code later in this
+                            # polling cycle run first. Analyse this same updated FEN on
+                            # the following poll, after the premove has been queued.
+                            deferred_coaching_fen = fen
 
                         next_coaching_arrows = [
                             str(value) for value in (coaching_plan.get("arrows") or [])
@@ -6084,6 +6104,65 @@ def main() -> int:
                             print(
                                 f"[COACHING] Danger arrows: {'; '.join(danger_arrows)}"
                                 + (f" | {plan_reason}" if plan_mode != "tactical-queue" else ""),
+                                flush=True,
+                            )
+
+                    elif deferred_coaching_fen and fen and fen == deferred_coaching_fen:
+                        coaching_plan = {"mode": "none", "arrows": [], "highlight_square": None, "reason": ""}
+                        if (
+                            args.auto_play
+                            and engine is not None
+                            and active_bot_color in {"white", "black"}
+                        ):
+                            try:
+                                coaching_plan = build_current_position_danger_plan(
+                                    fen,
+                                    active_bot_color,
+                                    engine=engine,
+                                    search_seconds=max(
+                                        0.03,
+                                        min(0.12, float(getattr(args, "engine_time", 0.4)) * 0.15),
+                                    ),
+                                )
+                            except (ValueError, IndexError, TypeError, RuntimeError):
+                                coaching_plan = {
+                                    "mode": "none", "arrows": [], "highlight_square": None, "reason": ""
+                                }
+                        next_coaching_arrows = [
+                            str(value) for value in (coaching_plan.get("arrows") or [])
+                            if isinstance(value, str)
+                        ][:5]
+                        next_coaching_arrows = filter_new_coaching_arrows(
+                            next_coaching_arrows,
+                            shown_coaching_arrows,
+                        )
+                        next_highlight_square = (
+                            str(coaching_plan.get("highlight_square") or "").strip().lower() or None
+                        )
+                        auto_analysis_arrows, auto_analysis_highlight_square = (
+                            _replace_native_coaching_annotations(
+                                driver,
+                                args.board_selector,
+                                auto_analysis_arrows,
+                                auto_analysis_highlight_square,
+                                next_coaching_arrows,
+                                next_highlight_square,
+                                fen,
+                            )
+                        )
+                        shown_coaching_arrows.update(
+                            arrow for arrow in next_coaching_arrows
+                            if arrow in auto_analysis_arrows
+                        )
+                        deferred_coaching_fen = ""
+                        danger_arrows = [
+                            str(value) for value in (coaching_plan.get("danger_arrows") or [])
+                            if isinstance(value, str)
+                        ][:4]
+                        if danger_arrows:
+                            print(
+                                f"[COACHING] Fresh post-premove danger analysis: {'; '.join(danger_arrows)}"
+                                f" | {str(coaching_plan.get('reason') or '')}",
                                 flush=True,
                             )
 
