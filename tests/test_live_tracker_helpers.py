@@ -335,7 +335,10 @@ class NativeAnnotationRedrawTests(unittest.TestCase):
                 "seleniumbase_live_game_tracker._read_board_annotation_geometry",
                 return_value={
                     "left": 0.0, "top": 0.0, "width": 800.0, "height": 800.0,
-                    "bottom_side": "white",
+                    "bottom_side": "white", "fen": chess.STARTING_FEN,
+                    "screen_left": 100.0, "screen_top": 200.0,
+                    "screen_width": 800.0, "screen_height": 800.0,
+                    "window_title": "Owned Chess Site - Browser",
                 },
             ),
             patch("seleniumbase_live_game_tracker._same_chess_position", return_value=True),
@@ -455,7 +458,7 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
             patch(
                 "seleniumbase_live_game_tracker.read_selenium_board_geometry",
                 return_value=object(),
-            ),
+            ) as fallback_geometry,
             patch("seleniumbase_live_game_tracker._same_chess_position", return_value=True),
         ):
             arrows, highlight = _replace_native_coaching_annotations(
@@ -471,11 +474,15 @@ class VisibleCursorAnnotationIntegrationTests(unittest.TestCase):
                 fast_mode=False,
             )
 
-        cdp.assert_not_called()
+        cdp.assert_called_once()
+        cdp.return_value.evaluate.assert_any_call(
+            "(() => { if (window.__variationLineAnalyzer) window.__variationLineAnalyzer.suppress = true; return true; })()"
+        )
         self.assertEqual(arrows, ["d4d8"])
         self.assertEqual(highlight, "e4")
         controller.draw_arrow.assert_called_once()
         controller.draw_highlight.assert_called_once()
+        fallback_geometry.assert_not_called()
 
 
 class PostMoveCoachingGateTests(unittest.TestCase):
